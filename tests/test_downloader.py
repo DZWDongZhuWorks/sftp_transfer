@@ -724,7 +724,8 @@ class TestDownloadOneFileCheckpointing:
         with caplog.at_level(logging.INFO):
             d._download_one_file("/remote/f.bin", "f.bin", tmp_path)
         pct_lines = [r.message for r in caplog.records if "進度" in r.message]
-        percents = [int(line.split(":")[-1].strip().rstrip("%")) for line in pct_lines]
+        # 進度訊息格式為「... 進度: NN%」或「... 進度: NN% (速率/s)」，取百分號前的數字。
+        percents = [int(line.split("進度:")[-1].split("%")[0].strip()) for line in pct_lines]
         assert percents == sorted(percents)
         assert percents[-1] == 100
 

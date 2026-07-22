@@ -7,6 +7,7 @@
 
 import hashlib
 import os
+import time
 from pathlib import Path, PurePosixPath
 
 import paramiko
@@ -193,6 +194,10 @@ class SFTPUploader(SFTPBase):
         last_pct_logged = -1
         last_checkpoint_pct = -1
         transferred = uploaded_bytes
+        start_time = time.time()
+        # 記住上次印進度的時間與位元組數，用差值算「這段期間的即時速率」，比整體平均更能反映當下網速。
+        last_log_time = start_time
+        last_log_bytes = transferred
         try:
             with open(local_file, "rb") as local_f:
                 local_f.seek(uploaded_bytes)
@@ -207,7 +212,16 @@ class SFTPUploader(SFTPBase):
                         if local_size > 0:
                             pct = int(transferred / local_size * 100)
                             if pct > last_pct_logged:
-                                self.logger.info(f"  {rel_path} 進度: {pct}%")
+                                now = time.time()
+                                elapsed = now - last_log_time
+                                # elapsed 可能為 0（連續 chunk 太快），此時略過速率不印，避免除以零。
+                                if elapsed > 0:
+                                    speed = (transferred - last_log_bytes) / elapsed
+                                    self.logger.info(f"  {rel_path} 進度: {pct}% ({format_size(speed)}/s)")
+                                else:
+                                    self.logger.info(f"  {rel_path} 進度: {pct}%")
+                                last_log_time = now
+                                last_log_bytes = transferred
                                 last_pct_logged = pct
                             # 每跨過 10% 進度就存一次檢查點，避免大檔案上傳時頻繁寫入版本紀錄檔。
                             if self.resume and pct >= last_checkpoint_pct + 10:
@@ -232,9 +246,14 @@ class SFTPUploader(SFTPBase):
                 }
                 self._save_manifest(local_root)
 
-        self.logger.info(
-            f"完成上傳: {PurePosixPath(target_remote).name if target_remote != remote_file else rel_path}"
-        )
+        total_elapsed = time.time() - start_time
+        uploaded_this_run = transferred - uploaded_bytes  # 本次實際上傳的位元組（不含斷點續傳前遠端已存在的部分）
+        done_name = PurePosixPath(target_remote).name if target_remote != remote_file else rel_path
+        if total_elapsed > 0 and uploaded_this_run > 0:
+            avg_speed = uploaded_this_run / total_elapsed
+            self.logger.info(f"完成上傳: {done_name}（平均 {format_size(avg_speed)}/s）")
+        else:
+            self.logger.info(f"完成上傳: {done_name}")
         return "uploaded"
 
     def run(self):

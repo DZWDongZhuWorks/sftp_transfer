@@ -462,6 +462,10 @@ class SFTPDownloader(SFTPBase):
         last_pct_logged = -1
         last_checkpoint_pct = -1
         transferred = local_size
+        start_time = time.time()
+        # 記住上次印進度的時間與位元組數，用差值算「這段期間的即時速率」，比整體平均更能反映當下網速。
+        last_log_time = start_time
+        last_log_bytes = transferred
         try:
             with self.sftp.open(remote_file, "rb") as remote_f:
                 remote_f.seek(local_size)
@@ -476,7 +480,16 @@ class SFTPDownloader(SFTPBase):
                         if remote_size > 0:
                             pct = int(transferred / remote_size * 100)
                             if pct > last_pct_logged:
-                                self.logger.info(f"  {rel_path} 進度: {pct}%")
+                                now = time.time()
+                                elapsed = now - last_log_time
+                                # elapsed 可能為 0（連續 chunk 太快），此時略過速率不印，避免除以零。
+                                if elapsed > 0:
+                                    speed = (transferred - last_log_bytes) / elapsed
+                                    self.logger.info(f"  {rel_path} 進度: {pct}% ({format_size(speed)}/s)")
+                                else:
+                                    self.logger.info(f"  {rel_path} 進度: {pct}%")
+                                last_log_time = now
+                                last_log_bytes = transferred
                                 last_pct_logged = pct
                             # 每跨過 10% 進度就存一次檢查點，而不是每個 chunk 都寫檔，
                             # 避免大檔案下載時頻繁寫入版本紀錄檔造成不必要的效能負擔。
@@ -502,7 +515,14 @@ class SFTPDownloader(SFTPBase):
                 }
                 self._save_manifest(local_root)
 
-        self.logger.info(f"完成下載: {target_file.name if target_file != local_file else rel_path}")
+        total_elapsed = time.time() - start_time
+        downloaded_bytes = transferred - local_size  # 本次實際下載的位元組（不含斷點續傳前已存在的部分）
+        done_name = target_file.name if target_file != local_file else rel_path
+        if total_elapsed > 0 and downloaded_bytes > 0:
+            avg_speed = downloaded_bytes / total_elapsed
+            self.logger.info(f"完成下載: {done_name}（平均 {format_size(avg_speed)}/s）")
+        else:
+            self.logger.info(f"完成下載: {done_name}")
         return "downloaded"
 
     def run(self):

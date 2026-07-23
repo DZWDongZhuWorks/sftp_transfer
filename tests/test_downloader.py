@@ -1037,6 +1037,17 @@ class TestRun:
         d.run()
         d._upload_log_file.assert_not_called()
 
+    def test_upload_log_called_even_when_task_aborts(self, downloader_factory):
+        # 任務中途中止（此處以連線階段拋出未預期例外模擬）時，log 仍必須上傳，
+        # 否則最需要遠端紀錄的失敗情境反而沒有 log。此為 SFTPBase.run 以 finally 保證的行為。
+        d = downloader_factory(wait_for_network=False, upload_log=True, remote_log_dir="/logs")
+        d._connect_with_retry = MagicMock(side_effect=RuntimeError("boom"))
+        d._close = MagicMock()
+        d._upload_log_file = MagicMock()
+        result = d.run()
+        assert result is False
+        d._upload_log_file.assert_called_once()
+
 
 # ---------------------------------------------------------------------------
 # create_logger / _CSVFileHandler

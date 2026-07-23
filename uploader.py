@@ -256,7 +256,7 @@ class SFTPUploader(SFTPBase):
             self.logger.info(f"完成上傳: {done_name}")
         return "uploaded"
 
-    def run(self):
+    def _run(self):
         self.logger.info("=== SFTP 上傳任務開始 ===")
         # 上傳僅使用單一目的地路徑；若不慎傳入路徑陣列，取第一個並警告。
         remote_root = self.remote_path[0] if isinstance(self.remote_path, list) else self.remote_path
@@ -336,8 +336,5 @@ class SFTPUploader(SFTPBase):
         self.logger.info(f"=== 上傳任務結束：成功 {uploaded}，略過 {skipped}，失敗 {len(failed)} ===")
         if failed:
             self.logger.info("失敗清單：" + ", ".join(failed))
-
-        if self.upload_log:
-            self._upload_log_file()
 
         return len(failed) == 0

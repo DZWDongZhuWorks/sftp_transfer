@@ -325,6 +325,18 @@ class SFTPBase:
         finally:
             self._close()
 
+    def run(self):
+        """統一進入點：呼叫子類別的 _run() 執行實際傳輸。
+
+        無論傳輸成功、失敗或中途中止（帳密錯誤、達重試上限、未預期例外），
+        最後都會在 upload_log 開啟時把 log 上傳回 remote，確保「最需要遠端紀錄的失敗情境」
+        也留得下 log。log 上傳本身的錯誤已在 _upload_log_file 內部吞掉，不影響回傳值。"""
+        try:
+            return self._run()
+        finally:
+            if self.upload_log:
+                self._upload_log_file()
+
 
 class SFTPDownloader(SFTPBase):
     """SFTP 下載（remote → local）：遞迴走訪遠端目錄、斷點續傳、忽略規則與版本紀錄。"""
@@ -525,7 +537,7 @@ class SFTPDownloader(SFTPBase):
             self.logger.info(f"完成下載: {done_name}")
         return "downloaded"
 
-    def run(self):
+    def _run(self):
         self.logger.info("=== SFTP 下載任務開始 ===")
         local_root = Path(self.local_path)
         local_root.mkdir(parents=True, exist_ok=True)
@@ -618,8 +630,5 @@ class SFTPDownloader(SFTPBase):
         self.logger.info(f"=== 下載任務結束：成功 {downloaded}，略過 {skipped}，失敗 {len(failed)} ===")
         if failed:
             self.logger.info("失敗清單：" + ", ".join(failed))
-
-        if self.upload_log:
-            self._upload_log_file()
 
         return len(failed) == 0

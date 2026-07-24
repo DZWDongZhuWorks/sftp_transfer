@@ -272,10 +272,12 @@ fi
 #      放行；安裝白名單需一次性輸入密碼（sudo）——趁部署互動時一併完成。
 # 兩步皆冪等；非互動終端機時不擅自更動，僅印出手動指令。
 TIMERS_INSTALLER="${SHARE_DIR}/scheduler/install_timers.sh"
+HEARTBEAT_INSTALLER="${SHARE_DIR}/scheduler/failover/install_heartbeat.sh"
 SUDOERS_SRC="${SHARE_DIR}/scheduler/etc/nssms-scheduler.sudoers"
 SUDOERS_DST="/etc/sudoers.d/nssms-scheduler"
 SCHED_STATUS="未執行"
 SUDOERS_STATUS="未執行"
+HEARTBEAT_STATUS="未執行"
 echo ""
 info "檢查週期排程設定 ..."
 if [ ! -f "$TIMERS_INSTALLER" ]; then
@@ -288,7 +290,7 @@ elif [ ! -t 0 ]; then
   SCHED_STATUS="略過（非互動終端機）"
 else
   sched_ans=""
-  read -r -p "  是否設定週期排程 timer（wave / reboot / teamviewer）？[Y/n] " sched_ans || sched_ans=""
+  read -r -p "  是否設定週期排程與 ipc 接管（timer + 心跳/接管服務 + sudo 白名單）？[Y/n] " sched_ans || sched_ans=""
   case "$sched_ans" in
     ""|Y|y)
       # (1) 佈署 / 啟用 timer（user 層，免 root；失敗只警告不中斷部署）
@@ -342,6 +344,25 @@ else
             SUDOERS_STATUS="使用者略過"
             ;;
         esac
+      fi
+
+      # (3) ipc1↔ipc2 心跳/接管服務（user 層,免 root;角色自動分派,兩台都裝）
+      echo ""
+      if [ ! -f "$HEARTBEAT_INSTALLER" ]; then
+        warn "找不到 $HEARTBEAT_INSTALLER ，略過心跳/接管服務安裝。"
+        HEARTBEAT_STATUS="略過（找不到安裝腳本）"
+      else
+        set +e
+        bash "$HEARTBEAT_INSTALLER"
+        HB_RC=$?
+        set -e
+        if [ "$HB_RC" -eq 0 ]; then
+          ok "心跳/接管服務(nssms-heartbeat)已佈署並啟用。"
+          HEARTBEAT_STATUS="已啟用"
+        else
+          warn "心跳/接管服務安裝有問題（exit=$HB_RC），請檢視上方訊息。"
+          HEARTBEAT_STATUS="部分完成（exit=$HB_RC）"
+        fi
       fi
       ;;
     *)
@@ -500,6 +521,7 @@ echo ""
 echo "── 部署總結 ──"
 printf "  開機自動執行設定：%s\n" "$AUTOSTART_STATUS"
 printf "  週期排程 timer   ：%s\n" "$SCHED_STATUS"
+printf "  心跳/接管服務    ：%s\n" "$HEARTBEAT_STATUS"
 printf "  sudo 白名單      ：%s\n" "$SUDOERS_STATUS"
 [ "$RUN_HEALTH" -eq 1 ] && printf "  健康檢查：%s\n" \
   "$( [ "$HEALTH_RC" -eq 0 ] && echo HEALTHY || echo "有問題（exit=$HEALTH_RC）" )"

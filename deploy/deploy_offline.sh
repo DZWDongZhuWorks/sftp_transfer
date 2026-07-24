@@ -11,8 +11,9 @@
 # 目標平台：Linux aarch64 / CPython 3.10 / glibc >= 2.34  (NVIDIA Tegra, mic-733ao)
 #
 # 用法：
-#   ./deploy_offline.sh                 # 建立/更新專屬 venv，安裝執行期相依
-#   ./deploy_offline.sh --with-tests    # 一併安裝 pytest 等測試工具
+#   ./deploy_offline.sh                 # 建立/更新專屬 venv，安裝執行期相依 + 測試堆疊（預設）
+#   ./deploy_offline.sh --skip-tests    # 不安裝 pytest 測試堆疊，健康檢查也略過單元測試
+#   ./deploy_offline.sh --with-tests    # （保留相容；現為預設，明確要求安裝測試堆疊）
 #   ./deploy_offline.sh --recreate      # 砍掉重建 venv（乾淨安裝）
 #   ./deploy_offline.sh --no-health-check # 部署後不自動執行健康檢查
 #   ./deploy_offline.sh --check-only    # 只驗證 wheel 完整性與環境，不安裝
@@ -41,7 +42,9 @@ VESSEL_INFO="${SHARE_DIR}/.env/vessel_basic_info.json"
 DEFAULT_VENV="${HOME}/venv/wanhai_nssms/share/sftp_transfer"
 VENV_DIR="${DEFAULT_VENV}"
 PYTHON_BIN=""          # 空字串＝自動偵測（優先 python3.10，與下游 install_env.sh 一致）
-WITH_TESTS=0
+# 預設安裝測試堆疊（pytest 等），讓部署後的 health_check 預設就會實際跑單元測試。
+# 以 --skip-tests 關閉：不裝測試套件，且轉傳 --skip-tests 讓 health_check 略過。
+INSTALL_TESTS=1
 CHECK_ONLY=0
 SKIP_VERIFY=0
 RECREATE=0
@@ -63,7 +66,8 @@ usage() { grep '^#' "$0" | sed 's/^# \{0,1\}//'; exit 0; }
 # --- 解析參數 --------------------------------------------------------------
 while [ $# -gt 0 ]; do
   case "$1" in
-    --with-tests)  WITH_TESTS=1 ;;
+    --with-tests)  INSTALL_TESTS=1 ;;
+    --skip-tests)  INSTALL_TESTS=0 ;;
     --check-only)  CHECK_ONLY=1 ;;
     --skip-verify) SKIP_VERIFY=1 ;;
     --recreate)    RECREATE=1 ;;
@@ -422,11 +426,11 @@ RUNTIME_PKGS=(paramiko bcrypt cryptography pynacl cffi pycparser invoke typing-e
 TEST_PKGS=(pytest pytest-cov coverage pluggy iniconfig packaging pygments tomli exceptiongroup)
 
 PKGS=("${RUNTIME_PKGS[@]}")
-if [ "$WITH_TESTS" -eq 1 ]; then
+if [ "$INSTALL_TESTS" -eq 1 ]; then
   PKGS+=("${TEST_PKGS[@]}")
-  info "安裝範圍      : 執行期相依 + 測試工具"
+  info "安裝範圍      : 執行期相依 + 測試堆疊 (pytest；預設)"
 else
-  info "安裝範圍      : 執行期相依 (paramiko 堆疊)"
+  info "安裝範圍      : 執行期相依 (paramiko 堆疊；--skip-tests)"
 fi
 
 info "開始離線安裝到 venv（--no-index，不連外網）..."
@@ -471,8 +475,12 @@ if [ "$RUN_HEALTH" -eq 1 ]; then
     echo ""
     info "自動執行健康檢查（能力測試 + SFTP 連線 + 健康報告）..."
     echo "==========================================================="
+    # 未安裝測試堆疊（--skip-tests）時，轉傳 --skip-tests 讓 health_check 直接略過
+    # 單元測試那一項（記 INFO 而非 WARN）。預設有裝 pytest 時則實際跑測試。
+    HEALTH_ARGS=()
+    [ "$INSTALL_TESTS" -eq 0 ] && HEALTH_ARGS+=(--skip-tests)
     set +e
-    "$VENV_PY" "$SCRIPT_DIR/health_check.py"
+    "$VENV_PY" "$SCRIPT_DIR/health_check.py" "${HEALTH_ARGS[@]}"
     HEALTH_RC=$?
     set -e
     echo "==========================================================="

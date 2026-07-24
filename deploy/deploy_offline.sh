@@ -261,6 +261,92 @@ else
   esac
 fi
 
+# --- 週期排程設定（scheduler/install_timers.sh + sudoers 白名單） ----------
+# 與開機自動執行同屬「需使用者留意的一次性設定」：
+#   1) install_timers.sh 佈署/啟用 systemd user timer（純 user 層，免 root）。
+#   2) reboot / teamviewer 這兩支 timer 需 root，改由極窄的 /etc/sudoers.d 白名單
+#      放行；安裝白名單需一次性輸入密碼（sudo）——趁部署互動時一併完成。
+# 兩步皆冪等；非互動終端機時不擅自更動，僅印出手動指令。
+TIMERS_INSTALLER="${SHARE_DIR}/scheduler/install_timers.sh"
+SUDOERS_SRC="${SHARE_DIR}/scheduler/etc/nssms-scheduler.sudoers"
+SUDOERS_DST="/etc/sudoers.d/nssms-scheduler"
+SCHED_STATUS="未執行"
+SUDOERS_STATUS="未執行"
+echo ""
+info "檢查週期排程設定 ..."
+if [ ! -f "$TIMERS_INSTALLER" ]; then
+  warn "找不到 $TIMERS_INSTALLER ，略過週期排程設定。"
+  SCHED_STATUS="略過（找不到安裝腳本）"
+elif [ ! -t 0 ]; then
+  warn "非互動終端機，略過週期排程設定。"
+  warn "如需設定，請手動執行：bash $TIMERS_INSTALLER"
+  warn "reboot / teamviewer 需 sudo 白名單，見 $SUDOERS_SRC 檔頭安裝說明。"
+  SCHED_STATUS="略過（非互動終端機）"
+else
+  sched_ans=""
+  read -r -p "  是否設定週期排程 timer（wave / reboot / teamviewer）？[Y/n] " sched_ans || sched_ans=""
+  case "$sched_ans" in
+    ""|Y|y)
+      # (1) 佈署 / 啟用 timer（user 層，免 root；失敗只警告不中斷部署）
+      set +e
+      bash "$TIMERS_INSTALLER"
+      TIMERS_RC=$?
+      set -e
+      if [ "$TIMERS_RC" -eq 0 ]; then
+        ok "週期排程 timer 已佈署並啟用。"
+        SCHED_STATUS="已啟用"
+      else
+        warn "週期排程 timer 設定有項目失敗（exit=$TIMERS_RC），請檢視上方訊息。"
+        SCHED_STATUS="部分完成（exit=$TIMERS_RC）"
+      fi
+
+      # (2) sudo 白名單（reboot / teamviewer 需要；此步需輸入密碼一次）
+      echo ""
+      if [ ! -f "$SUDOERS_SRC" ]; then
+        warn "找不到 $SUDOERS_SRC ，略過 sudo 白名單安裝。"
+        warn "未安裝白名單時，reboot / teamviewer 兩支 timer 會因 sudo 需密碼而失敗。"
+        SUDOERS_STATUS="略過（找不到來源檔）"
+      elif [ -f "$SUDOERS_DST" ]; then
+        ok "sudo 白名單已存在（$SUDOERS_DST），沿用現有設定。"
+        SUDOERS_STATUS="已存在"
+      else
+        sudoers_ans=""
+        read -r -p "  reboot / teamviewer 需 sudo 白名單，現在安裝？（需輸入一次密碼）[Y/n] " sudoers_ans || sudoers_ans=""
+        case "$sudoers_ans" in
+          ""|Y|y)
+            # 以目前使用者名稱套用（來源檔預設 mic-733ao；換人也正確）。
+            CUR_USER="$(id -un)"
+            TMP_SUDOERS="$(mktemp)"
+            sed "s/^mic-733ao /${CUR_USER} /" "$SUDOERS_SRC" > "$TMP_SUDOERS"
+            # 先驗證語法（絕不安裝壞掉的 sudoers，以免打壞整個 sudo）。
+            if sudo visudo -c -f "$TMP_SUDOERS" >/dev/null 2>&1; then
+              if sudo install -m 0440 -o root -g root "$TMP_SUDOERS" "$SUDOERS_DST"; then
+                ok "已安裝 sudo 白名單：$SUDOERS_DST"
+                SUDOERS_STATUS="已安裝"
+              else
+                warn "sudo 白名單安裝失敗（install 失敗）。"
+                SUDOERS_STATUS="安裝失敗"
+              fi
+            else
+              warn "sudo 白名單語法驗證未通過，未安裝（避免打壞 sudo）。"
+              SUDOERS_STATUS="驗證失敗（未安裝）"
+            fi
+            rm -f "$TMP_SUDOERS"
+            ;;
+          *)
+            info "略過 sudo 白名單安裝。日後可依 $SUDOERS_SRC 檔頭說明手動安裝。"
+            SUDOERS_STATUS="使用者略過"
+            ;;
+        esac
+      fi
+      ;;
+    *)
+      info "略過週期排程設定。日後可執行：bash $TIMERS_INSTALLER"
+      SCHED_STATUS="使用者略過"
+      ;;
+  esac
+fi
+
 if [ ! -d "$WHEELHOUSE" ]; then
   err "wheelhouse 目錄不存在：$WHEELHOUSE"; exit 1
 fi
@@ -405,6 +491,8 @@ fi
 echo ""
 echo "── 部署總結 ──"
 printf "  開機自動執行設定：%s\n" "$AUTOSTART_STATUS"
+printf "  週期排程 timer   ：%s\n" "$SCHED_STATUS"
+printf "  sudo 白名單      ：%s\n" "$SUDOERS_STATUS"
 [ "$RUN_HEALTH" -eq 1 ] && printf "  健康檢查：%s\n" \
   "$( [ "$HEALTH_RC" -eq 0 ] && echo HEALTHY || echo "有問題（exit=$HEALTH_RC）" )"
 

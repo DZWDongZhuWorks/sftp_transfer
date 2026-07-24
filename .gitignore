@@ -26,3 +26,4 @@ htmlcov/
 config
 *.whl
 .sftp_upload_manifest.json
+.sftp_download_manifest.json

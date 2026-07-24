@@ -32,11 +32,13 @@ def logger():
 class FakeSFTPAttr:
     """模擬 paramiko.SFTPAttributes。"""
 
-    def __init__(self, filename, is_dir, size=0, mtime=0):
+    def __init__(self, filename, is_dir, size=0, mtime=0, atime=None):
         self.filename = filename
-        self.st_mode = stat_module.S_IFDIR if is_dir else stat_module.S_IFREG
+        # 含權限位元(不只格式位元),讓 stat.S_IMODE 取得到真實權限(對應保留權限功能)。
+        self.st_mode = (stat_module.S_IFDIR | 0o755) if is_dir else (stat_module.S_IFREG | 0o644)
         self.st_size = size
         self.st_mtime = mtime
+        self.st_atime = atime if atime is not None else mtime
 
 
 class FakeSFTPFile:
@@ -99,6 +101,8 @@ class FakeSFTPClient:
         self.put_calls = []
         self.dirs = set()
         self.mkdir_calls = []
+        self.chmod_calls = []   # 記錄 (path, mode),供保留權限相關測試檢查
+        self.utime_calls = []   # 記錄 (path, (atime, mtime))
 
     def stat(self, path):
         path = path.rstrip("/")
@@ -138,6 +142,12 @@ class FakeSFTPClient:
             data = f.read()
         self.files[remote_path] = data
         self.put_calls.append((local_path, remote_path))
+
+    def chmod(self, path, mode):
+        self.chmod_calls.append((path.rstrip("/"), mode))
+
+    def utime(self, path, times):
+        self.utime_calls.append((path.rstrip("/"), times))
 
 
 @pytest.fixture

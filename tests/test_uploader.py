@@ -5,6 +5,8 @@
 
 import hashlib
 import logging
+import os
+import stat
 import sys
 from pathlib import Path
 from unittest.mock import MagicMock
@@ -104,6 +106,20 @@ class TestNextRemoteDuplicatePath:
         d = uploader_factory(duplicate_suffix="copy")
         d.sftp = fake_sftp_factory(files={"/remote/a.txt": b"x", "/remote/a_copy.txt": b"y"})
         assert d._next_remote_duplicate_path("/remote/a.txt") == "/remote/a_copy1.txt"
+
+
+class TestUploadPreservesModeAndMtime:
+    def test_upload_mirrors_local_mode_and_mtime_to_remote(self, uploader_factory, fake_sftp_factory, tmp_path):
+        local = tmp_path / "x.sh"
+        _write(local, b"#!/bin/sh\n")
+        os.chmod(local, 0o755)
+        os.utime(local, (1111, 2222))
+        d = uploader_factory()
+        d.sftp = fake_sftp_factory(files={})
+        d._upload_one_file(local, "x.sh", "/remote", tmp_path)
+        # 上傳後應把本地權限與 mtime 鏡射到遠端(SFTP 預設不搬)。
+        assert ("/remote/x.sh", 0o755) in d.sftp.chmod_calls
+        assert any(p == "/remote/x.sh" and int(times[1]) == 2222 for p, times in d.sftp.utime_calls)
 
 
 class TestUploadOneFileFresh:

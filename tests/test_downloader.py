@@ -2,6 +2,8 @@
 
 import hashlib
 import logging
+import os
+import stat
 from pathlib import Path
 from unittest.mock import MagicMock, patch
 
@@ -480,6 +482,17 @@ class TestDownloadOneFileFreshDownload:
         d.sftp = fake_sftp_factory(files={"/remote/sub/b.txt": b"nested"}, mtimes={"/remote/sub/b.txt": 1000})
         d._download_one_file("/remote/sub/b.txt", "sub/b.txt", tmp_path)
         assert (tmp_path / "sub" / "b.txt").read_bytes() == b"nested"
+
+
+class TestDownloadPreservesModeAndMtime:
+    def test_downloaded_file_mirrors_remote_mode_and_mtime(self, downloader_factory, fake_sftp_factory, tmp_path):
+        d = downloader_factory()
+        # FakeSFTPAttr 對一般檔案回 st_mode=S_IFREG|0o644、st_atime=st_mtime。
+        d.sftp = fake_sftp_factory(files={"/remote/x.sh": b"#!/bin/sh\n"}, mtimes={"/remote/x.sh": 1234567})
+        d._download_one_file("/remote/x.sh", "x.sh", tmp_path)
+        st = os.stat(tmp_path / "x.sh")
+        assert stat.S_IMODE(st.st_mode) == 0o644     # 權限鏡射自來源(而非本地 umask 預設)
+        assert int(st.st_mtime) == 1234567           # mtime 保留
 
 
 class TestDownloadOneFileResumeDisabled:

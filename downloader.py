@@ -535,6 +535,15 @@ class SFTPDownloader(SFTPBase):
             self.logger.info(f"完成下載: {done_name}（平均 {format_size(avg_speed)}/s）")
         else:
             self.logger.info(f"完成下載: {done_name}")
+        # 保留來源權限與 mtime:SFTP/paramiko 預設不會搬,需以 remote_stat 自行鏡射
+        # （否則 .sh 等會掉 +x）。失敗只警告不中斷 —— 內容已下載完成,不該因權限/時間視為失敗。
+        try:
+            os.chmod(target_file, stat.S_IMODE(remote_stat.st_mode))
+            atime = getattr(remote_stat, "st_atime", None)
+            os.utime(target_file, (atime if atime is not None else remote_stat.st_mtime,
+                                   remote_stat.st_mtime))
+        except (OSError, AttributeError, TypeError, ValueError) as e:
+            self.logger.warning(f"設定 {done_name} 權限/mtime 失敗(不影響下載內容): {e}")
         return "downloaded"
 
     def _run(self):

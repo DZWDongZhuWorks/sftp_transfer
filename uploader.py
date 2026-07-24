@@ -7,6 +7,7 @@
 
 import hashlib
 import os
+import stat
 import time
 from pathlib import Path, PurePosixPath
 
@@ -254,6 +255,13 @@ class SFTPUploader(SFTPBase):
             self.logger.info(f"完成上傳: {done_name}（平均 {format_size(avg_speed)}/s）")
         else:
             self.logger.info(f"完成上傳: {done_name}")
+        # 保留本地權限與 mtime 到遠端(SFTP 預設不搬;否則 .sh 等會掉 +x)。
+        # 失敗只警告不中斷 —— 內容已上傳完成,不該因權限/時間視為失敗。
+        try:
+            self.sftp.chmod(target_remote, stat.S_IMODE(local_stat.st_mode))
+            self.sftp.utime(target_remote, (local_stat.st_atime, local_stat.st_mtime))
+        except (OSError, IOError, AttributeError, TypeError, ValueError) as e:
+            self.logger.warning(f"設定遠端 {done_name} 權限/mtime 失敗(不影響上傳內容): {e}")
         return "uploaded"
 
     def _run(self):

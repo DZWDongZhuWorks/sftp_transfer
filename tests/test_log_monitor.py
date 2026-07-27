@@ -1,0 +1,307 @@
+# -*- coding: utf-8 -*-
+"""monitor/log_monitor.py 的單元測試。
+
+不需網路：於 tmp_path 寫入含 BOM 的合成 CSV log，直接驗證解析、彙整與呈現。
+"""
+import csv
+from datetime import datetime
+from unittest import mock
+
+import pytest
+
+from monitor.log_monitor import (
+    aggregate_by_device,
+    build_parser,
+    collect_logs,
+    parse_device_name,
+    parse_log_file,
+    render_cli,
+    render_html,
+    sync_logs,
+)
+
+
+def write_log(path, device_name, rows):
+    """rows: list of (timestamp, level, message)。以本體相同格式（utf-8-sig CSV）寫出。"""
+    with open(path, "w", encoding="utf-8-sig", newline="") as fh:
+        w = csv.writer(fh)
+        w.writerow(["timestamp", "device_name", "version_info", "level", "message"])
+        for ts, level, msg in rows:
+            w.writerow([ts, device_name, "", level, msg])
+    return path
+
+
+def _download_rows(start="2026-07-27 02:58:53", extra=None):
+    rows = [
+        (start, "INFO", "=== SFTP 下載任務開始 ==="),
+        ("2026-07-27 02:59:21", "INFO", "共 2 個來源路徑，合併後發現 581 個檔案"),
+    ]
+    rows.extend(extra or [])
+    return rows
+
+
+# --- parse_log_file: 四態 --------------------------------------------------
+def test_parse_success(tmp_path):
+    p = write_log(
+        tmp_path / "D_CLINK_IPC-1_ecdis_20260727_025853.csv",
+        "CLINK_IPC-1_ecdis",
+        _download_rows(
+            extra=[("2026-07-27 02:59:56", "INFO", "=== 下載任務結束：成功 10，略過 571，失敗 0 ===")]
+        ),
+    )
+    rec = parse_log_file(p)
+    assert rec is not None
+    assert rec.status == "success"
+    assert rec.mode == "download"
+    assert rec.device_name == "CLINK_IPC-1_ecdis"
+    assert (rec.success, rec.skipped, rec.failed) == (10, 571, 0)
+    assert rec.file_count == 581
+    assert rec.started_at == datetime(2026, 7, 27, 2, 58, 53)
+
+
+def test_parse_partial_with_failed_list(tmp_path):
+    p = write_log(
+        tmp_path / "D_dev_20260727_030000.csv",
+        "CLINK_IPC-1_radar",
+        _download_rows(
+            extra=[
+                ("2026-07-27 03:00:10", "ERROR", "檔案 a/x.bin 下載失敗，放棄重試"),
+                ("2026-07-27 03:00:11", "INFO", "=== 下載任務結束：成功 3，略過 1，失敗 2 ==="),
+                ("2026-07-27 03:00:11", "INFO", "失敗清單：a/x.bin, b/y.bin"),
+            ]
+        ),
+    )
+    rec = parse_log_file(p)
+    assert rec.status == "partial"
+    assert rec.failed == 2
+    assert rec.failed_list == ["a/x.bin", "b/y.bin"]
+    assert rec.errors  # 收集到 ERROR
+
+
+def test_parse_aborted(tmp_path):
+    p = write_log(
+        tmp_path / "D_dev_20260727_040000.csv",
+        "CLINK_IPC-1_scheduler",
+        [
+            ("2026-07-27 04:00:00", "INFO", "=== SFTP 下載任務開始 ==="),
+            ("2026-07-27 04:00:02", "ERROR", "=== 任務中止：帳號或密碼錯誤 ==="),
+        ],
+    )
+    rec = parse_log_file(p)
+    assert rec.status == "aborted"
+    assert rec.abort_reason == "帳號或密碼錯誤"
+
+
+def test_parse_incomplete(tmp_path):
+    p = write_log(
+        tmp_path / "D_dev_20260727_050000.csv",
+        "CLINK_IPC-1_share",
+        [("2026-07-27 05:00:00", "INFO", "=== SFTP 下載任務開始 ===")],
+    )
+    rec = parse_log_file(p)
+    assert rec.status == "incomplete"
+    assert rec.success is None
+
+
+def test_parse_upload_mode_from_content(tmp_path):
+    # 檔名無前綴，仍應由起始行判定為 upload
+    p = write_log(
+        tmp_path / "legacy_uploader_20260727_060000.csv",
+        "RADAR_UPLOADER",
+        [
+            ("2026-07-27 06:00:00", "INFO", "=== SFTP 上傳任務開始 ==="),
+            ("2026-07-27 06:00:05", "INFO", "=== 上傳任務結束：成功 4，略過 0，失敗 0 ==="),
+        ],
+    )
+    rec = parse_log_file(p)
+    assert rec.mode == "upload"
+    assert rec.status == "success"
+
+
+def test_parse_multi_job_summary(tmp_path):
+    p = write_log(
+        tmp_path / "U_dev_20260727_070000.csv",
+        "dev",
+        [
+            ("2026-07-27 07:00:00", "INFO", "=== SFTP 上傳任務開始 ==="),
+            ("2026-07-27 07:00:05", "INFO", "=== 上傳任務結束（3 組）：成功 7，略過 2，失敗 0 ==="),
+        ],
+    )
+    rec = parse_log_file(p)
+    assert (rec.success, rec.skipped, rec.failed) == (7, 2, 0)
+    assert rec.status == "success"
+
+
+def test_parse_non_log_csv_returns_none(tmp_path):
+    p = tmp_path / "other.csv"
+    with open(p, "w", encoding="utf-8", newline="") as fh:
+        csv.writer(fh).writerow(["foo", "bar", "baz"])
+    assert parse_log_file(p) is None
+
+
+# --- parse_device_name -----------------------------------------------------
+@pytest.mark.parametrize(
+    "name,expected",
+    [
+        ("CLINK_IPC-1_ecdis", ("CLINK", "IPC-1", "ecdis")),
+        ("WH289_IPC-1_RADAR_DOWNLOADER", ("WH289", "IPC-1", "RADAR_DOWNLOADER")),
+        ("RADAR_UPLOADER", (None, None, "RADAR_UPLOADER")),
+    ],
+)
+def test_parse_device_name(name, expected):
+    assert parse_device_name(name) == expected
+
+
+# --- collect_logs / aggregate ---------------------------------------------
+def test_collect_logs_mode_filter(tmp_path):
+    write_log(
+        tmp_path / "D_a_20260727_010000.csv",
+        "a",
+        _download_rows(extra=[("2026-07-27 02:59:56", "INFO", "=== 下載任務結束：成功 1，略過 0，失敗 0 ===")]),
+    )
+    write_log(
+        tmp_path / "U_b_20260727_010000.csv",
+        "b",
+        [
+            ("2026-07-27 01:00:00", "INFO", "=== SFTP 上傳任務開始 ==="),
+            ("2026-07-27 01:00:05", "INFO", "=== 上傳任務結束：成功 1，略過 0，失敗 0 ==="),
+        ],
+    )
+    assert len(collect_logs(tmp_path, mode="all")) == 2
+    downloads = collect_logs(tmp_path, mode="download")
+    assert [r.device_name for r in downloads] == ["a"]
+
+
+def test_aggregate_picks_latest_and_flags_stale(tmp_path):
+    write_log(
+        tmp_path / "D_dev_20260720_010000.csv",
+        "CLINK_IPC-1_ecdis",
+        [
+            ("2026-07-20 01:00:00", "INFO", "=== SFTP 下載任務開始 ==="),
+            ("2026-07-20 01:00:05", "INFO", "=== 下載任務結束：成功 9，略過 0，失敗 0 ==="),
+        ],
+    )
+    write_log(
+        tmp_path / "D_dev_20260727_010000.csv",
+        "CLINK_IPC-1_ecdis",
+        [
+            ("2026-07-27 01:00:00", "INFO", "=== SFTP 下載任務開始 ==="),
+            ("2026-07-27 01:00:05", "INFO", "=== 下載任務結束：成功 5，略過 0，失敗 0 ==="),
+        ],
+    )
+    records = collect_logs(tmp_path)
+    now = datetime(2026, 7, 27, 3, 0, 0)
+    devices = aggregate_by_device(records, now=now, stale_hours=24)
+    assert len(devices) == 1
+    d = devices[0]
+    assert d.run_count == 2
+    assert d.latest.started_at == datetime(2026, 7, 27, 1, 0, 0)  # 取最新
+    assert d.latest.success == 5
+    assert d.is_stale is False
+    assert d.display_status == "success"
+
+    # 門檻縮到 1 小時 → 逾期
+    devices_stale = aggregate_by_device(records, now=now, stale_hours=1)
+    assert devices_stale[0].is_stale is True
+    assert devices_stale[0].display_status == "stale"
+
+
+def test_aggregate_sort_severity_first(tmp_path):
+    write_log(
+        tmp_path / "D_ok_20260727_020000.csv",
+        "ok_dev",
+        [
+            ("2026-07-27 02:00:00", "INFO", "=== SFTP 下載任務開始 ==="),
+            ("2026-07-27 02:00:05", "INFO", "=== 下載任務結束：成功 1，略過 0，失敗 0 ==="),
+        ],
+    )
+    write_log(
+        tmp_path / "D_bad_20260727_020000.csv",
+        "bad_dev",
+        [
+            ("2026-07-27 02:00:00", "INFO", "=== SFTP 下載任務開始 ==="),
+            ("2026-07-27 02:00:05", "INFO", "=== 下載任務結束：成功 0，略過 0，失敗 3 ==="),
+        ],
+    )
+    now = datetime(2026, 7, 27, 2, 30, 0)
+    devices = aggregate_by_device(collect_logs(tmp_path), now=now, stale_hours=24)
+    assert devices[0].device_name == "bad_dev"  # 異常排最前
+
+
+# --- render ----------------------------------------------------------------
+def _sample_devices(tmp_path):
+    write_log(
+        tmp_path / "D_CLINK_IPC-1_ecdis_20260727_010000.csv",
+        "CLINK_IPC-1_ecdis",
+        [
+            ("2026-07-27 01:00:00", "INFO", "=== SFTP 下載任務開始 ==="),
+            ("2026-07-27 01:00:05", "INFO", "=== 下載任務結束：成功 10，略過 571，失敗 0 ==="),
+        ],
+    )
+    now = datetime(2026, 7, 27, 1, 30, 0)
+    return aggregate_by_device(collect_logs(tmp_path), now=now, stale_hours=24), now
+
+
+def test_render_cli_plain_has_no_ansi(tmp_path):
+    devices, now = _sample_devices(tmp_path)
+    out = render_cli(devices, now=now, use_color=False)
+    assert "\033[" not in out
+    assert "CLINK_IPC-1_ecdis" in out
+    assert "裝置 1" in out
+    assert "10/571/0" in out
+
+
+def test_render_cli_color_has_ansi(tmp_path):
+    devices, now = _sample_devices(tmp_path)
+    out = render_cli(devices, now=now, use_color=True)
+    assert "\033[" in out
+
+
+def test_render_html_writes_file(tmp_path):
+    devices, now = _sample_devices(tmp_path)
+    out = tmp_path / "report.html"
+    render_html(devices, out, generated_at=now, log_dir=str(tmp_path), stale_hours=24)
+    assert out.exists()
+    content = out.read_text(encoding="utf-8")
+    assert "CLINK_IPC-1_ecdis" in content
+    assert "chip s-success" in content
+    assert "<!DOCTYPE html>" in content
+
+
+def test_render_empty(tmp_path):
+    now = datetime(2026, 7, 27, 1, 0, 0)
+    out = render_cli([], now=now, use_color=False)
+    assert "無資料" in out
+    html_out = tmp_path / "e.html"
+    render_html([], html_out, generated_at=now)
+    assert "（無資料）" in html_out.read_text(encoding="utf-8")
+
+
+# --- sync_logs -------------------------------------------------------------
+def test_sync_logs_success(tmp_path):
+    cfg = tmp_path / "c.json"
+    cfg.write_text("{}", encoding="utf-8")
+    with mock.patch("monitor.log_monitor.subprocess.run") as m:
+        m.return_value = mock.Mock(returncode=0)
+        assert sync_logs(cfg) is True
+    args = m.call_args[0][0]
+    assert "--cli" in args and "download" in args and str(cfg) in args
+
+
+def test_sync_logs_nonzero_returns_false(tmp_path):
+    cfg = tmp_path / "c.json"
+    cfg.write_text("{}", encoding="utf-8")
+    with mock.patch("monitor.log_monitor.subprocess.run") as m:
+        m.return_value = mock.Mock(returncode=1)
+        assert sync_logs(cfg) is False
+
+
+def test_sync_logs_missing_config_returns_false(tmp_path):
+    assert sync_logs(tmp_path / "nope.json") is False
+
+
+def test_build_parser_defaults():
+    args = build_parser().parse_args([])
+    assert args.mode == "all"
+    assert args.stale_hours == 24
+    assert args.html is None

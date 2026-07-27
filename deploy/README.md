@@ -25,6 +25,7 @@
 | `MANIFEST.txt` | 各 wheel 的 sha256 與建置平台資訊（安裝前完整性校驗用） |
 | `deploy_offline.sh` | 離線安裝腳本（全程 `--no-index`，不連外網） |
 | `health_check.py` | 安裝後能力測試 + SFTP 連線測試 + 產生健康報告 |
+| `automation_health_check.py` | systemd user service、timer、linger、sudoers、heartbeat、tmux 與 unit 同步狀態的一鍵唯讀巡檢 |
 
 > `wheelhouse/` 與 `virtualenv_wheels/` 內的 `.whl` 因體積較大且與平台綁定，
 > 不納入 git 版控（見 `.gitignore`），須隨部署包一併實體派送到船機。
@@ -63,7 +64,46 @@ sftp_transfer 使用**專屬虛擬環境**（與 radar / SHM 等其他專案慣�
 #    務必用 venv 內的 python 執行：
 ~/venv/wanhai_nssms/share/sftp_transfer/bin/python deploy/health_check.py
 #    報告會寫到  logs/health_report_<時間>.md
+
+# 3) 巡檢開機自動化、timer、heartbeat 等隱性設定（使用系統 python3 即可）
+python3 deploy/automation_health_check.py
+#    報告會寫到 logs/automation_health_report_<時間>.md
 ```
+
+### 自動化存活巡檢
+
+`automation_health_check.py` 是唯讀工具，不會啟停服務或修改設定。它會檢查：
+
+- `systemctl --user` 與 linger 是否可用；
+- `nssms-boot`、`nssms-heartbeat`、所有 `nssms-*` timer 的實際狀態；
+- timer 對應 service 的最近執行結果與 `ExecStart` 目標是否存在；
+- repo unit 母體與 `~/.config/systemd/user/` 實際安裝版本是否一致；
+- sudoers 權限及 reboot / TeamViewer 的精確 NOPASSWD 白名單；
+- heartbeat 實際 TCP 回應、failover 狀態與角色；
+- 依 IPC 角色預期存在的 tmux sessions。
+
+wave 目前可空置，因此預設把 wave 腳本缺少或 service 失敗列為 `SKIP`，不影響整體
+健康。需要將 wave 納入正式驗收時，可使用嚴格模式：
+
+```bash
+python3 deploy/automation_health_check.py --strict-wave
+```
+
+其他選項：
+
+```bash
+python3 deploy/automation_health_check.py --no-report     # 不寫 Markdown 報告
+python3 deploy/automation_health_check.py --compact       # 只顯示 WARN/FAIL 與總結
+python3 deploy/automation_health_check.py --fail-on-warn  # 有 WARN 時回傳 exit 2
+```
+
+離開碼：`0` 表示沒有 FAIL；`1` 表示至少一項 FAIL；搭配 `--fail-on-warn` 時，
+只有 WARN 而無 FAIL 會回傳 `2`。
+
+`deploy_offline.sh` 會在部署流程最後自動以 `--compact --fail-on-warn` 執行本
+巡檢，並把 HEALTHY／DEGRADED／UNHEALTHY 加入部署總結；完整明細仍會寫入
+Markdown 報告。指定 `deploy_offline.sh
+--no-health-check` 時，能力健康檢查與自動化存活巡檢都會略過。
 
 ## 執行本工具
 

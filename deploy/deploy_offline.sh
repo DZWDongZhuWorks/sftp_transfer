@@ -15,7 +15,7 @@
 #   ./deploy_offline.sh --skip-tests    # 不安裝 pytest 測試堆疊，健康檢查也略過單元測試
 #   ./deploy_offline.sh --with-tests    # （保留相容；現為預設，明確要求安裝測試堆疊）
 #   ./deploy_offline.sh --recreate      # 砍掉重建 venv（乾淨安裝）
-#   ./deploy_offline.sh --no-health-check # 部署後不自動執行健康檢查
+#   ./deploy_offline.sh --no-health-check # 部署後不自動執行能力／自動化健康檢查
 #   ./deploy_offline.sh --check-only    # 只驗證 wheel 完整性與環境，不安裝
 #   ./deploy_offline.sh --venv /path/to/venv        # 自訂 venv 路徑
 #   ./deploy_offline.sh --python /usr/bin/python3.10 # 指定建立 venv 用的直譯器
@@ -514,7 +514,51 @@ if [ "$RUN_HEALTH" -eq 1 ]; then
     warn "找不到 health_check.py，略過自動健康檢查。"
   fi
 else
-  info "已指定 --no-health-check，略過自動健康檢查。"
+  info "已指定 --no-health-check，略過能力健康檢查。"
+fi
+
+# --- 隱性自動化存活巡檢 ----------------------------------------------------
+# 放在部署流程最後，以實際 systemd 狀態驗證：user manager / linger / unit /
+# timer / sudoers / heartbeat / tmux。使用 --compact --fail-on-warn，部署畫面
+# 只顯示 WARN/FAIL 與總結；完整明細仍寫入 logs/automation_health_report_<時間>.md。
+# wave 尚未提供時由巡檢器列為 SKIP，不影響整體健康。
+AUTOMATION_CHECKER="${SCRIPT_DIR}/automation_health_check.py"
+AUTOMATION_RC=0
+AUTOMATION_STATUS="未執行"
+if [ "$RUN_HEALTH" -eq 1 ]; then
+  echo ""
+  info "執行隱性自動化存活巡檢（compact）..."
+  if [ -f "$AUTOMATION_CHECKER" ]; then
+    set +e
+    "$PYTHON_BIN" "$AUTOMATION_CHECKER" --compact --fail-on-warn
+    AUTOMATION_RC=$?
+    set -e
+    case "$AUTOMATION_RC" in
+      0)
+        ok "自動化存活巡檢：HEALTHY"
+        AUTOMATION_STATUS="HEALTHY"
+        ;;
+      1)
+        warn "自動化存活巡檢：UNHEALTHY（有 FAIL；請查看上方與 Markdown 報告）"
+        AUTOMATION_STATUS="UNHEALTHY（exit=1）"
+        ;;
+      2)
+        warn "自動化存活巡檢：DEGRADED（有 WARN；請查看上方與 Markdown 報告）"
+        AUTOMATION_STATUS="DEGRADED（exit=2）"
+        ;;
+      *)
+        warn "自動化存活巡檢未預期結束（exit=$AUTOMATION_RC）"
+        AUTOMATION_STATUS="執行異常（exit=$AUTOMATION_RC）"
+        ;;
+    esac
+  else
+    warn "找不到 $AUTOMATION_CHECKER，略過自動化存活巡檢。"
+    AUTOMATION_RC=127
+    AUTOMATION_STATUS="略過（找不到巡檢腳本）"
+  fi
+else
+  info "已指定 --no-health-check，略過自動化存活巡檢。"
+  AUTOMATION_STATUS="略過（--no-health-check）"
 fi
 
 echo ""
@@ -525,6 +569,7 @@ printf "  心跳/接管服務    ：%s\n" "$HEARTBEAT_STATUS"
 printf "  sudo 白名單      ：%s\n" "$SUDOERS_STATUS"
 [ "$RUN_HEALTH" -eq 1 ] && printf "  健康檢查：%s\n" \
   "$( [ "$HEALTH_RC" -eq 0 ] && echo HEALTHY || echo "有問題（exit=$HEALTH_RC）" )"
+printf "  自動化存活巡檢  ：%s\n" "$AUTOMATION_STATUS"
 
 echo ""
 echo "啟用 venv："
@@ -535,6 +580,9 @@ echo "  \"$VENV_PY\" \"$PROJECT_DIR/main.py\" --cli"
 echo ""
 echo "如需單獨再跑一次健康檢查："
 echo "  \"$VENV_PY\" \"$SCRIPT_DIR/health_check.py\""
+echo ""
+echo "如需單獨再跑一次自動化存活巡檢："
+echo "  \"$PYTHON_BIN\" \"$AUTOMATION_CHECKER\""
 echo "==========================================================="
 
 # 部署本身成功即回傳 0；健康檢查結果另以訊息呈現，不影響部署離開碼。

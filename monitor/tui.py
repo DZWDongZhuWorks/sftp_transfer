@@ -14,6 +14,7 @@
 from __future__ import annotations
 
 import curses
+import unicodedata
 from dataclasses import dataclass, field
 from datetime import datetime
 
@@ -35,6 +36,36 @@ from monitor.log_monitor import (
 _MODE_CYCLE = ["", "download", "upload"]
 _STATUS_CYCLE = ["all", "ok", "stale", "problem"]
 _PAIR = {"success": 1, "stale": 2, "incomplete": 2, "partial": 3, "aborted": 3}
+
+
+# --- 顯示寬度（CJK 全形字佔 2 欄）------------------------------------------
+def _char_width(ch: str) -> int:
+    return 2 if unicodedata.east_asian_width(ch) in ("W", "F") else 1
+
+
+def disp_width(s: str) -> int:
+    return sum(_char_width(c) for c in s)
+
+
+def fit_display(s: str, cols: int) -> tuple[str, int]:
+    """截斷 s 至顯示寬度不超過 cols，回傳 (截斷後字串, 實際顯示寬度)。"""
+    if cols <= 0:
+        return "", 0
+    out, w = [], 0
+    for c in s:
+        cw = _char_width(c)
+        if w + cw > cols:
+            break
+        out.append(c)
+        w += cw
+    return "".join(out), w
+
+
+def pad_display(s: str, cols: int, align: str = "left") -> str:
+    """依顯示寬度截斷並補空白到剛好 cols 欄（CJK 對齊用）。"""
+    fs, w = fit_display(s, cols)
+    fill = " " * (cols - w)
+    return fill + fs if align == "right" else fs + fill
 
 
 # ---------------------------------------------------------------------------
@@ -80,14 +111,13 @@ def _searchtext(d) -> str:
 
 def _device_line(d, now: datetime | None) -> str:
     rec = d.latest
-    return "{comp:<20} {last:<17} {files:>5} {counts:>9} {age:<9} {detail}".format(
-        comp=d.component[:20],
-        last=rec.started_at.strftime(TS_FMT) if rec.started_at else "—",
-        files=("—" if rec.file_count is None else str(rec.file_count)),
-        counts=_counts_str(rec),
-        age=_humanize_age(d.last_seen, now) if now else "—",
-        detail=_detail_str(d)[:40],
-    )
+    comp = pad_display(d.component, 20)
+    last = pad_display(rec.started_at.strftime(TS_FMT) if rec.started_at else "—", 19)
+    files = pad_display("—" if rec.file_count is None else str(rec.file_count), 5, "right")
+    counts = pad_display(_counts_str(rec), 9, "right")
+    age = pad_display(_humanize_age(d.last_seen, now) if now else "—", 9)
+    detail = fit_display(_detail_str(d), 60)[0]
+    return f"{comp} {last} {files} {counts} {age} {detail}"
 
 
 def _device_matches(d, state: TuiState) -> bool:
@@ -343,9 +373,18 @@ def _attr(status):
     return 0
 
 
+def _put(win, y, x, text, attr, limit):
+    """在 (y,x) 寫入 text，截斷至剩餘顯示寬度 limit-x；回傳新的 x（顯示欄）。"""
+    fs, w = fit_display(text, limit - x)
+    if w > 0:
+        _addstr(win, y, x, fs, attr)
+    return x + w
+
+
 def _draw(stdscr, state: TuiState, rows: list[Row], tree, watch: float) -> None:
     stdscr.erase()
     maxy, maxx = stdscr.getmaxyx()
+    width = maxx - 1
     t, o, s, b = global_counts(tree)
     now_s = state.now.strftime(TS_FMT) if state.now else "—"
     head1 = f" SFTP Log 監視 {now_s}  裝置 {t}｜正常 {o}｜過期 {s}｜異常 {b}"
@@ -361,11 +400,11 @@ def _draw(stdscr, state: TuiState, rows: list[Row], tree, watch: float) -> None:
     if watch:
         filt.append(f"每{int(watch)}s刷新")
     head2 = " 過濾: " + ("、".join(filt) if filt else "（無）")
-    _addstr(stdscr, 0, 0, head1[: maxx - 1], curses.A_BOLD)
-    _addstr(stdscr, 1, 0, head2[: maxx - 1], curses.A_DIM)
+    _addstr(stdscr, 0, 0, fit_display(head1, width)[0], curses.A_BOLD)
+    _addstr(stdscr, 1, 0, fit_display(head2, width)[0], curses.A_DIM)
     foot = (" ↑↓移動  Enter開合/明細  ←→收展  E/C全展收  /搜尋  m方向  s狀態"
             "  p異常  r重載  ?說明  q離開")
-    _addstr(stdscr, maxy - 1, 0, foot[: maxx - 1].ljust(maxx - 1), curses.A_REVERSE)
+    _addstr(stdscr, maxy - 1, 0, pad_display(foot, width), curses.A_REVERSE)
 
     top, height = 2, maxy - 3
     if height < 1:
@@ -392,25 +431,27 @@ def _draw(stdscr, state: TuiState, rows: list[Row], tree, watch: float) -> None:
             prefix = indent + "  "
         else:
             prefix = indent + ("▼" if r.key in state.expanded else "▶") + " "
-        line = (prefix + "● " + r.text)[: maxx - 1]
         sel = ridx == idx
-        _addstr(stdscr, y, 0, line.ljust(maxx - 1)[: maxx - 1],
-                curses.A_REVERSE if sel else 0)
-        if not sel:
-            _addstr(stdscr, y, len(prefix), "●", _attr(r.status))
+        base = curses.A_REVERSE if sel else 0
+        if sel:  # 先鋪整列反白底，選取列橫跨整行
+            _addstr(stdscr, y, 0, " " * width, curses.A_REVERSE)
+        # 依顯示寬度逐段寫入，避免 CJK 造成位移或溢出換行
+        x = _put(stdscr, y, 0, prefix, base, width)
+        x = _put(stdscr, y, x, "●", base if sel else _attr(r.status), width)
+        _put(stdscr, y, x, " " + r.text, base, width)
     stdscr.refresh()
 
 
 def _popup(stdscr, lines, title="明細"):
     maxy, maxx = stdscr.getmaxyx()
     body = lines or ["（無明細）"]
-    w = min(maxx - 2, max([len(title) + 6] + [len(x) for x in body]) + 4)
+    w = min(maxx - 2, max([disp_width(title) + 6] + [disp_width(x) for x in body]) + 4)
     h = min(maxy - 2, len(body) + 4)
     win = curses.newwin(h, w, max(0, (maxy - h) // 2), max(0, (maxx - w) // 2))
     win.box()
     _addstr(win, 0, 2, f" {title} ", curses.A_BOLD)
     for i, ln in enumerate(body[: h - 4]):
-        _addstr(win, 2 + i, 2, ln[: w - 4])
+        _addstr(win, 2 + i, 2, fit_display(ln, w - 4)[0])
     _addstr(win, h - 1, 2, " 任意鍵關閉 ", curses.A_DIM)
     win.refresh()
     win.getch()

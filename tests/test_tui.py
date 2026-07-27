@@ -224,6 +224,47 @@ def test_key_action():
 
 
 # --- 明細 ------------------------------------------------------------------
+def test_display_width_helpers():
+    assert tui.disp_width("abc") == 3
+    assert tui.disp_width("裝置") == 4          # CJK 全形各佔 2 欄
+    assert tui.disp_width("6天前") == 5          # 1 半形 + 2 全形
+    # pad_display 依顯示寬度補滿，不論 CJK
+    assert tui.disp_width(tui.pad_display("裝置", 10)) == 10
+    assert tui.disp_width(tui.pad_display("abc", 10)) == 10
+    assert tui.pad_display("x", 5, "right") == "    x"
+    # fit_display 不超過欄寬、且不會切半個全形字
+    s, w = tui.fit_display("遠端路徑不存在", 5)
+    assert w <= 5 and tui.disp_width(s) == w
+
+
+def test_device_line_columns_align():
+    # 不同 age 文字（天/小時/分鐘前）下，detail 前的固定欄位顯示寬度一致
+    import types
+    from datetime import datetime as _dt
+
+    def fake(comp, age_secs):
+        rec = types.SimpleNamespace(
+            mode="download",
+            started_at=_dt(2026, 7, 27, 1, 0, 0),
+            file_count=5,
+            success=5, skipped=0, failed=0,
+            status="success", abort_reason="", errors=[], warnings=[],
+        )
+        d = types.SimpleNamespace(
+            component=comp, latest=rec, is_stale=False, status="success",
+            display_status="success", device_name="x", vessel="V", ipc="IPC-1",
+            last_seen=_dt(2026, 7, 27, 1, 0, 0),
+        )
+        return d
+
+    now = _dt(2026, 7, 27, 1, 30, 0)      # 30 分鐘前
+    later = _dt(2026, 7, 30, 1, 0, 0)     # 3 天前
+    fixed = 20 + 1 + 19 + 1 + 5 + 1 + 9 + 1 + 9
+    w1 = tui.disp_width(tui.fit_display(tui._device_line(fake("ecdis", 0), now), fixed)[0])
+    w2 = tui.disp_width(tui.fit_display(tui._device_line(fake("radar", 0), later), fixed)[0])
+    assert w1 == w2 == fixed
+
+
 def test_device_detail_lines(tmp_path):
     p = tmp_path / "D_CLINK_IPC-1_radar_0.csv"
     with open(p, "w", encoding="utf-8-sig", newline="") as fh:

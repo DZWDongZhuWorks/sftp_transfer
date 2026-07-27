@@ -256,14 +256,19 @@ def collect_logs(log_dir, mode: str = "all") -> list[RunRecord]:
 def aggregate_by_device(
     records: list[RunRecord], now: datetime, stale_hours: float
 ) -> list[DeviceStatus]:
-    """依 device_name 分組，取最新一次執行為代表並計算過期與排序。"""
-    groups: dict[str, list[RunRecord]] = {}
+    """依 (device_name, mode) 分組，取最新一次執行為代表並計算過期與排序。
+
+    以 (device_name, mode) 而非單純 device_name 為鍵：同名 project 的上傳與下載
+    共用同一 device_name（如 ecdis_download / ecdis_upload 皆為 {vsl}_{ipc}_ecdis），
+    合併會遺失其中一個方向；分開才能各自呈現與排查。
+    """
+    groups: dict[tuple[str, str], list[RunRecord]] = {}
     for rec in records:
-        groups.setdefault(rec.device_name, []).append(rec)
+        groups.setdefault((rec.device_name, rec.mode), []).append(rec)
 
     stale_delta = timedelta(hours=stale_hours)
     devices: list[DeviceStatus] = []
-    for device_name, recs in groups.items():
+    for (device_name, _mode), recs in groups.items():
         recs_sorted = sorted(
             recs, key=lambda r: r.started_at or datetime.min, reverse=True
         )
@@ -293,6 +298,111 @@ def aggregate_by_device(
         )
     )
     return devices
+
+
+# ---------------------------------------------------------------------------
+# 階層分群（方向 > vessel > IPC > project）與 rollup
+# ---------------------------------------------------------------------------
+_UNCLASSIFIED_VESSEL = "（未分類）"
+_UNKNOWN_IPC = "—"
+_MODE_LABEL = {"download": "↓ 下載", "upload": "↑ 上傳"}
+_MODE_ORDER = {"download": 0, "upload": 1}
+
+
+@dataclass
+class GroupSummary:
+    """一個群組（mode/vessel/ipc）的 rollup 統計。"""
+
+    total: int = 0
+    ok: int = 0
+    stale: int = 0
+    bad: int = 0
+    worst: str = "success"  # 群內 display_status 最嚴重者
+
+
+@dataclass
+class IpcGroup:
+    name: str
+    summary: GroupSummary
+    devices: list[DeviceStatus]
+
+
+@dataclass
+class VesselGroup:
+    name: str
+    summary: GroupSummary
+    ipcs: list[IpcGroup]
+
+
+@dataclass
+class ModeGroup:
+    mode: str
+    summary: GroupSummary
+    vessels: list[VesselGroup]
+
+
+def _summarize(devices: list[DeviceStatus]) -> GroupSummary:
+    s = GroupSummary(total=len(devices))
+    worst_sev = -1
+    for d in devices:
+        st = d.display_status
+        if st == "success":
+            s.ok += 1
+        elif st == "stale":
+            s.stale += 1
+        else:
+            s.bad += 1
+        sev = _SEVERITY.get(st, 0)
+        if sev > worst_sev:
+            worst_sev, s.worst = sev, st
+    return s
+
+
+def group_is_problem(summary: GroupSummary) -> bool:
+    """群組是否含需關注的裝置（過期 / 失敗 / 中止 / 未完成）→ 預設展開。"""
+    return bool(summary.bad or summary.stale)
+
+
+def _group_sort_key(summary: GroupSummary, name: str):
+    # 未分類 / 未知 IPC 置底；其餘先依 worst 嚴重度 desc、再名稱
+    is_bucket = name in (_UNCLASSIFIED_VESSEL, _UNKNOWN_IPC)
+    return (is_bucket, -_SEVERITY.get(summary.worst, 0), name)
+
+
+def build_tree(devices: list[DeviceStatus]) -> list[ModeGroup]:
+    """把扁平 DeviceStatus 依 mode → vessel → ipc 建成階層樹並由下而上算 rollup。"""
+    tree: dict[str, dict[str, dict[str, list[DeviceStatus]]]] = {}
+    for d in devices:
+        mode = d.latest.mode
+        vessel = d.vessel or _UNCLASSIFIED_VESSEL
+        ipc = d.ipc or _UNKNOWN_IPC
+        tree.setdefault(mode, {}).setdefault(vessel, {}).setdefault(ipc, []).append(d)
+
+    mode_groups: list[ModeGroup] = []
+    for mode in sorted(tree, key=lambda m: _MODE_ORDER.get(m, 9)):
+        vessels: list[VesselGroup] = []
+        mode_devices: list[DeviceStatus] = []
+        for vessel, ipc_map in tree[mode].items():
+            ipcs: list[IpcGroup] = []
+            vessel_devices: list[DeviceStatus] = []
+            for ipc, devs in ipc_map.items():
+                devs_sorted = sorted(
+                    devs, key=lambda d: (-_SEVERITY.get(d.display_status, 0), d.component)
+                )
+                ipcs.append(
+                    IpcGroup(name=ipc, summary=_summarize(devs_sorted), devices=devs_sorted)
+                )
+                vessel_devices.extend(devs_sorted)
+            ipcs.sort(key=lambda g: _group_sort_key(g.summary, g.name))
+            vessels.append(
+                VesselGroup(name=vessel, summary=_summarize(vessel_devices), ipcs=ipcs)
+            )
+            mode_devices.extend(vessel_devices)
+        vessels.sort(key=lambda g: _group_sort_key(g.summary, g.name))
+        mode_groups.append(
+            ModeGroup(mode=mode, summary=_summarize(mode_devices), vessels=vessels)
+        )
+    return mode_groups
 
 
 # ---------------------------------------------------------------------------
@@ -383,6 +493,36 @@ def _detail_str(dev: DeviceStatus) -> str:
     return ""
 
 
+def device_detail_lines(dev: DeviceStatus) -> list[str]:
+    """該裝置最新一次執行的多行純文字明細（與 HTML 明細同源，供 TUI 彈窗/其他純文字用途）。"""
+    rec = dev.latest
+    lines: list[str] = []
+    lines.append(f"裝置：{dev.device_name}（{_MODE_LABEL.get(rec.mode, rec.mode)}）")
+    lines.append(
+        f"狀態：{_STATUS_LABEL.get(dev.display_status, dev.display_status)}"
+        f"｜最後執行：{rec.started_at.strftime(TS_FMT) if rec.started_at else '—'}"
+        f"｜檔案：{'—' if rec.file_count is None else rec.file_count}"
+        f"｜成功/略/失：{_counts_str(rec)}"
+    )
+    if rec.abort_reason:
+        lines.append(f"中止原因：{rec.abort_reason}")
+    if rec.failed_list:
+        lines.append("失敗清單：" + ", ".join(rec.failed_list))
+    for e in rec.errors[-5:]:
+        lines.append(f"ERROR：{e}")
+    for w in rec.warnings[-5:]:
+        lines.append(f"WARNING：{w}")
+    lines.append(f"來源檔：{rec.path.name}｜歷史執行 {dev.run_count} 次")
+    if len(dev.history) > 1:
+        hist = "、".join(
+            (r.started_at.strftime("%m-%d %H:%M") if r.started_at else "—")
+            + f"（{_STATUS_LABEL.get(r.status, r.status)}）"
+            for r in dev.history[:6]
+        )
+        lines.append(f"近期：{hist}")
+    return lines
+
+
 def render_cli(devices: list[DeviceStatus], now: datetime, use_color: bool = True) -> str:
     """組出終端機彩色列表（回傳字串，方便測試）。"""
     lines: list[str] = []
@@ -432,6 +572,90 @@ def render_cli(devices: list[DeviceStatus], now: datetime, use_color: bool = Tru
     return "\n".join(lines)
 
 
+def _summary_badge(s: GroupSummary, use_color: bool) -> str:
+    parts = [f"裝置 {s.total}", _color("32", f"正常 {s.ok}", use_color)]
+    if s.stale:
+        parts.append(_color("33", f"過期 {s.stale}", use_color))
+    if s.bad:
+        parts.append(_color("31", f"異常 {s.bad}", use_color))
+    return "｜".join(parts)
+
+
+def _dot(status: str, use_color: bool) -> str:
+    return _color(_STATUS_COLOR.get(status, "0"), "●", use_color)
+
+
+def render_cli_grouped(
+    mode_groups: list[ModeGroup], now: datetime, use_color: bool = True, expand: str = "auto"
+) -> str:
+    """階層分群的終端機輸出：方向 > vessel > IPC > project。
+
+    expand: 'auto'（正常收合、異常展開）/ 'all'（全展開）/ 'none'（全收合）。
+    收合的群組只印摘要行、不列出下層。
+    """
+    lines: list[str] = []
+    total = sum(m.summary.total for m in mode_groups)
+    ok = sum(m.summary.ok for m in mode_groups)
+    stale = sum(m.summary.stale for m in mode_groups)
+    bad = sum(m.summary.bad for m in mode_groups)
+    lines.append(
+        f"SFTP Log 監視 — 產生於 {now.strftime(TS_FMT)}｜裝置 {total}｜"
+        + _color("32", f"正常 {ok}", use_color)
+        + "｜"
+        + _color("31", f"異常 {bad}", use_color)
+        + "｜"
+        + _color("33", f"過期 {stale}", use_color)
+    )
+    lines.append("=" * 96)
+    if total == 0:
+        lines.append("（無資料：找不到任何可解析的 log）")
+        return "\n".join(lines)
+
+    def is_expanded(summary: GroupSummary) -> bool:
+        if expand == "all":
+            return True
+        if expand == "none":
+            return False
+        return group_is_problem(summary)
+
+    for m in mode_groups:
+        lines.append(
+            f"{_dot(m.summary.worst, use_color)} {_MODE_LABEL.get(m.mode, m.mode)}"
+            f"  [{_summary_badge(m.summary, use_color)}]"
+        )
+        for v in m.vessels:
+            v_exp = is_expanded(v.summary)
+            lines.append(
+                f"  {'▼' if v_exp else '▶'} {_dot(v.summary.worst, use_color)} {v.name}"
+                f"  [{_summary_badge(v.summary, use_color)}]"
+            )
+            if not v_exp:
+                continue
+            for ip in v.ipcs:
+                ip_exp = is_expanded(ip.summary)
+                lines.append(
+                    f"    {'▼' if ip_exp else '▶'} {_dot(ip.summary.worst, use_color)} {ip.name}"
+                    f"  [{_summary_badge(ip.summary, use_color)}]"
+                )
+                if not ip_exp:
+                    continue
+                for d in ip.devices:
+                    rec = d.latest
+                    lines.append(
+                        "      {light} {comp:<22} {last:<18} {files:>6} {counts:>10}"
+                        "  {age:<10} {detail}".format(
+                            light=_dot(d.display_status, use_color),
+                            comp=d.component[:22],
+                            last=rec.started_at.strftime(TS_FMT) if rec.started_at else "—",
+                            files=("—" if rec.file_count is None else str(rec.file_count)),
+                            counts=_counts_str(rec),
+                            age=_humanize_age(d.last_seen, now),
+                            detail=_detail_str(d)[:56],
+                        )
+                    )
+    return "\n".join(lines)
+
+
 # ---------------------------------------------------------------------------
 # 呈現：HTML（單一自包含檔，內嵌 CSS/JS，不引外部資源）
 # ---------------------------------------------------------------------------
@@ -442,112 +666,104 @@ _HTML_TEMPLATE = """<!DOCTYPE html>
 <meta name="viewport" content="width=device-width, initial-scale=1">
 <title>SFTP Log 監視</title>
 <style>
-:root{{--bg:#f7f8fa;--fg:#1c1e21;--muted:#6b7280;--card:#fff;--border:#e3e6ea;
---ok:#188038;--warn:#b8860b;--bad:#d93025;--chiptext:#fff;--hover:#eef1f5;}}
-@media (prefers-color-scheme:dark){{:root{{--bg:#16181c;--fg:#e6e8eb;--muted:#9aa0a6;
---card:#1f2226;--border:#2c3036;--hover:#262a30;}}}}
-*{{box-sizing:border-box;}}
-body{{margin:0;padding:24px;background:var(--bg);color:var(--fg);
-font-family:-apple-system,"Noto Sans TC","Segoe UI",Roboto,sans-serif;}}
-h1{{font-size:20px;margin:0 0 4px;}}
-.meta{{color:var(--muted);font-size:13px;margin-bottom:16px;}}
-.cards{{display:flex;gap:12px;flex-wrap:wrap;margin-bottom:18px;}}
-.card{{background:var(--card);border:1px solid var(--border);border-radius:10px;
-padding:12px 18px;min-width:96px;}}
-.card .n{{font-size:24px;font-weight:700;}}
-.card .l{{font-size:12px;color:var(--muted);}}
-.controls{{margin-bottom:12px;display:flex;gap:10px;flex-wrap:wrap;align-items:center;}}
-input,select{{padding:7px 10px;border:1px solid var(--border);border-radius:8px;
-background:var(--card);color:var(--fg);font-size:14px;}}
-.tablewrap{{overflow-x:auto;background:var(--card);border:1px solid var(--border);
-border-radius:10px;}}
-table{{border-collapse:collapse;width:100%;font-size:14px;}}
-th,td{{padding:9px 12px;text-align:left;border-bottom:1px solid var(--border);
-white-space:nowrap;}}
-th{{cursor:pointer;user-select:none;position:sticky;top:0;background:var(--card);}}
-th:hover{{color:var(--muted);}}
-tbody tr.main{{cursor:pointer;}}
-tbody tr.main:hover{{background:var(--hover);}}
-.chip{{display:inline-block;padding:2px 9px;border-radius:999px;font-size:12px;
-color:var(--chiptext);}}
-.s-success{{background:var(--ok);}} .s-partial,.s-aborted{{background:var(--bad);}}
-.s-incomplete,.s-stale{{background:var(--warn);}}
-.detail{{display:none;}} .detail td{{white-space:normal;color:var(--muted);
-font-size:13px;background:var(--bg);}}
-.detail.open{{display:table-row;}}
-.mono{{font-family:ui-monospace,Menlo,Consolas,monospace;font-size:12px;}}
-.err{{color:var(--bad);}} .warn{{color:var(--warn);}}
-.muted{{color:var(--muted);}}
+:root{--bg:#f7f8fa;--fg:#1c1e21;--muted:#6b7280;--card:#fff;--border:#e3e6ea;
+--ok:#188038;--warn:#b8860b;--bad:#d93025;--chiptext:#fff;--hover:#eef1f5;}
+@media (prefers-color-scheme:dark){:root{--bg:#16181c;--fg:#e6e8eb;--muted:#9aa0a6;
+--card:#1f2226;--border:#2c3036;--hover:#262a30;}}
+*{box-sizing:border-box;}
+body{margin:0;padding:24px;background:var(--bg);color:var(--fg);
+font-family:-apple-system,"Noto Sans TC","Segoe UI",Roboto,sans-serif;}
+h1{font-size:20px;margin:0 0 4px;}
+.meta{color:var(--muted);font-size:13px;margin-bottom:16px;}
+.cards{display:flex;gap:12px;flex-wrap:wrap;margin-bottom:12px;}
+.card{background:var(--card);border:1px solid var(--border);border-radius:10px;padding:12px 18px;min-width:92px;}
+.card .n{font-size:24px;font-weight:700;}
+.card .l{font-size:12px;color:var(--muted);}
+.controls{position:sticky;top:0;z-index:5;background:var(--bg);padding:8px 0;margin-bottom:8px;
+display:flex;gap:8px;flex-wrap:wrap;align-items:center;}
+input,select{padding:7px 10px;border:1px solid var(--border);border-radius:8px;background:var(--card);color:var(--fg);font-size:14px;}
+button{padding:7px 12px;border:1px solid var(--border);border-radius:8px;background:var(--card);color:var(--fg);font-size:13px;cursor:pointer;}
+button:hover{background:var(--hover);}
+label.cb{font-size:13px;display:flex;align-items:center;gap:4px;cursor:pointer;}
+.mode-sec{margin-bottom:18px;}
+.mode-h{font-size:16px;font-weight:700;margin:16px 0 6px;display:flex;align-items:center;gap:10px;}
+details{border:1px solid var(--border);border-radius:8px;margin:6px 0;background:var(--card);overflow:hidden;}
+details.ipc{margin:6px 8px 8px;}
+summary{cursor:pointer;padding:8px 12px;font-weight:600;list-style:none;display:flex;align-items:center;gap:8px;}
+summary::-webkit-details-marker{display:none;}
+.caret{display:inline-block;transition:transform .12s;color:var(--muted);}
+details[open]>summary .caret{transform:rotate(90deg);}
+.badge{font-size:12px;color:var(--muted);font-weight:400;}
+.badge .ok{color:var(--ok);} .badge .warn{color:var(--warn);} .badge .bad{color:var(--bad);}
+.match{font-size:12px;color:var(--warn);font-weight:400;margin-left:4px;}
+.dot{display:inline-block;width:9px;height:9px;border-radius:50%;flex:none;}
+table{border-collapse:collapse;width:100%;font-size:14px;}
+th,td{padding:7px 12px;text-align:left;border-bottom:1px solid var(--border);white-space:nowrap;}
+th{color:var(--muted);font-weight:600;font-size:12px;}
+tr.lf{cursor:pointer;} tr.lf:hover{background:var(--hover);}
+.chip{display:inline-block;padding:2px 9px;border-radius:999px;font-size:12px;color:var(--chiptext);}
+.s-success{background:var(--ok);} .s-partial,.s-aborted{background:var(--bad);}
+.s-incomplete,.s-stale{background:var(--warn);}
+.detail{display:none;} .detail.open{display:table-row;}
+.detail td{white-space:normal;color:var(--muted);font-size:13px;background:var(--bg);}
+.mono{font-family:ui-monospace,Menlo,Consolas,monospace;font-size:12px;}
+.err{color:var(--bad);} .warn{color:var(--warn);} .muted{color:var(--muted);}
+.empty{color:var(--muted);padding:12px;}
 </style>
 </head>
 <body>
 <h1>SFTP 傳輸 Log 監視</h1>
-<div class="meta">產生於 {generated_at}｜來源目錄 <span class="mono">{log_dir}</span>｜過期門檻 {stale_hours} 小時</div>
+<div class="meta">產生於 @@GENERATED_AT@@｜來源目錄 <span class="mono">@@LOG_DIR@@</span>｜過期門檻 @@STALE_HOURS@@ 小時</div>
 <div class="cards">
-  <div class="card"><div class="n">{total}</div><div class="l">裝置</div></div>
-  <div class="card"><div class="n" style="color:var(--ok)">{ok}</div><div class="l">正常</div></div>
-  <div class="card"><div class="n" style="color:var(--bad)">{bad}</div><div class="l">異常</div></div>
-  <div class="card"><div class="n" style="color:var(--warn)">{stale}</div><div class="l">過期</div></div>
+  <div class="card"><div class="n">@@TOTAL@@</div><div class="l">裝置</div></div>
+  <div class="card"><div class="n" style="color:var(--ok)">@@OK@@</div><div class="l">正常</div></div>
+  <div class="card"><div class="n" style="color:var(--bad)">@@BAD@@</div><div class="l">異常</div></div>
+  <div class="card"><div class="n" style="color:var(--warn)">@@STALE@@</div><div class="l">過期</div></div>
 </div>
 <div class="controls">
-  <input id="q" placeholder="搜尋裝置 / 摘要…" oninput="flt()">
-  <select id="st" onchange="flt()">
-    <option value="">全部狀態</option>
-    <option value="success">正常</option>
-    <option value="stale">過期</option>
-    <option value="partial">部分失敗</option>
-    <option value="aborted">中止</option>
-    <option value="incomplete">未完成</option>
-  </select>
-  <span class="muted" style="font-size:13px">點欄位標題可排序、點列可展開明細</span>
+  <input id="q" placeholder="搜尋…">
+  <select id="fm"><option value="">全部方向</option><option value="download">↓ 下載</option><option value="upload">↑ 上傳</option></select>
+  <select id="fv"><option value="">全部船隻</option>@@VESSEL_OPTS@@</select>
+  <select id="fi"><option value="">全部 IPC</option>@@IPC_OPTS@@</select>
+  <select id="fc"><option value="">全部元件</option>@@COMP_OPTS@@</select>
+  <select id="fs"><option value="">全部狀態</option><option value="success">正常</option><option value="stale">過期</option><option value="partial">部分失敗</option><option value="aborted">中止</option><option value="incomplete">未完成</option></select>
+  <label class="cb"><input type="checkbox" id="ob">只看異常</label>
+  <button onclick="expandAll(true)">全部展開</button>
+  <button onclick="expandAll(false)">全部收合</button>
 </div>
-<div class="tablewrap">
-<table id="t">
-<thead><tr>
-<th onclick="srt(0)">狀態</th><th onclick="srt(1)">裝置</th><th onclick="srt(2)">船/IPC</th>
-<th onclick="srt(3)">元件</th><th onclick="srt(4)">方向</th><th onclick="srt(5)">最後執行</th>
-<th onclick="srt(6)">檔案</th><th onclick="srt(7)">成功/略/失</th><th onclick="srt(8)">距今</th>
-<th onclick="srt(9)">摘要</th>
-</tr></thead>
-<tbody>
-{rows}
-</tbody>
-</table>
-</div>
+@@BODY@@
 <script>
-function flt(){{
-  var q=document.getElementById('q').value.toLowerCase();
-  var st=document.getElementById('st').value;
-  document.querySelectorAll('#t tbody tr.main').forEach(function(tr){{
-    var okS=!st||tr.dataset.status===st;
-    var okQ=!q||tr.textContent.toLowerCase().indexOf(q)>=0;
-    var show=okS&&okQ;
+function val(id){var e=document.getElementById(id);return e?e.value:'';}
+function vis(node){return Array.prototype.filter.call(node.querySelectorAll('tr.lf'),function(r){return r.style.display!=='none';}).length;}
+function setMatch(dt){var s=dt.querySelector(':scope > summary .match');if(!s)return;var v=vis(dt),t=dt.querySelectorAll('tr.lf').length;s.textContent=(v===t)?'':'（符合 '+v+'）';}
+function applyFilters(){
+  var q=val('q').toLowerCase(),fm=val('fm'),fv=val('fv'),fi=val('fi'),fc=val('fc'),fs=val('fs');
+  var ob=document.getElementById('ob').checked;
+  document.querySelectorAll('tr.lf').forEach(function(tr){
+    var d=tr.dataset,show=true;
+    if(fm&&d.mode!==fm)show=false;
+    if(fv&&d.vessel!==fv)show=false;
+    if(fi&&d.ipc!==fi)show=false;
+    if(fc&&d.component!==fc)show=false;
+    if(fs&&d.status!==fs)show=false;
+    if(ob&&d.status==='success')show=false;
+    if(q&&tr.textContent.toLowerCase().indexOf(q)<0)show=false;
     tr.style.display=show?'':'none';
-    var d=tr.nextElementSibling;
-    if(d&&d.classList.contains('detail')&&!show){{d.classList.remove('open');}}
-  }});
-}}
-function srt(col){{
-  var tb=document.querySelector('#t tbody');
-  var rows=Array.prototype.slice.call(tb.querySelectorAll('tr.main'));
-  var asc=tb.dataset.col==col&&tb.dataset.dir!='asc'?true:false;
-  rows.sort(function(a,b){{
-    var x=a.children[col].dataset.sort||a.children[col].textContent;
-    var y=b.children[col].dataset.sort||b.children[col].textContent;
-    var nx=parseFloat(x),ny=parseFloat(y);
-    if(!isNaN(nx)&&!isNaN(ny)){{x=nx;y=ny;}}
-    return (x>y?1:x<y?-1:0)*(asc?1:-1);
-  }});
-  tb.dataset.col=col;tb.dataset.dir=asc?'asc':'desc';
-  rows.forEach(function(r){{var d=r.nextElementSibling;tb.appendChild(r);
-    if(d&&d.classList.contains('detail'))tb.appendChild(d);}});
-}}
-document.querySelectorAll('#t tbody tr.main').forEach(function(tr){{
-  tr.addEventListener('click',function(){{
-    var d=tr.nextElementSibling;
-    if(d&&d.classList.contains('detail'))d.classList.toggle('open');
-  }});
-}});
+    var det=tr.nextElementSibling;
+    if(det&&det.classList.contains('detail'))det.classList.remove('open');
+  });
+  document.querySelectorAll('details.ipc').forEach(function(dt){dt.style.display=vis(dt)?'':'none';setMatch(dt);});
+  document.querySelectorAll('details.vessel').forEach(function(dt){dt.style.display=vis(dt)?'':'none';setMatch(dt);});
+  document.querySelectorAll('.mode-sec').forEach(function(sec){sec.style.display=vis(sec)?'':'none';});
+}
+function expandAll(o){document.querySelectorAll('details').forEach(function(d){if(d.style.display!=='none')d.open=o;});}
+document.addEventListener('click',function(e){
+  if(!e.target.closest)return;
+  var tr=e.target.closest('tr.lf');
+  if(tr){var det=tr.nextElementSibling;if(det&&det.classList.contains('detail'))det.classList.toggle('open');}
+});
+['q','fm','fv','fi','fc','fs'].forEach(function(id){var el=document.getElementById(id);if(el){el.addEventListener('input',applyFilters);el.addEventListener('change',applyFilters);}});
+document.getElementById('ob').addEventListener('change',applyFilters);
 </script>
 </body>
 </html>
@@ -587,6 +803,43 @@ def _detail_html(dev: DeviceStatus) -> str:
     return "".join(parts) or '<div class="muted">無額外明細</div>'
 
 
+def _html_badges(summary: GroupSummary) -> str:
+    parts = [f"裝置 {summary.total}", f'<span class="ok">正常 {summary.ok}</span>']
+    if summary.stale:
+        parts.append(f'<span class="warn">過期 {summary.stale}</span>')
+    if summary.bad:
+        parts.append(f'<span class="bad">異常 {summary.bad}</span>')
+    return '<span class="badge">' + " · ".join(parts) + "</span>"
+
+
+def _leaf_row(d: DeviceStatus, generated_at: datetime) -> str:
+    rec = d.latest
+    st = d.display_status
+    vessel = d.vessel or _UNCLASSIFIED_VESSEL
+    ipc = d.ipc or _UNKNOWN_IPC
+    row = (
+        "<tr class='lf' data-mode='{mode}' data-vessel='{v}' data-ipc='{i}' "
+        "data-component='{c}' data-status='{st}'>"
+        "<td><span class='chip s-{st}'>{label}</span></td>"
+        "<td>{comp}</td><td>{last}</td><td>{files}</td><td>{counts}</td>"
+        "<td>{age}</td><td>{detail}</td></tr>"
+    ).format(
+        mode=_esc(rec.mode),
+        v=_esc(vessel),
+        i=_esc(ipc),
+        c=_esc(d.component),
+        st=st,
+        label=_STATUS_LABEL.get(st, st),
+        comp=_esc(d.component),
+        last=_esc(rec.started_at.strftime(TS_FMT) if rec.started_at else "—"),
+        files=("—" if rec.file_count is None else rec.file_count),
+        counts=_esc(_counts_str(rec)),
+        age=_esc(_humanize_age(d.last_seen, generated_at)),
+        detail=_esc(_detail_str(d)),
+    )
+    return row + f"<tr class='detail'><td colspan='7'>{_detail_html(d)}</td></tr>"
+
+
 def render_html(
     devices: list[DeviceStatus],
     out_path,
@@ -594,62 +847,73 @@ def render_html(
     log_dir: str = "",
     stale_hours: float = 24,
 ) -> Path:
-    """產生單一自包含 HTML 報告，回傳寫出的路徑。"""
+    """產生單一自包含 HTML 報告（方向>vessel>IPC>project 巢狀可折疊 + 多維過濾）。"""
     out_path = Path(out_path)
     total = len(devices)
     ok = sum(1 for d in devices if d.display_status == "success")
     stale = sum(1 for d in devices if d.display_status == "stale")
     bad = total - ok - stale
+    tree = build_tree(devices)
 
-    rows: list[str] = []
-    for d in devices:
-        rec = d.latest
-        st = d.display_status
-        age_secs = (
-            int((generated_at - d.last_seen).total_seconds()) if d.last_seen else -1
+    def _opts(vals):
+        return "".join(f"<option value='{_esc(v)}'>{_esc(v)}</option>" for v in sorted(vals))
+
+    vessel_opts = _opts({d.vessel or _UNCLASSIFIED_VESSEL for d in devices})
+    ipc_opts = _opts({d.ipc or _UNKNOWN_IPC for d in devices})
+    comp_opts = _opts({d.component for d in devices})
+
+    parts: list[str] = []
+    for m in tree:
+        parts.append(
+            f'<section class="mode-sec"><div class="mode-h">'
+            f'<span class="dot s-{m.summary.worst}"></span>'
+            f"{_esc(_MODE_LABEL.get(m.mode, m.mode))}{_html_badges(m.summary)}</div>"
         )
-        sort_ts = rec.started_at.strftime("%Y%m%d%H%M%S") if rec.started_at else "0"
-        counts = _counts_str(rec)
-        rows.append(
-            "<tr class='main' data-status='{st}'>"
-            "<td data-sort='{sev}'><span class='chip s-{st}'>{label}</span></td>"
-            "<td>{dev}</td><td>{vi}</td><td>{comp}</td><td>{mode}</td>"
-            "<td data-sort='{sort_ts}'>{last}</td>"
-            "<td data-sort='{files_sort}'>{files}</td>"
-            "<td>{counts}</td>"
-            "<td data-sort='{age}'>{age_h}</td><td>{detail}</td>"
-            "</tr>".format(
-                st=st,
-                sev=_SEVERITY.get(st, 0),
-                label=_STATUS_LABEL.get(st, st),
-                dev=_esc(d.device_name),
-                vi=_esc("/".join(x for x in (d.vessel, d.ipc) if x) or "—"),
-                comp=_esc(d.component),
-                mode="↓ 下載" if rec.mode == "download" else "↑ 上傳",
-                sort_ts=sort_ts,
-                last=_esc(rec.started_at.strftime(TS_FMT) if rec.started_at else "—"),
-                files_sort=(rec.file_count if rec.file_count is not None else -1),
-                files=("—" if rec.file_count is None else rec.file_count),
-                counts=_esc(counts),
-                age=age_secs,
-                age_h=_esc(_humanize_age(d.last_seen, generated_at)),
-                detail=_esc(_detail_str(d)),
+        for v in m.vessels:
+            vopen = " open" if group_is_problem(v.summary) else ""
+            parts.append(
+                f'<details class="vessel" data-vessel="{_esc(v.name)}"{vopen}>'
+                f'<summary><span class="caret">▶</span>'
+                f'<span class="dot s-{v.summary.worst}"></span>{_esc(v.name)}'
+                f'{_html_badges(v.summary)}<span class="match"></span></summary>'
             )
-        )
-        rows.append(
-            f"<tr class='detail'><td colspan='10'>{_detail_html(d)}</td></tr>"
-        )
-
-    doc = _HTML_TEMPLATE.format(
-        generated_at=_esc(generated_at.strftime(TS_FMT)),
-        log_dir=_esc(log_dir),
-        stale_hours=_esc(stale_hours),
-        total=total,
-        ok=ok,
-        bad=bad,
-        stale=stale,
-        rows="\n".join(rows) if rows else "<tr><td colspan='10'>（無資料）</td></tr>",
+            for ip in v.ipcs:
+                iopen = " open" if group_is_problem(ip.summary) else ""
+                parts.append(
+                    f'<details class="ipc" data-ipc="{_esc(ip.name)}"{iopen}>'
+                    f'<summary><span class="caret">▶</span>'
+                    f'<span class="dot s-{ip.summary.worst}"></span>{_esc(ip.name)}'
+                    f'{_html_badges(ip.summary)}<span class="match"></span></summary>'
+                    "<table><thead><tr>"
+                    "<th>狀態</th><th>元件</th><th>最後執行</th><th>檔案</th>"
+                    "<th>成功/略/失</th><th>距今</th><th>摘要</th></tr></thead><tbody>"
+                )
+                for d in ip.devices:
+                    parts.append(_leaf_row(d, generated_at))
+                parts.append("</tbody></table></details>")
+            parts.append("</details>")
+        parts.append("</section>")
+    body = (
+        "".join(parts)
+        if total
+        else '<div class="empty">（無資料：找不到任何可解析的 log）</div>'
     )
+
+    doc = _HTML_TEMPLATE
+    for token, value in [
+        ("@@GENERATED_AT@@", _esc(generated_at.strftime(TS_FMT))),
+        ("@@LOG_DIR@@", _esc(log_dir)),
+        ("@@STALE_HOURS@@", _esc(stale_hours)),
+        ("@@TOTAL@@", str(total)),
+        ("@@OK@@", str(ok)),
+        ("@@BAD@@", str(bad)),
+        ("@@STALE@@", str(stale)),
+        ("@@VESSEL_OPTS@@", vessel_opts),
+        ("@@IPC_OPTS@@", ipc_opts),
+        ("@@COMP_OPTS@@", comp_opts),
+        ("@@BODY@@", body),
+    ]:
+        doc = doc.replace(token, value)
     out_path.parent.mkdir(parents=True, exist_ok=True)
     out_path.write_text(doc, encoding="utf-8")
     return out_path
@@ -670,21 +934,54 @@ def build_parser() -> argparse.ArgumentParser:
         nargs="?",
         const="__auto__",
         default=None,
-        help="另存 HTML 報告；可接路徑，不接則存到 logs/log_monitor_<時間>.html",
+        help="另存 HTML 報告；可接路徑，不接則覆寫 <log-dir>/log_monitor.html",
     )
     p.add_argument("--sync-config", default=None, help="分析前先用此 download 設定檔觸發本體下載遠端 log")
     p.add_argument("--watch", type=float, default=None, help="每 N 秒刷新（搭配 --sync-config 才會重新下載）")
     p.add_argument("--vessel", default=None, help="只顯示指定船名（vessel）")
-    p.add_argument("--component", default=None, help="只顯示指定元件（component）")
+    p.add_argument("--ipc", default=None, help="只顯示指定 IPC")
+    p.add_argument("--component", default=None, help="只顯示指定元件（project/component）")
+    p.add_argument(
+        "--status",
+        choices=["ok", "stale", "problem", "all"],
+        default="all",
+        help="只顯示某狀態：ok=正常、stale=過期、problem=失敗/中止/未完成",
+    )
+    p.add_argument("--flat", action="store_true", help="改用舊的平面表格（不分群）")
+    p.add_argument(
+        "--tui",
+        action="store_true",
+        help="互動式終端機介面（curses）：可鍵盤展開/收合/搜尋/過濾/看明細；非 TTY 自動退回靜態輸出",
+    )
+    grp = p.add_mutually_exclusive_group()
+    grp.add_argument("--expand-all", action="store_true", help="分群時全部展開")
+    grp.add_argument("--collapsed", action="store_true", help="分群時全部收合")
     p.add_argument("--no-color", action="store_true", help="停用 ANSI 顏色")
     return p
 
 
-def _apply_filters(devices, vessel, component):
+def _status_matches(dev: DeviceStatus, status: str) -> bool:
+    if status == "all":
+        return True
+    st = dev.display_status
+    if status == "ok":
+        return st == "success"
+    if status == "stale":
+        return st == "stale"
+    if status == "problem":
+        return st not in ("success", "stale")
+    return True
+
+
+def _apply_filters(devices, vessel=None, ipc=None, component=None, status="all"):
     if vessel:
         devices = [d for d in devices if d.vessel == vessel]
+    if ipc:
+        devices = [d for d in devices if d.ipc == ipc]
     if component:
         devices = [d for d in devices if d.component == component]
+    if status and status != "all":
+        devices = [d for d in devices if _status_matches(d, status)]
     return devices
 
 
@@ -694,12 +991,22 @@ def _run_once(args, use_color: bool) -> tuple[str, list[DeviceStatus]]:
     now = datetime.now()
     records = collect_logs(args.log_dir, mode=args.mode)
     devices = aggregate_by_device(records, now=now, stale_hours=args.stale_hours)
-    devices = _apply_filters(devices, args.vessel, args.component)
-    out = render_cli(devices, now=now, use_color=use_color)
+    devices = _apply_filters(
+        devices, args.vessel, args.ipc, args.component, args.status
+    )
+    if args.flat:
+        out = render_cli(devices, now=now, use_color=use_color)
+    else:
+        expand = "all" if args.expand_all else "none" if args.collapsed else "auto"
+        out = render_cli_grouped(
+            build_tree(devices), now=now, use_color=use_color, expand=expand
+        )
 
     if args.html is not None:
         if args.html == "__auto__":
-            html_path = Path(args.log_dir) / f"log_monitor_{now.strftime('%Y%m%d_%H%M%S')}.html"
+            # 固定檔名、覆寫同一份：--watch 就是原地刷新的儀表板，不會堆積檔案。
+            # 需保留歷史快照時，改用 --html <明確路徑>。
+            html_path = Path(args.log_dir) / "log_monitor.html"
         else:
             html_path = Path(args.html)
         render_html(
@@ -716,6 +1023,17 @@ def _run_once(args, use_color: bool) -> tuple[str, list[DeviceStatus]]:
 def main(argv=None) -> int:
     args = build_parser().parse_args(argv)
     use_color = (not args.no_color) and sys.stdout.isatty()
+
+    if args.tui:
+        if not sys.stdout.isatty():
+            print("[INFO] 非互動式終端機，改用靜態輸出。", file=sys.stderr)
+        else:
+            try:
+                from monitor import tui
+            except Exception as exc:  # pragma: no cover - 極少數環境缺 curses
+                print(f"[WARN] 無法載入 TUI（{exc}），改用靜態輸出。", file=sys.stderr)
+            else:
+                return tui.run_app(args)
 
     if args.watch:
         try:

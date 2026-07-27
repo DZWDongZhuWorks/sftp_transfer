@@ -12,10 +12,13 @@ import pytest
 from monitor.log_monitor import (
     aggregate_by_device,
     build_parser,
+    build_tree,
     collect_logs,
+    group_is_problem,
     parse_device_name,
     parse_log_file,
     render_cli,
+    render_cli_grouped,
     render_html,
     sync_logs,
 )
@@ -274,7 +277,7 @@ def test_render_empty(tmp_path):
     assert "無資料" in out
     html_out = tmp_path / "e.html"
     render_html([], html_out, generated_at=now)
-    assert "（無資料）" in html_out.read_text(encoding="utf-8")
+    assert "無資料" in html_out.read_text(encoding="utf-8")
 
 
 # --- sync_logs -------------------------------------------------------------
@@ -305,3 +308,162 @@ def test_build_parser_defaults():
     assert args.mode == "all"
     assert args.stale_hours == 24
     assert args.html is None
+    assert args.flat is False
+    assert args.status == "all"
+
+
+# ===========================================================================
+# v2：階層分群 + 折疊 + 過濾
+# ===========================================================================
+NOW = datetime(2026, 7, 27, 12, 0, 0)
+_RECENT = "2026-07-27 11:00:00"  # 1 小時前（未過期）
+_OLD = "2026-07-20 11:00:00"     # 7 天前（過期）
+
+
+def _summary_rows(direction, when, success, skipped, failed):
+    verb = "下載" if direction == "download" else "上傳"
+    return [
+        (when, "INFO", f"=== SFTP {verb}任務開始 ==="),
+        (when, "INFO", f"=== {verb}任務結束：成功 {success}，略過 {skipped}，失敗 {failed} ==="),
+    ]
+
+
+def _devices(tmp_path, stale_hours=24):
+    return aggregate_by_device(collect_logs(tmp_path), now=NOW, stale_hours=stale_hours)
+
+
+def test_aggregate_splits_upload_download_same_device(tmp_path):
+    # 同一 device_name 同時有下載與上傳 log → 應拆成 2 個 device
+    write_log(
+        tmp_path / "D_CLINK_IPC-1_ecdis_20260727_110000.csv",
+        "CLINK_IPC-1_ecdis",
+        _summary_rows("download", _RECENT, 5, 0, 0),
+    )
+    write_log(
+        tmp_path / "U_CLINK_IPC-1_ecdis_20260727_110000.csv",
+        "CLINK_IPC-1_ecdis",
+        _summary_rows("upload", _RECENT, 3, 0, 0),
+    )
+    devices = _devices(tmp_path)
+    modes = sorted(d.latest.mode for d in devices)
+    assert modes == ["download", "upload"]
+    assert len(devices) == 2
+
+
+def test_build_tree_hierarchy_and_rollup(tmp_path):
+    write_log(  # download CLINK/IPC-1/ecdis 正常
+        tmp_path / "D_CLINK_IPC-1_ecdis_20260727_110000.csv",
+        "CLINK_IPC-1_ecdis",
+        _summary_rows("download", _RECENT, 5, 0, 0),
+    )
+    write_log(  # download CLINK/IPC-1/radar 部分失敗
+        tmp_path / "D_CLINK_IPC-1_radar_20260727_110000.csv",
+        "CLINK_IPC-1_radar",
+        _summary_rows("download", _RECENT, 1, 0, 2),
+    )
+    write_log(  # upload 靜態名（無 vessel/ipc）
+        tmp_path / "U_RADAR_UPLOADER_20260727_110000.csv",
+        "RADAR_UPLOADER",
+        _summary_rows("upload", _RECENT, 4, 0, 0),
+    )
+    tree = build_tree(_devices(tmp_path))
+
+    modes = [m.mode for m in tree]
+    assert modes == ["download", "upload"]  # download 先於 upload
+
+    dl = tree[0]
+    assert dl.summary.total == 2 and dl.summary.ok == 1 and dl.summary.bad == 1
+    assert dl.summary.worst == "partial"
+    clink = dl.vessels[0]
+    assert clink.name == "CLINK"
+    assert clink.ipcs[0].name == "IPC-1"
+    comps = {d.component for d in clink.ipcs[0].devices}
+    assert comps == {"ecdis", "radar"}
+    # 問題元件（radar）排在健康元件（ecdis）之前
+    assert clink.ipcs[0].devices[0].component == "radar"
+
+    ul = tree[1]
+    assert ul.vessels[0].name == "（未分類）"
+    assert ul.vessels[0].ipcs[0].name == "—"
+
+
+def test_group_is_problem():
+    from monitor.log_monitor import GroupSummary
+
+    assert group_is_problem(GroupSummary(total=3, ok=3)) is False
+    assert group_is_problem(GroupSummary(total=3, ok=2, stale=1, worst="stale")) is True
+    assert group_is_problem(GroupSummary(total=1, bad=1, worst="partial")) is True
+
+
+def test_render_cli_grouped_collapses_healthy(tmp_path):
+    write_log(  # 健康船：WH999 全部正常且新鮮
+        tmp_path / "D_WH999_IPC-1_ecdis_20260727_110000.csv",
+        "WH999_IPC-1_ecdis",
+        _summary_rows("download", _RECENT, 5, 0, 0),
+    )
+    write_log(  # 問題船：CLINK 有失敗
+        tmp_path / "D_CLINK_IPC-1_radar_20260727_110000.csv",
+        "CLINK_IPC-1_radar",
+        _summary_rows("download", _RECENT, 0, 0, 3),
+    )
+    tree = build_tree(_devices(tmp_path))
+
+    auto = render_cli_grouped(tree, now=NOW, use_color=False, expand="auto")
+    # 問題船 CLINK 展開 → 列出 radar；健康船 WH999 收合 → 不列 ecdis
+    assert "radar" in auto
+    assert "ecdis" not in auto
+    assert "WH999" in auto  # 摘要行仍在
+
+    all_exp = render_cli_grouped(tree, now=NOW, use_color=False, expand="all")
+    assert "ecdis" in all_exp and "radar" in all_exp
+
+    none_exp = render_cli_grouped(tree, now=NOW, use_color=False, expand="none")
+    assert "ecdis" not in none_exp and "radar" not in none_exp
+
+    assert "\033[" not in auto  # --no-color
+
+
+def test_render_html_grouped_structure(tmp_path):
+    write_log(
+        tmp_path / "D_CLINK_IPC-1_ecdis_20260727_110000.csv",
+        "CLINK_IPC-1_ecdis",
+        _summary_rows("download", _RECENT, 5, 0, 0),
+    )
+    write_log(  # 問題船：過期
+        tmp_path / "D_WH289_IPC-1_radar_20260720_110000.csv",
+        "WH289_IPC-1_radar",
+        _summary_rows("download", _OLD, 5, 0, 0),
+    )
+    out = tmp_path / "r.html"
+    render_html(_devices(tmp_path), out, generated_at=NOW, log_dir=str(tmp_path))
+    content = out.read_text(encoding="utf-8")
+
+    assert "↓ 下載" in content
+    assert 'details class="vessel"' in content
+    assert 'details class="ipc"' in content
+    assert "data-vessel=" in content and "data-ipc=" in content
+    assert "data-component=" in content and "data-status=" in content
+    # 控制列
+    assert 'id="fv"' in content and 'id="fi"' in content and 'id="fs"' in content
+    assert "只看異常" in content
+    # 過期船（WH289）群組預設展開；正常船（CLINK）收合
+    assert 'data-vessel="WH289" open' in content
+    assert 'data-vessel="CLINK">' in content  # 無 open
+
+
+def test_render_html_upload_download_sections(tmp_path):
+    write_log(
+        tmp_path / "D_CLINK_IPC-1_ecdis_20260727_110000.csv",
+        "CLINK_IPC-1_ecdis",
+        _summary_rows("download", _RECENT, 5, 0, 0),
+    )
+    write_log(
+        tmp_path / "U_CLINK_IPC-1_ecdis_20260727_110000.csv",
+        "CLINK_IPC-1_ecdis",
+        _summary_rows("upload", _RECENT, 3, 0, 0),
+    )
+    out = tmp_path / "r.html"
+    render_html(_devices(tmp_path), out, generated_at=NOW)
+    content = out.read_text(encoding="utf-8")
+    assert "↓ 下載" in content and "↑ 上傳" in content
+    assert content.count("mode-sec") >= 2

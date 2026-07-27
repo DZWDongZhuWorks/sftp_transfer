@@ -21,9 +21,15 @@ import paramiko
 from gitignore import GitIgnoreSpec
 
 CHUNK_SIZE = 32768
-SOCKET_TIMEOUT = 30
+SOCKET_TIMEOUT = 120
 KEEPALIVE_INTERVAL = 15
 MANIFEST_FILENAME = ".sftp_download_manifest.json"
+SFTP_RETRY_EXCEPTIONS = (
+    paramiko.SSHException,
+    paramiko.SFTPError,
+    OSError,
+    EOFError,
+)
 
 _FILENAME_UNSAFE = re.compile(r'[<>:"/\\|?*]')
 
@@ -34,6 +40,11 @@ def format_size(num_bytes):
         if size < 1024 or unit == "GB":
             return f"{size:.1f}{unit}"
         size /= 1024
+
+
+def format_exception(error):
+    """保留例外類型與 repr；即使 socket.timeout 沒有訊息，Log 仍可辨識原因。"""
+    return f"{type(error).__name__}: {error!r}"
 
 
 class _CSVFileHandler(logging.Handler):
@@ -174,6 +185,9 @@ class SFTPBase:
 
     def _connect(self):
         self.logger.info(f"正在連線至 {self.host}:{self.port} ...")
+        # 每次建立新連線前先清掉舊的 SFTP channel / SSH transport，避免斷線
+        # 重連時殘留半開連線，累積占用本機與伺服器端資源。
+        self._close()
         client = paramiko.SSHClient()
         client.load_system_host_keys()
         client.set_missing_host_key_policy(paramiko.AutoAddPolicy())
@@ -182,13 +196,23 @@ class SFTPBase:
             connect_kwargs["key_filename"] = self.key_file
         else:
             connect_kwargs["password"] = self.password
-        client.connect(**connect_kwargs)
+        try:
+            client.connect(**connect_kwargs)
+            sftp = client.open_sftp()
+            # 若無此逾時設定，連線在傳輸中途「無聲斷線」（如網路線拔掉、Wi-Fi 斷線）時，
+            # 讀寫呼叫會永遠卡住不會丟出例外，導致斷線重連機制永遠不會被觸發。
+            sftp.get_channel().settimeout(SOCKET_TIMEOUT)
+            client.get_transport().set_keepalive(KEEPALIVE_INTERVAL)
+        except Exception:
+            # 連線或 SFTP subsystem 初始化到一半失敗時，client 尚未掛到
+            # self.client，需在此主動關閉，否則 _close() 無法清掉。
+            try:
+                client.close()
+            except Exception:
+                pass
+            raise
         self.client = client
-        self.sftp = client.open_sftp()
-        # 若無此逾時設定，連線在傳輸中途「無聲斷線」（如網路線拔掉、Wi-Fi 斷線）時，
-        # 讀寫呼叫會永遠卡住不會丟出例外，導致斷線重連機制永遠不會被觸發。
-        self.sftp.get_channel().settimeout(SOCKET_TIMEOUT)
-        client.get_transport().set_keepalive(KEEPALIVE_INTERVAL)
+        self.sftp = sftp
         self.logger.info("連線成功")
 
     def _connect_with_retry(self):
@@ -200,9 +224,9 @@ class SFTPBase:
             except paramiko.AuthenticationException:
                 self.logger.error("連線失敗：帳號或密碼錯誤")
                 raise
-            except (paramiko.SSHException, OSError) as e:
+            except SFTP_RETRY_EXCEPTIONS as e:
                 attempts += 1
-                self.logger.warning(f"連線失敗（第 {attempts} 次）：{e}")
+                self.logger.warning(f"連線失敗（第 {attempts} 次）：{format_exception(e)}")
                 if not self.auto_reconnect or self._retry_limit_reached(attempts):
                     self.logger.error("已達重試上限，放棄連線")
                     raise
@@ -227,11 +251,15 @@ class SFTPBase:
                 self.sftp.close()
         except Exception:
             pass
+        finally:
+            self.sftp = None
         try:
             if self.client:
                 self.client.close()
         except Exception:
             pass
+        finally:
+            self.client = None
 
     def _load_ignore_spec(self):
         """讀取「忽略設定檔」（格式同 .gitignore）。未設定或檔案不存在代表無需忽略；
@@ -321,7 +349,7 @@ class SFTPBase:
             self.sftp.put(str(self.log_file), remote_name)
             self.logger.info(f"Log 上傳完成: {remote_name}")
         except Exception as e:
-            self.logger.error(f"Log 上傳失敗: {e}")
+            self.logger.error(f"Log 上傳失敗: {format_exception(e)}")
         finally:
             self._close()
 
@@ -604,10 +632,12 @@ class SFTPDownloader(SFTPBase):
                                 # 其餘存在的來源照常下載。FileNotFoundError 為 OSError 子類，需在此個別攔截，
                                 # 才不會被外層的網路錯誤分支當成連線問題而觸發重連。
                                 self.logger.warning(f"遠端路徑不存在，略過此來源: {current_root}")
-                    except (paramiko.SSHException, OSError, EOFError) as e:
+                    except SFTP_RETRY_EXCEPTIONS as e:
                         file_list = None
                         list_attempts += 1
-                        self.logger.warning(f"列出遠端檔案清單發生錯誤（第 {list_attempts} 次）: {e}")
+                        self.logger.warning(
+                            f"列出遠端檔案清單發生錯誤（第 {list_attempts} 次）: {format_exception(e)}"
+                        )
                         if not self.auto_reconnect or self._retry_limit_reached(list_attempts):
                             self.logger.error("已達重試上限，任務中止")
                             return False
@@ -647,9 +677,11 @@ class SFTPDownloader(SFTPBase):
                             self.logger.error(f"檔案不存在: {rel_path}: {e}")
                             failed.append(rel_path)
                             break
-                        except (paramiko.SSHException, OSError, EOFError) as e:
+                        except SFTP_RETRY_EXCEPTIONS as e:
                             attempts += 1
-                            self.logger.warning(f"下載 {rel_path} 發生錯誤（第 {attempts} 次）: {e}")
+                            self.logger.warning(
+                                f"下載 {rel_path} 發生錯誤（第 {attempts} 次）: {format_exception(e)}"
+                            )
                             if not self.auto_reconnect or self._retry_limit_reached(attempts):
                                 self.logger.error(f"檔案 {rel_path} 下載失敗，放棄重試")
                                 failed.append(rel_path)
@@ -663,7 +695,7 @@ class SFTPDownloader(SFTPBase):
             self.logger.error("=== 任務中止：帳號或密碼錯誤 ===")
             return False
         except Exception as e:
-            self.logger.error(f"=== 任務中止：{e} ===")
+            self.logger.error(f"=== 任務中止：{format_exception(e)} ===")
             return False
         finally:
             self._close()

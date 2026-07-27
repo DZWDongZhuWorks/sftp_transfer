@@ -37,6 +37,18 @@ class TestFormatSize:
 
 
 # ---------------------------------------------------------------------------
+# format_exception
+# ---------------------------------------------------------------------------
+
+class TestFormatException:
+    def test_includes_type_and_repr_for_empty_message_exception(self):
+        assert dl.format_exception(TimeoutError()) == "TimeoutError: TimeoutError()"
+
+    def test_includes_type_and_message(self):
+        assert dl.format_exception(OSError("connection reset")) == "OSError: OSError('connection reset')"
+
+
+# ---------------------------------------------------------------------------
 # _retry_limit_reached
 # ---------------------------------------------------------------------------
 
@@ -68,6 +80,9 @@ class TestRetryLimitReached:
 # ---------------------------------------------------------------------------
 
 class TestConnect:
+    def test_socket_timeout_is_tuned_for_slow_wan_links(self):
+        assert dl.SOCKET_TIMEOUT == 120
+
     @patch("downloader.paramiko.SSHClient")
     def test_password_auth_connects_and_configures_timeouts(self, mock_ssh_client_cls, downloader_factory):
         mock_client = MagicMock()
@@ -87,6 +102,39 @@ class TestConnect:
         mock_transport.set_keepalive.assert_called_once_with(dl.KEEPALIVE_INTERVAL)
         assert d.client is mock_client
         assert d.sftp is mock_sftp
+
+    @patch("downloader.paramiko.SSHClient")
+    def test_closes_previous_connection_before_reconnecting(self, mock_ssh_client_cls, downloader_factory):
+        old_sftp = MagicMock()
+        old_client = MagicMock()
+        new_client = MagicMock()
+        new_sftp = MagicMock()
+        new_client.open_sftp.return_value = new_sftp
+        mock_ssh_client_cls.return_value = new_client
+
+        d = downloader_factory(password="secret")
+        d.sftp = old_sftp
+        d.client = old_client
+        d._connect()
+
+        old_sftp.close.assert_called_once()
+        old_client.close.assert_called_once()
+        assert d.sftp is new_sftp
+        assert d.client is new_client
+
+    @patch("downloader.paramiko.SSHClient")
+    def test_failed_new_connection_is_closed(self, mock_ssh_client_cls, downloader_factory):
+        new_client = MagicMock()
+        new_client.connect.side_effect = OSError("refused")
+        mock_ssh_client_cls.return_value = new_client
+
+        d = downloader_factory(password="secret")
+        with pytest.raises(OSError):
+            d._connect()
+
+        new_client.close.assert_called_once()
+        assert d.sftp is None
+        assert d.client is None
 
     @patch("downloader.paramiko.SSHClient")
     def test_key_file_auth_used_instead_of_password(self, mock_ssh_client_cls, downloader_factory):
@@ -134,6 +182,12 @@ class TestConnectWithRetry:
         d._connect = MagicMock(side_effect=[OSError("refused"), OSError("refused"), None])
         d._connect_with_retry()
         assert d._connect.call_count == 3
+
+    def test_retries_after_sftp_protocol_error(self, downloader_factory):
+        d = downloader_factory(retry_count=2, wait_for_network=False)
+        d._connect = MagicMock(side_effect=[paramiko.SFTPError("Garbage packet received"), None])
+        d._connect_with_retry()
+        assert d._connect.call_count == 2
 
     def test_raises_after_exceeding_retry_limit(self, downloader_factory):
         d = downloader_factory(retry_count=2, wait_for_network=False)
@@ -201,13 +255,23 @@ class TestClose:
 
     def test_close_swallows_exceptions_from_sftp_and_client(self, downloader_factory):
         d = downloader_factory()
-        d.sftp = MagicMock()
-        d.sftp.close.side_effect = Exception("already closed")
-        d.client = MagicMock()
-        d.client.close.side_effect = Exception("already closed")
+        sftp = MagicMock()
+        sftp.close.side_effect = Exception("already closed")
+        client = MagicMock()
+        client.close.side_effect = Exception("already closed")
+        d.sftp = sftp
+        d.client = client
         d._close()  # 不應向外拋出
-        d.sftp.close.assert_called_once()
-        d.client.close.assert_called_once()
+        sftp.close.assert_called_once()
+        client.close.assert_called_once()
+
+    def test_close_clears_stale_connection_references(self, downloader_factory):
+        d = downloader_factory()
+        d.sftp = MagicMock()
+        d.client = MagicMock()
+        d._close()
+        assert d.sftp is None
+        assert d.client is None
 
 
 # ---------------------------------------------------------------------------
@@ -772,10 +836,12 @@ class TestEnsureRemoteDir:
         d = downloader_factory(remote_log_dir="/fleet/WH289/IPC-1/sftp_logs", log_file=str(log_file))
         d.logger.addHandler(logging.NullHandler())
         d._connect_with_retry = MagicMock()
-        d.sftp = fake_sftp_factory(files={})
+        sftp = fake_sftp_factory(files={})
+        d.sftp = sftp
         d._upload_log_file()
-        assert "/fleet/WH289/IPC-1/sftp_logs" in d.sftp.dirs
-        assert "/fleet/WH289/IPC-1/sftp_logs/run.csv" in d.sftp.files
+        assert "/fleet/WH289/IPC-1/sftp_logs" in sftp.dirs
+        assert "/fleet/WH289/IPC-1/sftp_logs/run.csv" in sftp.files
+        assert d.sftp is None
 
 
 class TestUploadLogFile:
@@ -785,9 +851,11 @@ class TestUploadLogFile:
         d = downloader_factory(remote_log_dir="/data/logs", log_file=str(log_file))
         d.logger.addHandler(logging.NullHandler())
         d._connect_with_retry = MagicMock()
-        d.sftp = fake_sftp_factory(files={})
+        sftp = fake_sftp_factory(files={})
+        d.sftp = sftp
         d._upload_log_file()
-        assert "/data/logs/run.csv" in d.sftp.files
+        assert "/data/logs/run.csv" in sftp.files
+        assert d.sftp is None
 
     def test_upload_failure_is_caught_and_does_not_propagate(self, downloader_factory, tmp_path):
         log_file = tmp_path / "run.csv"
@@ -967,6 +1035,24 @@ class TestRun:
         result = d.run()
         assert result is True
 
+    def test_sftp_error_while_listing_retries_then_succeeds(self, downloader_factory, fake_sftp_factory):
+        d = downloader_factory(wait_for_network=False, retry_count=2)
+        good_sftp = fake_sftp_factory(files={"/remote/a.txt": b"A"}, mtimes={"/remote/a.txt": 1})
+        d._connect_with_retry = MagicMock(side_effect=lambda: setattr(d, "sftp", good_sftp))
+        d._close = MagicMock()
+        original_list = d._list_remote_files
+        state = {"failed_once": False}
+
+        def flaky_list(remote_root, local_root):
+            if not state["failed_once"]:
+                state["failed_once"] = True
+                raise paramiko.SFTPError("Garbage packet received")
+            return original_list(remote_root, local_root)
+
+        d._list_remote_files = MagicMock(side_effect=flaky_list)
+        assert d.run() is True
+        assert d._connect_with_retry.call_count == 2
+
     def test_listing_error_exceeds_retry_limit_returns_false(self, downloader_factory):
         d = downloader_factory(wait_for_network=False, retry_count=1)
         d._connect_with_retry = MagicMock()
@@ -1013,6 +1099,27 @@ class TestRun:
         result = d.run()
         assert result is True
         assert d._connect_with_retry.call_count >= 2  # 初次連線 + 下載失敗後重連
+
+    def test_sftp_error_during_download_reconnects_and_succeeds(self, downloader_factory, fake_sftp_factory):
+        d = self._prepare(
+            downloader_factory,
+            fake_sftp_factory,
+            files={"/remote/a.txt": b"A"},
+            mtimes={"/remote/a.txt": 1},
+            retry_count=2,
+        )
+        original_download = d._download_one_file
+        state = {"failed_once": False}
+
+        def flaky_download(remote_file, rel_path, local_root):
+            if not state["failed_once"]:
+                state["failed_once"] = True
+                raise paramiko.SFTPError("Garbage packet received")
+            return original_download(remote_file, rel_path, local_root)
+
+        d._download_one_file = MagicMock(side_effect=flaky_download)
+        assert d.run() is True
+        assert d._connect_with_retry.call_count >= 2
 
     def test_connection_error_exceeds_retry_limit_marks_file_failed_but_continues(self, downloader_factory, fake_sftp_factory):
         d = self._prepare(

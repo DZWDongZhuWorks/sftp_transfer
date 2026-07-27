@@ -408,34 +408,114 @@ def build_tree(devices: list[DeviceStatus]) -> list[ModeGroup]:
 # ---------------------------------------------------------------------------
 # 選配：觸發本體下載遠端 log
 # ---------------------------------------------------------------------------
-def sync_logs(sync_config, timeout: float | None = 600) -> bool:
+def _run_with_output_callback(command, cwd, timeout, output_callback):
+    """執行子行程並逐行回傳合併後的 stdout/stderr，同時保留 timeout。"""
+    import queue
+    import threading
+    import time
+
+    proc = subprocess.Popen(
+        command,
+        cwd=cwd,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.STDOUT,
+        text=True,
+        encoding="utf-8",
+        errors="replace",
+        bufsize=1,
+    )
+    pending = queue.Queue()
+    finished = object()
+
+    def read_output():
+        try:
+            for line in proc.stdout:
+                pending.put(line)
+        finally:
+            pending.put(finished)
+
+    reader = threading.Thread(target=read_output, daemon=True)
+    reader.start()
+    deadline = None if timeout is None else time.monotonic() + timeout
+    reader_done = False
+    try:
+        while not (reader_done and proc.poll() is not None):
+            if deadline is not None:
+                remaining = deadline - time.monotonic()
+                if remaining <= 0:
+                    raise subprocess.TimeoutExpired(command, timeout)
+                wait = min(0.1, remaining)
+            else:
+                wait = 0.1
+            try:
+                item = pending.get(timeout=wait)
+            except queue.Empty:
+                continue
+            if item is finished:
+                reader_done = True
+            else:
+                output_callback(item.rstrip("\r\n"))
+        return subprocess.CompletedProcess(command, proc.wait())
+    finally:
+        if proc.poll() is None:
+            proc.kill()
+            proc.wait()
+        reader.join(timeout=1)
+
+
+def sync_logs(
+    sync_config,
+    timeout: float | None = 600,
+    quiet: bool = False,
+    output_callback=None,
+) -> bool:
     """以子行程呼叫 sftp_transfer 本體下載遠端 log（沿用 run_all_downloads.py 模式）。
 
     失敗僅回傳 False、不拋例外，讓分析仍能沿用既有本地資料。
+    quiet=True 時不讓子行程或警告寫入終端機，避免破壞 curses/TUI 畫面。
+    output_callback 若有提供，stdout/stderr 會合併後逐行傳入 callback。
     """
     sync_config = Path(sync_config)
     if not sync_config.exists():
-        print(f"[WARN] 同步設定檔不存在，略過下載：{sync_config}", file=sys.stderr)
+        if not quiet:
+            print(f"[WARN] 同步設定檔不存在，略過下載：{sync_config}", file=sys.stderr)
         return False
+    command = [
+        sys.executable,
+        str(MAIN_SCRIPT),
+        "--cli",
+        "--mode",
+        "download",
+        "--config",
+        str(sync_config),
+    ]
     try:
-        proc = subprocess.run(
-            [
-                sys.executable,
-                str(MAIN_SCRIPT),
-                "--cli",
-                "--mode",
-                "download",
-                "--config",
-                str(sync_config),
-            ],
-            cwd=str(PROJECT_DIR),
-            timeout=timeout,
-        )
+        if output_callback is not None:
+            proc = _run_with_output_callback(
+                command, str(PROJECT_DIR), timeout, output_callback
+            )
+        else:
+            output_kwargs = (
+                {"stdout": subprocess.DEVNULL, "stderr": subprocess.DEVNULL}
+                if quiet
+                else {}
+            )
+            proc = subprocess.run(
+                command,
+                cwd=str(PROJECT_DIR),
+                timeout=timeout,
+                **output_kwargs,
+            )
     except (subprocess.SubprocessError, OSError) as exc:
-        print(f"[WARN] 觸發下載失敗，改用既有本地 log：{exc}", file=sys.stderr)
+        if not quiet:
+            print(f"[WARN] 觸發下載失敗，改用既有本地 log：{exc}", file=sys.stderr)
         return False
     if proc.returncode != 0:
-        print(f"[WARN] 本體下載回傳非零（{proc.returncode}），改用既有本地 log", file=sys.stderr)
+        if not quiet:
+            print(
+                f"[WARN] 本體下載回傳非零（{proc.returncode}），改用既有本地 log",
+                file=sys.stderr,
+            )
         return False
     return True
 

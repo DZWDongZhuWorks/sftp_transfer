@@ -4,6 +4,7 @@
 不需網路：於 tmp_path 寫入含 BOM 的合成 CSV log，直接驗證解析、彙整與呈現。
 """
 import csv
+import subprocess
 from datetime import datetime
 from unittest import mock
 
@@ -289,6 +290,44 @@ def test_sync_logs_success(tmp_path):
         assert sync_logs(cfg) is True
     args = m.call_args[0][0]
     assert "--cli" in args and "download" in args and str(cfg) in args
+    assert "stdout" not in m.call_args.kwargs
+    assert "stderr" not in m.call_args.kwargs
+
+
+def test_sync_logs_quiet_suppresses_child_output(tmp_path):
+    cfg = tmp_path / "c.json"
+    cfg.write_text("{}", encoding="utf-8")
+    with mock.patch("monitor.log_monitor.subprocess.run") as m:
+        m.return_value = mock.Mock(returncode=0)
+        assert sync_logs(cfg, quiet=True) is True
+    assert m.call_args.kwargs["stdout"] is subprocess.DEVNULL
+    assert m.call_args.kwargs["stderr"] is subprocess.DEVNULL
+
+
+def test_sync_logs_streams_combined_output(tmp_path):
+    cfg = tmp_path / "c.json"
+    cfg.write_text("{}", encoding="utf-8")
+
+    class FakeProcess:
+        stdout = iter(["first\n", "second\r\n"])
+
+        def poll(self):
+            return 0
+
+        def wait(self, timeout=None):
+            return 0
+
+        def kill(self):
+            raise AssertionError("successful process must not be killed")
+
+    lines = []
+    with mock.patch(
+        "monitor.log_monitor.subprocess.Popen", return_value=FakeProcess()
+    ) as popen:
+        assert sync_logs(cfg, quiet=True, output_callback=lines.append) is True
+    assert lines == ["first", "second"]
+    assert popen.call_args.kwargs["stdout"] is subprocess.PIPE
+    assert popen.call_args.kwargs["stderr"] is subprocess.STDOUT
 
 
 def test_sync_logs_nonzero_returns_false(tmp_path):

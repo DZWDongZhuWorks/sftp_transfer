@@ -79,6 +79,8 @@ python monitor/log_monitor.py --sync-config config/log_monitor_sync.json \
     --log-dir fleet_logs --tui --watch 60
 ```
 
+同步期間由 TUI 安全顯示 `main.py` 最近 20 行輸出；完整紀錄仍寫入原本的 CSV log。
+
 **非互動式終端機（cron／管線／`| grep`）會自動退回靜態分群輸出**，不會卡住或崩潰。
 
 鍵位：

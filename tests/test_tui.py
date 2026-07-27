@@ -6,6 +6,8 @@ curses.KEY_* 為模組常數，import 後即可用，無需真實終端機。
 import csv
 import curses
 from datetime import datetime
+from types import SimpleNamespace
+from unittest import mock
 
 from monitor.log_monitor import (
     aggregate_by_device,
@@ -39,6 +41,56 @@ def _tree(tmp_path, specs, stale_hours=24):
         _write(tmp_path / f"{prefix}{dev}_{i}.csv", dev, direction, when, s, k, f)
     devices = aggregate_by_device(collect_logs(tmp_path), now=NOW, stale_hours=stale_hours)
     return build_tree(devices)
+
+
+def test_load_tree_quiets_sync_output(tmp_path):
+    args = SimpleNamespace(
+        sync_config="sync.json",
+        log_dir=tmp_path,
+        mode="all",
+        stale_hours=24,
+        vessel=None,
+        ipc=None,
+        component=None,
+        status="all",
+    )
+    with mock.patch.object(tui, "sync_logs", return_value=True) as sync:
+        assert tui.load_tree(args, NOW) == []
+    sync.assert_called_once_with("sync.json", quiet=True)
+
+
+def test_sync_progress_keeps_only_five_clean_lines():
+    class FakeScreen:
+        def __init__(self):
+            self.rows = {}
+
+        def erase(self):
+            self.rows.clear()
+
+        def getmaxyx(self):
+            return 12, 80
+
+        def addstr(self, y, x, text, attr=0):
+            self.rows[y] = text
+
+        def refresh(self):
+            pass
+
+    def fake_sync(config, quiet, output_callback):
+        assert config == "sync.json"
+        assert quiet is True
+        for number in range(1, 8):
+            output_callback(f"\x1b[31mline {number}\x1b[0m\r")
+        return True
+
+    screen = FakeScreen()
+    with mock.patch.object(tui, "sync_logs", side_effect=fake_sync):
+        assert tui._sync_with_progress(screen, "sync.json") is True
+    visible = "\n".join(screen.rows.values())
+    assert all(f"line {number}" in visible for number in range(3, 8))
+    assert "line 1\n" not in visible
+    assert "line 2\n" not in visible
+    assert "\x1b" not in visible
 
 
 # --- flatten：展開/收合 ----------------------------------------------------

@@ -14,7 +14,9 @@
 from __future__ import annotations
 
 import curses
+import re
 import unicodedata
+from collections import deque
 from dataclasses import dataclass, field
 from datetime import datetime
 
@@ -36,6 +38,8 @@ from monitor.log_monitor import (
 _MODE_CYCLE = ["", "download", "upload"]
 _STATUS_CYCLE = ["all", "ok", "stale", "problem"]
 _PAIR = {"success": 1, "stale": 2, "incomplete": 2, "partial": 3, "aborted": 3}
+_SYNC_LINE_LIMIT = 20
+_ANSI_ESCAPE = re.compile(r"\x1b\[[0-?]*[ -/]*[@-~]")
 
 
 # --- 顯示寬度（CJK 全形字佔 2 欄）------------------------------------------
@@ -338,9 +342,13 @@ def key_action(ch: int) -> str | None:
 # ---------------------------------------------------------------------------
 # 資料載入
 # ---------------------------------------------------------------------------
-def load_tree(args, now: datetime):
+def load_tree(args, now: datetime, sync_handler=None):
     if getattr(args, "sync_config", None):
-        sync_logs(args.sync_config)
+        if sync_handler is None:
+            # 非 curses 呼叫仍不可讓 main.py 的輸出直接污染目前終端機。
+            sync_logs(args.sync_config, quiet=True)
+        else:
+            sync_handler(args.sync_config)
     records = collect_logs(args.log_dir, mode=args.mode)
     devices = aggregate_by_device(records, now=now, stale_hours=args.stale_hours)
     devices = _apply_filters(devices, args.vessel, args.ipc, args.component, args.status)
@@ -365,6 +373,51 @@ def _addstr(win, y, x, text, attr=0):
         win.addstr(y, x, text, attr)
     except curses.error:
         pass
+
+
+def _clean_sync_line(line: str) -> str:
+    """移除會干擾 curses 游標位置的 ANSI 與控制字元。"""
+    line = _ANSI_ESCAPE.sub("", line).replace("\t", "    ")
+    return "".join(ch for ch in line if ch >= " ").strip()
+
+
+def _draw_sync(stdscr, lines) -> None:
+    """同步專用畫面：固定只顯示最近幾行，所有輸出皆經 curses 繪製。"""
+    stdscr.erase()
+    maxy, maxx = stdscr.getmaxyx()
+    width = max(0, maxx - 1)
+    title = f" 正在同步 fleet_logs…（僅顯示最近 {_SYNC_LINE_LIMIT} 行）"
+    _addstr(stdscr, 0, 0, fit_display(title, width)[0], curses.A_BOLD)
+    visible_count = min(_SYNC_LINE_LIMIT, max(0, maxy - 2))
+    for y, line in enumerate(list(lines)[-visible_count:], start=1):
+        _addstr(stdscr, y, 0, fit_display(line, width)[0])
+    if maxy > 1:
+        _addstr(
+            stdscr,
+            maxy - 1,
+            0,
+            pad_display(" 同步完成後自動返回監視畫面", width),
+            curses.A_REVERSE,
+        )
+    stdscr.refresh()
+
+
+def _sync_with_progress(stdscr, sync_config) -> bool:
+    """攔截 main.py 輸出，清理後在 curses 內即時顯示最近幾行。"""
+    recent = deque(maxlen=_SYNC_LINE_LIMIT)
+    _draw_sync(stdscr, recent)
+
+    def show(line):
+        cleaned = _clean_sync_line(line)
+        if cleaned:
+            recent.append(cleaned)
+            _draw_sync(stdscr, recent)
+
+    return sync_logs(
+        sync_config,
+        quiet=True,
+        output_callback=show,
+    )
 
 
 def _attr(status):
@@ -504,7 +557,11 @@ def _main_loop(stdscr, args):
 
     def reload():
         now = datetime.now()
-        tree = load_tree(args, now)
+        tree = load_tree(
+            args,
+            now,
+            sync_handler=lambda config: _sync_with_progress(stdscr, config),
+        )
         seed_expanded(tree, state)
         state.now = now
         return tree

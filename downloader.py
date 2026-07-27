@@ -14,7 +14,7 @@ import socket
 import stat
 import time
 from datetime import datetime
-from pathlib import Path
+from pathlib import Path, PurePosixPath
 
 import paramiko
 
@@ -546,12 +546,38 @@ class SFTPDownloader(SFTPBase):
             self.logger.warning(f"設定 {done_name} 權限/mtime 失敗(不影響下載內容): {e}")
         return "downloaded"
 
+    def _build_jobs(self):
+        """把 remote_path / local_path 正規化成一組 (job_sources, local_root) 工作。
+
+        remote_path 為來源、local_path 為目的地，三種形狀：
+          local 陣列        → 與 remote 來源「逐一配對」remote[i]→local[i]（長度須相同）。
+          local 單一帶尾斜線 → 視為「共同父目錄」，各 remote 來源展開到 父目錄/來源basename
+                               （多專案各自落在自己的目錄，如 STANDARD/share/alarm_controller
+                                → share/alarm_controller）。
+          local 單一無尾斜線 → 所有 remote 來源「合併」到同一個 local（STANDARD + 各船 UNIQUE
+                               疊加成完整專案，相同相對路徑以後面的來源為準）。
+        回傳 None 代表配對數量不符（已記錄錯誤）。"""
+        remote_paths = self.remote_path if isinstance(self.remote_path, list) else [self.remote_path]
+        local = self.local_path
+        if isinstance(local, list):
+            if len(local) != len(remote_paths):
+                self.logger.error(
+                    f"下載路徑配對數量不符：remote {len(remote_paths)} 個、local {len(local)} 個"
+                )
+                return None
+            return [([remote_paths[i]], Path(local[i])) for i in range(len(remote_paths))]
+        if isinstance(local, str) and local.endswith("/") and local.rstrip("/"):
+            parent = Path(local)
+            return [([r], parent / PurePosixPath(r.rstrip("/")).name) for r in remote_paths]
+        return [(remote_paths, Path(local))]
+
     def _run(self):
         self.logger.info("=== SFTP 下載任務開始 ===")
-        local_root = Path(self.local_path)
-        local_root.mkdir(parents=True, exist_ok=True)
-        self._manifest = self._load_manifest(local_root) if self.resume else {}
+        jobs = self._build_jobs()
+        if jobs is None:
+            return False
         self._ignore_spec = self._load_ignore_spec()
+        multi_job = len(jobs) > 1  # 配對或依 basename 展開時皆為多組獨立工作
 
         downloaded, skipped, failed = 0, 0, []
         try:
@@ -559,74 +585,80 @@ class SFTPDownloader(SFTPBase):
                 self._wait_for_network()
             self._connect_with_retry()
 
-            remote_paths = self.remote_path if isinstance(self.remote_path, list) else [self.remote_path]
-            file_list = None
-            list_attempts = 0
-            while file_list is None:
-                current_root = None
-                try:
-                    file_list = []
-                    for current_root in remote_paths:
-                        try:
-                            file_list.extend(self._list_remote_files(current_root, local_root))
-                        except FileNotFoundError:
-                            # 單一來源路徑不存在（常見於各船專屬路徑並非每船都有）時，只記警告並略過此來源，
-                            # 其餘存在的來源照常下載。FileNotFoundError 為 OSError 子類，需在此個別攔截，
-                            # 才不會被外層的網路錯誤分支當成連線問題而觸發重連。
-                            self.logger.warning(f"遠端路徑不存在，略過此來源: {current_root}")
-                except (paramiko.SSHException, OSError, EOFError) as e:
-                    file_list = None
-                    list_attempts += 1
-                    self.logger.warning(f"列出遠端檔案清單發生錯誤（第 {list_attempts} 次）: {e}")
-                    if not self.auto_reconnect or self._retry_limit_reached(list_attempts):
-                        self.logger.error("已達重試上限，任務中止")
-                        return False
-                    self._connect_with_retry()
+            for job_sources, local_root in jobs:
+                local_root.mkdir(parents=True, exist_ok=True)
+                # 配對模式各目的地各自維護版本紀錄檔；合併模式共用單一 local 的紀錄檔。
+                self._manifest = self._load_manifest(local_root) if self.resume else {}
 
-            # 多個來源路徑合併時，若不同來源含有相同的相對路徑，後面的來源會覆蓋前面的
-            # （版本紀錄也以後者為準），僅保留最後一筆並記錄警告。
-            deduped = {}
-            for remote_file, rel_path in file_list:
-                if rel_path in deduped and deduped[rel_path] != remote_file:
-                    self.logger.warning(f"多個來源路徑都含有 {rel_path}，以後面的來源為準: {remote_file}")
-                deduped[rel_path] = remote_file
-            file_list = [(remote_file, rel_path) for rel_path, remote_file in deduped.items()]
-
-            if len(remote_paths) > 1:
-                self.logger.info(f"共 {len(remote_paths)} 個來源路徑，合併後發現 {len(file_list)} 個檔案")
-            else:
-                self.logger.info(f"共發現 {len(file_list)} 個檔案")
-
-            for remote_file, rel_path in file_list:
-                attempts = 0
-                while True:
+                file_list = None
+                list_attempts = 0
+                while file_list is None:
+                    current_root = None
                     try:
-                        result = self._download_one_file(remote_file, rel_path, local_root)
-                        if result == "skipped":
-                            skipped += 1
-                        else:
-                            downloaded += 1
-                        break
-                    except PermissionError as e:
-                        self.logger.error(f"寫入失敗（權限不足）: {rel_path}: {e}")
-                        failed.append(rel_path)
-                        break
-                    except FileNotFoundError as e:
-                        self.logger.error(f"檔案不存在: {rel_path}: {e}")
-                        failed.append(rel_path)
-                        break
+                        file_list = []
+                        for current_root in job_sources:
+                            try:
+                                file_list.extend(self._list_remote_files(current_root, local_root))
+                            except FileNotFoundError:
+                                # 單一來源路徑不存在（常見於各船專屬路徑並非每船都有）時，只記警告並略過此來源，
+                                # 其餘存在的來源照常下載。FileNotFoundError 為 OSError 子類，需在此個別攔截，
+                                # 才不會被外層的網路錯誤分支當成連線問題而觸發重連。
+                                self.logger.warning(f"遠端路徑不存在，略過此來源: {current_root}")
                     except (paramiko.SSHException, OSError, EOFError) as e:
-                        attempts += 1
-                        self.logger.warning(f"下載 {rel_path} 發生錯誤（第 {attempts} 次）: {e}")
-                        if not self.auto_reconnect or self._retry_limit_reached(attempts):
-                            self.logger.error(f"檔案 {rel_path} 下載失敗，放棄重試")
-                            failed.append(rel_path)
-                            break
+                        file_list = None
+                        list_attempts += 1
+                        self.logger.warning(f"列出遠端檔案清單發生錯誤（第 {list_attempts} 次）: {e}")
+                        if not self.auto_reconnect or self._retry_limit_reached(list_attempts):
+                            self.logger.error("已達重試上限，任務中止")
+                            return False
+                        self._connect_with_retry()
+
+                # 同一 job 內多來源合併時，若不同來源含有相同的相對路徑，後面的來源會覆蓋前面的
+                # （版本紀錄也以後者為準），僅保留最後一筆並記錄警告。
+                deduped = {}
+                for remote_file, rel_path in file_list:
+                    if rel_path in deduped and deduped[rel_path] != remote_file:
+                        self.logger.warning(f"多個來源路徑都含有 {rel_path}，以後面的來源為準: {remote_file}")
+                    deduped[rel_path] = remote_file
+                file_list = [(remote_file, rel_path) for rel_path, remote_file in deduped.items()]
+
+                if multi_job:
+                    self.logger.info(f"{job_sources[0]} → {local_root}，發現 {len(file_list)} 個檔案")
+                elif len(job_sources) > 1:
+                    self.logger.info(f"共 {len(job_sources)} 個來源路徑，合併後發現 {len(file_list)} 個檔案")
+                else:
+                    self.logger.info(f"共發現 {len(file_list)} 個檔案")
+
+                for remote_file, rel_path in file_list:
+                    attempts = 0
+                    while True:
                         try:
-                            self._connect_with_retry()
-                        except Exception:
+                            result = self._download_one_file(remote_file, rel_path, local_root)
+                            if result == "skipped":
+                                skipped += 1
+                            else:
+                                downloaded += 1
+                            break
+                        except PermissionError as e:
+                            self.logger.error(f"寫入失敗（權限不足）: {rel_path}: {e}")
                             failed.append(rel_path)
                             break
+                        except FileNotFoundError as e:
+                            self.logger.error(f"檔案不存在: {rel_path}: {e}")
+                            failed.append(rel_path)
+                            break
+                        except (paramiko.SSHException, OSError, EOFError) as e:
+                            attempts += 1
+                            self.logger.warning(f"下載 {rel_path} 發生錯誤（第 {attempts} 次）: {e}")
+                            if not self.auto_reconnect or self._retry_limit_reached(attempts):
+                                self.logger.error(f"檔案 {rel_path} 下載失敗，放棄重試")
+                                failed.append(rel_path)
+                                break
+                            try:
+                                self._connect_with_retry()
+                            except Exception:
+                                failed.append(rel_path)
+                                break
         except paramiko.AuthenticationException:
             self.logger.error("=== 任務中止：帳號或密碼錯誤 ===")
             return False
@@ -636,7 +668,12 @@ class SFTPDownloader(SFTPBase):
         finally:
             self._close()
 
-        self.logger.info(f"=== 下載任務結束：成功 {downloaded}，略過 {skipped}，失敗 {len(failed)} ===")
+        if multi_job:
+            self.logger.info(
+                f"=== 下載任務結束（{len(jobs)} 組）：成功 {downloaded}，略過 {skipped}，失敗 {len(failed)} ==="
+            )
+        else:
+            self.logger.info(f"=== 下載任務結束：成功 {downloaded}，略過 {skipped}，失敗 {len(failed)} ===")
         if failed:
             self.logger.info("失敗清單：" + ", ".join(failed))
 

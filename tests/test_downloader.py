@@ -873,6 +873,51 @@ class TestRun:
         assert (tmp_path / "a.txt").read_bytes() == b"A"
         assert (tmp_path / "config.json").read_bytes() == b"{}"
 
+    def test_paired_remote_local_lists_map_each_source_to_its_own_local(
+        self, downloader_factory, fake_sftp_factory, tmp_path
+    ):
+        # local 為等長陣列 → 逐一配對 remote[i]→local[i]（多專案各自落在自己的目錄，
+        # 如 STANDARD/share/alarm_controller → share/alarm_controller），不再攤平合併。
+        d = self._prepare(
+            downloader_factory, fake_sftp_factory,
+            files={"/remote/alarm/x.py": b"alarm", "/remote/board/y.py": b"board"},
+            mtimes={"/remote/alarm/x.py": 1, "/remote/board/y.py": 2},
+            remote_path=["/remote/alarm", "/remote/board"],
+            local_path=[str(tmp_path / "alarm_controller"), str(tmp_path / "board_controller")],
+        )
+        assert d.run() is True
+        assert (tmp_path / "alarm_controller" / "x.py").read_bytes() == b"alarm"
+        assert (tmp_path / "board_controller" / "y.py").read_bytes() == b"board"
+        # 不會攤平到共同的 local 根目錄。
+        assert not (tmp_path / "x.py").exists()
+
+    def test_mismatched_pairing_returns_false(self, downloader_factory, fake_sftp_factory, tmp_path, caplog):
+        d = self._prepare(
+            downloader_factory, fake_sftp_factory, files={},
+            remote_path=["/remote/alarm", "/remote/board"],
+            local_path=[str(tmp_path / "only_one")],
+        )
+        with caplog.at_level(logging.ERROR):
+            assert d.run() is False
+        assert any("配對數量不符" in r.message for r in caplog.records)
+
+    def test_trailing_slash_local_parent_fans_out_by_basename(
+        self, downloader_factory, fake_sftp_factory, tmp_path
+    ):
+        # local 帶尾斜線 → 視為共同父目錄，各 remote 來源展開到 父目錄/來源basename。
+        d = self._prepare(
+            downloader_factory, fake_sftp_factory,
+            files={"/remote/alarm_controller/x.py": b"alarm", "/remote/board_controller/y.py": b"board"},
+            mtimes={"/remote/alarm_controller/x.py": 1, "/remote/board_controller/y.py": 2},
+            remote_path=["/remote/alarm_controller", "/remote/board_controller"],
+            local_path=str(tmp_path) + "/",
+        )
+        assert d.run() is True
+        assert (tmp_path / "alarm_controller" / "x.py").read_bytes() == b"alarm"
+        assert (tmp_path / "board_controller" / "y.py").read_bytes() == b"board"
+        # 不會攤平到共同父目錄根。
+        assert not (tmp_path / "x.py").exists()
+
     def test_remote_path_list_duplicate_rel_path_last_source_wins(self, downloader_factory, fake_sftp_factory, tmp_path, caplog):
         d = self._prepare(
             downloader_factory, fake_sftp_factory,

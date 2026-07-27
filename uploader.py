@@ -264,21 +264,51 @@ class SFTPUploader(SFTPBase):
             self.logger.warning(f"設定遠端 {done_name} 權限/mtime 失敗(不影響上傳內容): {e}")
         return "uploaded"
 
+    def _build_jobs(self):
+        """把 local_path / remote_path 正規化成一組 (job_sources, remote_root) 工作。
+
+        local_path 為來源、remote_path 為目的地，對稱於下載端的三種形狀：
+          remote 陣列        → 與 local 來源「逐一配對」local[i]→remote[i]（長度須相同）。
+          remote 單一帶尾斜線 → 視為「共同父目錄」，各 local 來源展開到 父目錄/來源basename
+                               （多專案各自上傳到自己的目的地，如 share/alarm_controller
+                                → STANDARD/share/alarm_controller）。
+          remote 單一無尾斜線 → 所有 local 來源「合併」上傳到同一個 remote（同 rel_path 後者覆蓋）。
+        回傳 None 代表配對數量不符（已記錄錯誤）。"""
+        local_paths = self.local_path if isinstance(self.local_path, list) else [self.local_path]
+        remote_paths = self.remote_path if isinstance(self.remote_path, list) else [self.remote_path]
+        if len(remote_paths) > 1:
+            if len(remote_paths) != len(local_paths):
+                self.logger.error(
+                    f"上傳路徑配對數量不符：local {len(local_paths)} 個、remote {len(remote_paths)} 個"
+                )
+                return None
+            return [([local_paths[i]], remote_paths[i]) for i in range(len(local_paths))]
+        remote_root = remote_paths[0]
+        if isinstance(remote_root, str) and remote_root.endswith("/") and remote_root.rstrip("/"):
+            base = remote_root.rstrip("/")
+            return [([lp], base + "/" + Path(lp).name) for lp in local_paths]
+        return [(local_paths, remote_root)]
+
     def _run(self):
         self.logger.info("=== SFTP 上傳任務開始 ===")
-        # 上傳僅使用單一目的地路徑；若不慎傳入路徑陣列，取第一個並警告。
-        remote_root = self.remote_path[0] if isinstance(self.remote_path, list) else self.remote_path
-        if isinstance(self.remote_path, list) and len(self.remote_path) > 1:
-            self.logger.warning(f"上傳僅支援單一目的地路徑，將使用第一個: {remote_root}")
-
-        source = Path(self.local_path)
-        if not source.exists():
-            self.logger.error(f"來源路徑不存在: {source}")
+        jobs = self._build_jobs()
+        if jobs is None:
             return False
-        # 單一檔案上傳時 manifest 放在其所在目錄；目錄上傳時放在該目錄本身。
-        local_root = source if source.is_dir() else source.parent
-        self._manifest = self._load_manifest(local_root) if self.resume else {}
+
+        # 連線前先驗證來源存在性：唯一來源不存在維持原行為視為失敗；多來源時略過不存在者。
+        all_sources = [lp for job_sources, _ in jobs for lp in job_sources]
+        for lp in all_sources:
+            if not Path(lp).exists():
+                if len(all_sources) == 1:
+                    self.logger.error(f"來源路徑不存在: {lp}")
+                    return False
+                self.logger.warning(f"來源路徑不存在，略過此來源: {lp}")
+        if not any(Path(lp).exists() for lp in all_sources):
+            self.logger.error("所有上傳來源路徑皆不存在，任務中止")
+            return False
+
         self._ignore_spec = self._load_ignore_spec()
+        multi_job = len(jobs) > 1  # 配對或依 basename 展開時皆為多組獨立工作
 
         uploaded, skipped, failed = 0, 0, []
         try:
@@ -286,52 +316,71 @@ class SFTPUploader(SFTPBase):
                 self._wait_for_network()
             self._connect_with_retry()
 
-            file_list = None
-            list_attempts = 0
-            while file_list is None:
-                try:
-                    file_list = self._list_local_files(source, remote_root)
-                except (paramiko.SSHException, OSError, EOFError) as e:
+            for job_sources, remote_root in jobs:
+                seen_rel = {}  # rel_path -> 來源字串，偵測同一 remote 目的地下跨來源的同名覆蓋
+                for lp in job_sources:
+                    source = Path(lp)
+                    if not source.exists():
+                        continue  # 不存在的來源已於上方記錄，直接略過
+                    # 單一檔案上傳時 manifest 放在其所在目錄；目錄上傳時放在該目錄本身。
+                    # 各來源各自維護自己目錄內的版本紀錄檔（rel_path 相對於各自來源根）。
+                    local_root = source if source.is_dir() else source.parent
+                    self._manifest = self._load_manifest(local_root) if self.resume else {}
+
                     file_list = None
-                    list_attempts += 1
-                    self.logger.warning(f"建立遠端目錄或列出本地檔案清單發生錯誤（第 {list_attempts} 次）: {e}")
-                    if not self.auto_reconnect or self._retry_limit_reached(list_attempts):
-                        self.logger.error("已達重試上限，任務中止")
-                        return False
-                    self._connect_with_retry()
-
-            self.logger.info(f"共發現 {len(file_list)} 個檔案")
-
-            for local_file, rel_path in file_list:
-                attempts = 0
-                while True:
-                    try:
-                        result = self._upload_one_file(local_file, rel_path, remote_root, local_root)
-                        if result == "skipped":
-                            skipped += 1
-                        else:
-                            uploaded += 1
-                        break
-                    except PermissionError as e:
-                        self.logger.error(f"上傳失敗（權限不足）: {rel_path}: {e}")
-                        failed.append(rel_path)
-                        break
-                    except FileNotFoundError as e:
-                        self.logger.error(f"本地檔案不存在: {rel_path}: {e}")
-                        failed.append(rel_path)
-                        break
-                    except (paramiko.SSHException, OSError, EOFError) as e:
-                        attempts += 1
-                        self.logger.warning(f"上傳 {rel_path} 發生錯誤（第 {attempts} 次）: {e}")
-                        if not self.auto_reconnect or self._retry_limit_reached(attempts):
-                            self.logger.error(f"檔案 {rel_path} 上傳失敗，放棄重試")
-                            failed.append(rel_path)
-                            break
+                    list_attempts = 0
+                    while file_list is None:
                         try:
+                            file_list = self._list_local_files(source, remote_root)
+                        except (paramiko.SSHException, OSError, EOFError) as e:
+                            file_list = None
+                            list_attempts += 1
+                            self.logger.warning(f"建立遠端目錄或列出本地檔案清單發生錯誤（第 {list_attempts} 次）: {e}")
+                            if not self.auto_reconnect or self._retry_limit_reached(list_attempts):
+                                self.logger.error("已達重試上限，任務中止")
+                                return False
                             self._connect_with_retry()
-                        except Exception:
-                            failed.append(rel_path)
-                            break
+
+                    if multi_job:
+                        self.logger.info(f"{source} → {remote_root}，發現 {len(file_list)} 個檔案")
+                    elif len(job_sources) > 1:
+                        self.logger.info(f"來源 {source} 發現 {len(file_list)} 個檔案")
+                    else:
+                        self.logger.info(f"共發現 {len(file_list)} 個檔案")
+
+                    for local_file, rel_path in file_list:
+                        if rel_path in seen_rel and seen_rel[rel_path] != str(source):
+                            self.logger.warning(f"多個來源都含有 {rel_path}，遠端以後面的來源為準: {source}")
+                        seen_rel[rel_path] = str(source)
+                        attempts = 0
+                        while True:
+                            try:
+                                result = self._upload_one_file(local_file, rel_path, remote_root, local_root)
+                                if result == "skipped":
+                                    skipped += 1
+                                else:
+                                    uploaded += 1
+                                break
+                            except PermissionError as e:
+                                self.logger.error(f"上傳失敗（權限不足）: {rel_path}: {e}")
+                                failed.append(rel_path)
+                                break
+                            except FileNotFoundError as e:
+                                self.logger.error(f"本地檔案不存在: {rel_path}: {e}")
+                                failed.append(rel_path)
+                                break
+                            except (paramiko.SSHException, OSError, EOFError) as e:
+                                attempts += 1
+                                self.logger.warning(f"上傳 {rel_path} 發生錯誤（第 {attempts} 次）: {e}")
+                                if not self.auto_reconnect or self._retry_limit_reached(attempts):
+                                    self.logger.error(f"檔案 {rel_path} 上傳失敗，放棄重試")
+                                    failed.append(rel_path)
+                                    break
+                                try:
+                                    self._connect_with_retry()
+                                except Exception:
+                                    failed.append(rel_path)
+                                    break
         except paramiko.AuthenticationException:
             self.logger.error("=== 任務中止：帳號或密碼錯誤 ===")
             return False
@@ -341,7 +390,12 @@ class SFTPUploader(SFTPBase):
         finally:
             self._close()
 
-        self.logger.info(f"=== 上傳任務結束：成功 {uploaded}，略過 {skipped}，失敗 {len(failed)} ===")
+        if multi_job:
+            self.logger.info(
+                f"=== 上傳任務結束（{len(jobs)} 組）：成功 {uploaded}，略過 {skipped}，失敗 {len(failed)} ==="
+            )
+        else:
+            self.logger.info(f"=== 上傳任務結束：成功 {uploaded}，略過 {skipped}，失敗 {len(failed)} ===")
         if failed:
             self.logger.info("失敗清單：" + ", ".join(failed))
 

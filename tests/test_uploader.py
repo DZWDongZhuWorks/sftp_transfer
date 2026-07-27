@@ -284,13 +284,144 @@ class TestRun:
         assert ok is True
         assert d._upload_one_file.call_count == 2
 
-    def test_run_uses_first_path_when_remote_is_list(self, uploader_factory, fake_sftp_factory, tmp_path, caplog):
+    def test_run_mismatched_pairing_returns_false(self, uploader_factory, fake_sftp_factory, tmp_path, caplog):
+        # remote 為陣列但與 local（單一）數量不符 → 配對失敗，任務中止。
         _write(tmp_path / "a.txt", b"aaa")
         d, fake = self._prepare(uploader_factory, fake_sftp_factory, remote_path=["/first", "/second"])
+
+        with caplog.at_level(logging.ERROR):
+            ok = d.run()
+
+        assert ok is False
+        assert any("配對數量不符" in r.message for r in caplog.records)
+
+
+class TestRunPaired:
+    """local_path 與 remote_path 皆為等長陣列時：逐一配對 local[i]→remote[i]
+    （多專案各自上傳到自己的目的地，如 share/alarm_controller → STANDARD/share/alarm_controller）。"""
+
+    def _prepare(self, uploader_factory, fake_sftp_factory, **overrides):
+        d = uploader_factory(wait_for_network=False, **overrides)
+        fake = fake_sftp_factory(files={})
+        d._connect_with_retry = MagicMock(side_effect=lambda: setattr(d, "sftp", fake))
+        d._close = MagicMock()
+        return d, fake
+
+    def test_paired_lists_map_each_source_to_its_own_remote(self, uploader_factory, fake_sftp_factory, tmp_path):
+        _write(tmp_path / "alarm" / "x.py", b"alarm")
+        _write(tmp_path / "board" / "y.py", b"board")
+        d, fake = self._prepare(
+            uploader_factory, fake_sftp_factory,
+            local_path=[str(tmp_path / "alarm"), str(tmp_path / "board")],
+            remote_path=["/remote/alarm_controller", "/remote/board_controller"],
+        )
+
+        ok = d.run()
+
+        assert ok is True
+        # 各專案落在自己配對的遠端目的地，不會互相攤平碰撞。
+        assert fake.files["/remote/alarm_controller/x.py"] == b"alarm"
+        assert fake.files["/remote/board_controller/y.py"] == b"board"
+        # 同名檔案在不同配對下互不干擾。
+        assert "/remote/board_controller/x.py" not in fake.files
+
+
+class TestRunFanout:
+    """remote_path 為「帶尾斜線的單一父目錄」+ local_path 為陣列時：
+    各 local 來源依 basename 展開到 remote父目錄/basename（多專案各自上傳到自己的目錄）。"""
+
+    def _prepare(self, uploader_factory, fake_sftp_factory, **overrides):
+        d = uploader_factory(wait_for_network=False, **overrides)
+        fake = fake_sftp_factory(files={})
+        d._connect_with_retry = MagicMock(side_effect=lambda: setattr(d, "sftp", fake))
+        d._close = MagicMock()
+        return d, fake
+
+    def test_trailing_slash_remote_parent_fans_out_by_basename(self, uploader_factory, fake_sftp_factory, tmp_path):
+        _write(tmp_path / "alarm_controller" / "x.py", b"alarm")
+        _write(tmp_path / "board_controller" / "y.py", b"board")
+        d, fake = self._prepare(
+            uploader_factory, fake_sftp_factory,
+            local_path=[str(tmp_path / "alarm_controller"), str(tmp_path / "board_controller")],
+            remote_path="/remote/share/",  # 尾斜線 → 展開到 /remote/share/<basename>
+        )
+
+        ok = d.run()
+
+        assert ok is True
+        assert fake.files["/remote/share/alarm_controller/x.py"] == b"alarm"
+        assert fake.files["/remote/share/board_controller/y.py"] == b"board"
+        # 不會攤平進 /remote/share 根目錄造成碰撞。
+        assert "/remote/share/x.py" not in fake.files
+
+    def test_no_trailing_slash_remote_still_merges(self, uploader_factory, fake_sftp_factory, tmp_path):
+        # 對照組：remote 不帶尾斜線 → 維持合併（攤平進同一 remote 根）。
+        _write(tmp_path / "alarm_controller" / "x.py", b"alarm")
+        d, fake = self._prepare(
+            uploader_factory, fake_sftp_factory,
+            local_path=[str(tmp_path / "alarm_controller")],
+            remote_path="/remote/share",  # 無尾斜線 → 合併
+        )
+
+        ok = d.run()
+
+        assert ok is True
+        assert fake.files["/remote/share/x.py"] == b"alarm"
+
+
+class TestRunMultiSource:
+    """local_path 為陣列時：多個本地來源合併上傳到單一 remote_root，
+    與下載端「多來源合併到單一 local」對稱。"""
+
+    def _prepare(self, uploader_factory, fake_sftp_factory, **overrides):
+        d = uploader_factory(wait_for_network=False, **overrides)
+        fake = fake_sftp_factory(files={})
+        d._connect_with_retry = MagicMock(side_effect=lambda: setattr(d, "sftp", fake))
+        d._close = MagicMock()
+        return d, fake
+
+    def test_multi_local_sources_merge_into_single_remote(self, uploader_factory, fake_sftp_factory, tmp_path):
+        _write(tmp_path / "src1" / "a.txt", b"aaa")
+        _write(tmp_path / "src2" / "b.txt", b"bbb")
+        d, fake = self._prepare(
+            uploader_factory, fake_sftp_factory,
+            local_path=[str(tmp_path / "src1"), str(tmp_path / "src2")],
+        )
+
+        ok = d.run()
+
+        assert ok is True
+        # 兩個來源的檔案都合併進同一個 /remote 下（rel_path 相對於各自來源根）。
+        assert fake.files["/remote/a.txt"] == b"aaa"
+        assert fake.files["/remote/b.txt"] == b"bbb"
+
+    def test_same_relpath_later_source_overwrites_with_warning(
+        self, uploader_factory, fake_sftp_factory, tmp_path, caplog
+    ):
+        _write(tmp_path / "src1" / "x.txt", b"first")
+        _write(tmp_path / "src2" / "x.txt", b"second")
+        d, fake = self._prepare(
+            uploader_factory, fake_sftp_factory,
+            local_path=[str(tmp_path / "src1"), str(tmp_path / "src2")],
+        )
 
         with caplog.at_level(logging.WARNING):
             ok = d.run()
 
         assert ok is True
-        assert fake.files["/first/a.txt"] == b"aaa"
-        assert any("僅支援單一目的地路徑" in r.message for r in caplog.records)
+        # 相同 rel_path：後面的來源(src2)覆蓋前面的(src1)。
+        assert fake.files["/remote/x.txt"] == b"second"
+        assert any("以後面的來源為準" in r.message for r in caplog.records)
+
+    def test_missing_source_among_many_is_skipped(self, uploader_factory, fake_sftp_factory, tmp_path):
+        _write(tmp_path / "src1" / "a.txt", b"aaa")
+        d, fake = self._prepare(
+            uploader_factory, fake_sftp_factory,
+            local_path=[str(tmp_path / "src1"), str(tmp_path / "nope")],
+        )
+
+        ok = d.run()
+
+        # 不存在的來源略過、不影響其餘來源，整體仍算成功。
+        assert ok is True
+        assert fake.files["/remote/a.txt"] == b"aaa"

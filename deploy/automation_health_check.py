@@ -37,11 +37,21 @@ SHARE_DIR = PROJECT_DIR.parent
 SCHEDULER_DIR = SHARE_DIR / "scheduler"
 TIMERS_DIR = SCHEDULER_DIR / "timers"
 FAILOVER_DIR = SCHEDULER_DIR / "failover"
-VESSEL_INFO = SHARE_DIR / ".env" / "vessel_basic_info.json"
-FAILOVER_STATE = SHARE_DIR / ".env" / "failover_state.json"
+# 身分與接管狀態檔。兩者都可用環境變數覆蓋（測試專用），與 sftp_transfer/settings.py
+# 的 VESSEL_INFO_PATH、heartbeat.py 與 reboot_tmux.sh 的 FAILOVER_STATE_PATH 同一慣例。
+VESSEL_INFO = Path(
+    os.environ.get("VESSEL_INFO_PATH") or SHARE_DIR / ".env" / "vessel_basic_info.json"
+)
+FAILOVER_STATE = Path(
+    os.environ.get("FAILOVER_STATE_PATH") or SHARE_DIR / ".env" / "failover_state.json"
+)
 USER_UNIT_DIR = Path.home() / ".config" / "systemd" / "user"
 SUDOERS_FILE = Path("/etc/sudoers.d/nssms-scheduler")
 REPORT_DIR = PROJECT_DIR / "logs"
+
+# 接管持續超過這麼久就從 INFO 升為 WARN。真實接管撐過一天代表 ipc1 一直沒修好，
+# 該有人知道；為了測試而手動建立、事後忘了清除的殘留狀態檔也會從這裡浮出來。
+TAKEOVER_WARN_HOURS = 24
 
 CORE_SERVICES = ("nssms-boot.service", "nssms-heartbeat.service")
 TIMERS = (
@@ -96,6 +106,19 @@ def record(section: str, name: str, status: str, detail: str) -> None:
 def heading(title: str) -> None:
     if not _COMPACT:
         print(f"\n=== {title} ===")
+
+
+def _takeover_age_hours(since) -> float | None:
+    """接管已持續幾小時。since 不是合法時間就回傳 None。
+
+    負值（since 位於未來）同樣視為不合法——heartbeat.sanitize_since() 會把它
+    clamp 成當下，這裡跟著回報為異常而非算出一個負的時數。
+    """
+    try:
+        age = (datetime.now().timestamp() - float(since)) / 3600
+    except (TypeError, ValueError):
+        return None
+    return age if age >= 0 else None
 
 
 def run(cmd: list[str], timeout: float = 15) -> subprocess.CompletedProcess[str]:
@@ -158,12 +181,37 @@ def check_identity() -> tuple[str, str]:
             state = read_json(FAILOVER_STATE)
             if role == "ipc2" and state.get("state") == "takeover":
                 role = "ipc2emer"
-                record(
-                    "identity",
-                    "接管狀態",
-                    "INFO",
-                    f"ipc2emer，since={state.get('since_iso', state.get('since'))}",
-                )
+                since_desc = state.get("since_iso", state.get("since"))
+                age_h = _takeover_age_hours(state.get("since"))
+                if age_h is None:
+                    # since 壞掉 → heartbeat 會 clamp 成現在（見 heartbeat.sanitize_since），
+                    # 接管不會中斷，但最短停留的計時會被重設，值得提出來。
+                    record(
+                        "identity",
+                        "接管狀態",
+                        "WARN",
+                        f"ipc2emer，但 since 不是合法時間（{state.get('since')!r}）；"
+                        "heartbeat 會以當下時間重新起算最短停留",
+                    )
+                elif age_h >= TAKEOVER_WARN_HOURS:
+                    # 真實接管撐過一天代表 ipc1 一直沒修好，該有人知道；
+                    # 測試留下的殘留檔也會從這裡浮出來。
+                    record(
+                        "identity",
+                        "接管狀態",
+                        "WARN",
+                        f"ipc2emer 已持續 {age_h:.1f} 小時（≥ {TAKEOVER_WARN_HOURS}）"
+                        f"，since={since_desc}；"
+                        "請確認 ipc1 是否真的故障，若為測試殘留請執行 "
+                        "scheduler/failover/failover_ctl.sh clear",
+                    )
+                else:
+                    record(
+                        "identity",
+                        "接管狀態",
+                        "INFO",
+                        f"ipc2emer，已持續 {age_h:.1f} 小時，since={since_desc}",
+                    )
             else:
                 record(
                     "identity",

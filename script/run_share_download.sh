@@ -9,6 +9,11 @@ BASE_DIR="$(dirname "$SCRIPT_DIR")"
 # 無論從哪個目錄或排程 (cron) 執行都能正確解析。
 cd "$BASE_DIR"
 
+# 開發機 (CLINK) 守門：見 _dev_guard.sh。share 下載會 overwrite 覆蓋開發端工作區，
+# 在 CLINK 上一律略過，避免覆蓋未提交的修改。
+source "$SCRIPT_DIR/_dev_guard.sh"
+dev_guard "$BASE_DIR"
+
 config="$SCRIPT_DIR/../config/IPC1_share_download_settings.json"
 
 if [[ ! -f "$config" ]]; then

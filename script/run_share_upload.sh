@@ -1,26 +1,20 @@
 #!/usr/bin/env bash
-# 手動執行：遍歷 config/ 內所有「上傳」設定檔（*_upload_settings.json）並依序執行 SFTP 上傳。
-#
-# 供使用者手動一次跑完全部上傳用；自動排程（timer / reboot_tmux）不使用本腳本，
-# 而是各自呼叫對應的單一 run_*.sh。實際遍歷與結果彙總由 run_all_uploads.py 負責。
-#
-# 用法：
-#   script/run_all_uploads.sh                     # 跑 ./config 內全部上傳設定
-#   script/run_all_uploads.sh --config-dir other  # 指定其他設定檔資料夾
+# 上傳 share（alarm/board/flag/controller → STANDARD/share/，各自依 basename 展開）
 set -euo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 BASE_DIR="$(dirname "$SCRIPT_DIR")"
 
 # 切換到專案根目錄，讓設定檔中的相對路徑（如 ignore_file: config/xxx_ignore.txt）
-# 無論從哪個目錄或排程 (cron) 執行都能正確解析（子行程會繼承此 CWD）。
+# 無論從哪個目錄或排程 (cron) 執行都能正確解析。
 cd "$BASE_DIR"
 
 # 注意：上傳「刻意不套用」_dev_guard.sh 的 CLINK 守門。CLINK 是 STANDARD 的發佈源頭，
 # 發佈動作正是要從這台往上傳；守門只用於下載（避免 STANDARD 覆蓋開發端未提交的修改）。
-DRIVER="$BASE_DIR/run_all_uploads.py"
-if [[ ! -f "$DRIVER" ]]; then
-    echo "找不到彙總上傳腳本: $DRIVER" >&2
+config="$SCRIPT_DIR/../config/IPC1_share_upload_settings.json"
+
+if [[ ! -f "$config" ]]; then
+    echo "找不到設定檔: $config" >&2
     exit 1
 fi
 
@@ -33,5 +27,4 @@ if [[ ! -x "$VENV_PY" ]]; then
     exit 1
 fi
 
-# 透傳所有參數（例如 --config-dir）給 driver。
-"$VENV_PY" "$DRIVER" "$@"
+"$VENV_PY" "$BASE_DIR/main.py" --cli --mode upload --config "$config"

@@ -11,6 +11,8 @@
 """
 
 import argparse
+import json
+import os
 import subprocess
 import sys
 from pathlib import Path
@@ -18,6 +20,21 @@ from pathlib import Path
 BASE_DIR = Path(__file__).resolve().parent
 CONFIG_DIR = BASE_DIR / "config"
 MAIN_SCRIPT = BASE_DIR / "main.py"
+
+
+def is_dev_machine():
+    """CLINK 開發機（STANDARD 發佈源頭）判定，與 script/_dev_guard.sh 對稱。
+
+    所有下載設定檔皆為 duplicate_mode=overwrite，且打進開發端工作區；在 CLINK 上跑下載
+    會清掉尚未發佈的開發修改，故一鍵全跑時也需擋住。失效方向安全：讀不到船舶資訊檔／
+    解析失敗一律回 False（當一般船照常下載）。船舶資訊檔路徑與 settings.py 一致
+    （可用 VESSEL_INFO_PATH 覆蓋，預設 share/.env/）。"""
+    vinfo = os.environ.get("VESSEL_INFO_PATH") or (BASE_DIR.parent / ".env" / "vessel_basic_info.json")
+    try:
+        with open(vinfo, encoding="utf-8") as f:
+            return str(json.load(f).get("vsl_name", "")).upper() == "CLINK"
+    except Exception:
+        return False
 
 
 def find_setting_files(config_dir: Path):
@@ -29,6 +46,10 @@ def main():
     parser = argparse.ArgumentParser(description="依序執行所有設定檔的 SFTP 下載")
     parser.add_argument("--config-dir", default=str(CONFIG_DIR), help="設定檔資料夾（預設 ./config）")
     args = parser.parse_args()
+
+    if is_dev_machine():
+        print("偵測到開發機 (vsl_name=CLINK)，略過所有下載，避免覆蓋未提交的修改。", file=sys.stderr)
+        return 0
 
     files = find_setting_files(Path(args.config_dir))
     if not files:

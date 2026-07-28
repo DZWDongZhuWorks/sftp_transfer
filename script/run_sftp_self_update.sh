@@ -9,18 +9,11 @@ BASE_DIR="$(dirname "$SCRIPT_DIR")"
 # 無論從哪個目錄或排程 (cron) 執行都能正確解析。
 cd "$BASE_DIR"
 
-# --- 開發機 (CLINK) 守門 ---------------------------------------------------
-# 自我更新會以 SFTP 遠端內容覆蓋本地 live 目錄（sftp_download_settings.json 的
-# local_path 即本專案、duplicate_mode=overwrite），在開發機上會連同尚未提交的修改
-# 一併還原。守門刻意放在本腳本內，讓它無論被 reboot_tmux.sh、timer 或人工直接呼叫
-# 都能自我保護，不再單靠外部呼叫端把關。
-# 船舶資訊檔路徑與 settings.py 一致（可用 VESSEL_INFO_PATH 覆蓋，預設 share/.env/）。
-vessel_info="${VESSEL_INFO_PATH:-$BASE_DIR/../.env/vessel_basic_info.json}"
-vsl="$(python3 -c 'import json,sys;print(json.load(open(sys.argv[1])).get("vsl_name",""))' "$vessel_info" 2>/dev/null || true)"
-if [[ "${vsl^^}" == "CLINK" ]]; then
-    echo "偵測到開發機 (vsl_name=CLINK)，略過 SFTP 自我更新，避免覆蓋未提交的修改。" >&2
-    exit 0
-fi
+# 開發機 (CLINK) 守門：見 _dev_guard.sh。自我更新會 overwrite 覆蓋本專案 live 目錄，
+# 在 CLINK 上一律略過，避免覆蓋未提交的修改。無論被 reboot_tmux.sh、timer 或人工直接
+# 呼叫都能自我保護，不再單靠外部呼叫端把關。
+source "$SCRIPT_DIR/_dev_guard.sh"
+dev_guard "$BASE_DIR"
 
 config="$SCRIPT_DIR/../config/sftp_download_settings.json"
 

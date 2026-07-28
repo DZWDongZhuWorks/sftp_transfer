@@ -59,7 +59,8 @@ def test_load_tree_quiets_sync_output(tmp_path):
     sync.assert_called_once_with("sync.json", quiet=True)
 
 
-def test_sync_progress_keeps_only_five_clean_lines():
+def test_sync_progress_keeps_recent_lines_clean():
+    # 高度足夠顯示滿 _SYNC_LINE_LIMIT 行
     class FakeScreen:
         def __init__(self):
             self.rows = {}
@@ -68,7 +69,7 @@ def test_sync_progress_keeps_only_five_clean_lines():
             self.rows.clear()
 
         def getmaxyx(self):
-            return 12, 80
+            return tui._SYNC_LINE_LIMIT + 4, 80
 
         def addstr(self, y, x, text, attr=0):
             self.rows[y] = text
@@ -76,21 +77,28 @@ def test_sync_progress_keeps_only_five_clean_lines():
         def refresh(self):
             pass
 
+    limit = tui._SYNC_LINE_LIMIT
+    total = limit + 5  # 餵超過上限，驗證只保留最近 limit 行
+
     def fake_sync(config, quiet, output_callback):
         assert config == "sync.json"
         assert quiet is True
-        for number in range(1, 8):
+        for number in range(1, total + 1):
             output_callback(f"\x1b[31mline {number}\x1b[0m\r")
         return True
 
     screen = FakeScreen()
     with mock.patch.object(tui, "sync_logs", side_effect=fake_sync):
         assert tui._sync_with_progress(screen, "sync.json") is True
-    visible = "\n".join(screen.rows.values())
-    assert all(f"line {number}" in visible for number in range(3, 8))
-    assert "line 1\n" not in visible
-    assert "line 2\n" not in visible
-    assert "\x1b" not in visible
+
+    values = set(screen.rows.values())
+    # 只保留最近 limit 行（line 6..25）；較早的 line 1..5 被丟棄
+    for n in range(total - limit + 1, total + 1):
+        assert f"line {n}" in values
+    for n in range(1, total - limit + 1):
+        assert f"line {n}" not in values
+    # ANSI / 控制字元已清除
+    assert all("\x1b" not in v for v in values)
 
 
 # --- flatten：展開/收合 ----------------------------------------------------

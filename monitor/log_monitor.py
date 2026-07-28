@@ -925,7 +925,7 @@ def render_html(
     out_path,
     generated_at: datetime,
     log_dir: str = "",
-    stale_hours: float = 24,
+    stale_hours: float = 72,
 ) -> Path:
     """產生單一自包含 HTML 報告（方向>vessel>IPC>project 巢狀可折疊 + 多維過濾）。"""
     out_path = Path(out_path)
@@ -1008,7 +1008,7 @@ def build_parser() -> argparse.ArgumentParser:
     )
     p.add_argument("--log-dir", default=str(DEFAULT_LOG_DIR), help="要分析的本地 log 目錄（預設 ./logs）")
     p.add_argument("--mode", choices=["download", "upload", "all"], default="all", help="只看某方向")
-    p.add_argument("--stale-hours", type=float, default=24, help="逾期告警門檻（小時，預設 24）")
+    p.add_argument("--stale-hours", type=float, default=72, help="逾期告警門檻（小時，預設 72）")
     p.add_argument(
         "--html",
         nargs="?",

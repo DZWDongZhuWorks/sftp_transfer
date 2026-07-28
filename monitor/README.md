@@ -29,7 +29,7 @@
 | `partial` 部分失敗 | 有「任務結束」行且失敗數 > 0 |
 | `aborted` 中止 | 出現「任務中止：…」 |
 | `incomplete` 未完成 | 無結束行（中斷/仍在執行） |
-| `stale` 過期 | 最新一次為 `success`，但距今超過 `--stale-hours`（預設 24h） |
+| `stale` 過期 | 最新一次為 `success`，但距今超過 `--stale-hours`（預設 72h） |
 
 過期只套用在原本正常的裝置；`partial/aborted/incomplete` 一律以異常優先呈現。
 
@@ -117,7 +117,7 @@ python monitor/log_monitor.py \
 |------|------|
 | `--log-dir PATH` | 要分析的本地 log 目錄（預設 `logs`）。遞迴掃描 `*.csv`，涵蓋巢狀結構。 |
 | `--mode {download,upload,all}` | 只看某方向（預設 `all`）。 |
-| `--stale-hours N` | 逾期告警門檻（小時，預設 24）。 |
+| `--stale-hours N` | 逾期告警門檻（小時，預設 72）。 |
 | `--html [PATH]` | 另存 HTML 報告；不接路徑則**覆寫** `<log-dir>/log_monitor.html`（固定檔名，`--watch` 為原地刷新、不堆檔）。需保留歷史快照時改接明確路徑。 |
 | `--sync-config PATH` | 分析前先用此 download 設定檔觸發本體下載遠端 log。 |
 | `--watch SECONDS` | 每 N 秒清畫面刷新（搭配 `--sync-config` 才會重新下載）。 |

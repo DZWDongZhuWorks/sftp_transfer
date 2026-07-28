@@ -345,7 +345,7 @@ def test_sync_logs_missing_config_returns_false(tmp_path):
 def test_build_parser_defaults():
     args = build_parser().parse_args([])
     assert args.mode == "all"
-    assert args.stale_hours == 24
+    assert args.stale_hours == 72
     assert args.html is None
     assert args.flat is False
     assert args.status == "all"

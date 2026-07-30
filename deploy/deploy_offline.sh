@@ -230,13 +230,34 @@ PY
   ok "已建立/更新船舶基本資訊檔：$VESSEL_INFO"
 }
 
+# --check-only 的承諾是「只驗證，不安裝」（見檔頭用法）。以下這一整段「一次性設定」
+# 會建立身分檔、清除接管旗標、刪除舊格式狀態檔、佈署 systemd unit 與 sudoers ——
+# 全部都是變更。所以 --check-only 一律只回報現況、不執行任何動作。
+#
+# 這個 guard 是後補的：CHECK_ONLY 原本要到 venv 那一段才被檢查，於是 --check-only 會
+# 一路把身分檔與 systemd 都改掉。加入「清除接管旗標」「刪除舊格式狀態檔」之後風險升級
+# ——對一台真的正在接管中的船,那會直接讓它失去接管。
+DRYRUN_NOTE=""
+if [ "$CHECK_ONLY" -eq 1 ]; then
+  DRYRUN_NOTE="（--check-only：只回報，不執行）"
+  echo ""
+  info "--check-only：以下一次性設定只回報現況，不做任何變更。"
+fi
+
 echo ""
 info "檢查船舶基本資訊檔 ..."
 set +e
 VESSEL_OUT="$(vessel_info_show)"; VESSEL_RC=$?
 set -e
 [ -n "$VESSEL_OUT" ] && printf '%s\n' "$VESSEL_OUT" | sed 's/^/       /'
-if [ "$VESSEL_RC" -eq 0 ]; then
+if [ "$CHECK_ONLY" -eq 1 ]; then
+  case "$VESSEL_RC" in
+    0) ok   "船舶基本資訊檔有效。" ;;
+    4) warn "船舶基本資訊檔有效，但**帶著 failover 接管旗標** —— 本機會以 emer 角色啟動。$DRYRUN_NOTE" ;;
+    3) warn "找不到船舶基本資訊檔；正式部署時會以互動問答建立。$DRYRUN_NOTE" ;;
+    *) warn "船舶基本資訊檔內容不正確；正式部署時會重新建立。$DRYRUN_NOTE" ;;
+  esac
+elif [ "$VESSEL_RC" -eq 0 ]; then
   ok "船舶基本資訊檔有效，沿用現有內容。"
 elif [ "$VESSEL_RC" -eq 4 ]; then
   # 欄位有效，但帶著接管旗標。重新部署幾乎總是意味著機器被重裝、搬移或換角色，
@@ -244,20 +265,34 @@ elif [ "$VESSEL_RC" -eq 4 ]; then
   echo ""
   warn "══════════════════ 本機處於接管狀態 ══════════════════"
   warn "身分檔帶有 failover 旗標，本機會以 emer 角色啟動（等同對方的完整服務清單）。"
-  warn "若對方其實活著，兩台會同時執行同一批服務（雙主）。"
-  warn "重新部署通常代表機器被重裝／搬移／換角色，此時該旗標幾乎確定是殘留。"
   warn "═══════════════════════════════════════════════════"
+  # 不猜預設值,把證據給操作者。成本是不對稱的:
+  #   誤清 → 若對方真的死了,船上立刻失去那些服務,而且沒有任何告警(安靜的嚴重故障)
+  #   誤留 → 啟動器每次都印雙主警告、巡檢 24 小時後升 WARN、status 直接顯示(很吵,可回復)
+  # 所以預設保留(Enter = N),並先跑一次唯讀的 status 讓操作者看對方到底活不活著。
+  FAILOVER_CTL="${SHARE_DIR}/scheduler/failover/failover_ctl.sh"
+  if [ -f "$FAILOVER_CTL" ]; then
+    echo ""
+    info "先確認對方是否還活著（failover_ctl.sh status，唯讀）："
+    set +e
+    bash "$FAILOVER_CTL" status 2>&1 | sed 's/^/       /'
+    set -e
+  fi
+  echo ""
+  warn "判讀:"
+  warn "  * 上面顯示對方**有回應** → 這個旗標是殘留,應該清除(否則兩台同時跑同一批服務)"
+  warn "  * 上面顯示對方**無回應** → 本機可能真的在替它接管,清除會讓船上失去那些服務"
   clear_ans=""
   if [ -t 0 ]; then
-    read -r -p "  現在清除接管旗標？（對方確實故障、需維持接管才選 n）[Y/n] " clear_ans \
-      || clear_ans=""
+    read -r -p "  清除接管旗標？（不確定就按 Enter 保留，之後可用 failover_ctl.sh clear）[y/N] " \
+      clear_ans || clear_ans=""
   else
     warn "非互動終端機：不擅自更動身分檔，保留現狀。"
-    warn "如需清除請執行：bash ${SHARE_DIR}/scheduler/failover/failover_ctl.sh clear"
+    warn "如需清除請執行：bash $FAILOVER_CTL clear"
     clear_ans="n"
   fi
   case "$clear_ans" in
-    ""|Y|y)
+    Y|y)
       if clear_failover_flag; then
         ok "已清除接管旗標（vsl_name / ipc 未變更）。"
         info "角色要生效仍需執行：bash ${SHARE_DIR}/scheduler/reboot_launcher.sh --reconcile"
@@ -283,18 +318,24 @@ LEGACY_FAILOVER="${SHARE_DIR}/.env/failover_state.json"
 if [ -f "$LEGACY_FAILOVER" ]; then
   echo ""
   warn "偵測到舊格式的接管狀態檔：$LEGACY_FAILOVER"
-  warn "它已廢除。若保留，heartbeat 啟動時會把它遷移成本機的接管狀態 ——"
-  warn "對一台剛部署的機器而言那幾乎確定是錯的（不該繼承別台的接管狀態）。"
+  warn "它已廢除。若保留，heartbeat 啟動時會把它遷移成本機的接管狀態。"
+  warn "判讀與上面同一個道理:若 .env/ 是從舊機複製過來的,這是殘留,該刪;"
+  warn "若本機真的在替一台死掉的對端接管,刪掉就會失去接管。"
+  warn "保留是可回復的（遷移後會出現在 failover_ctl.sh status 與巡檢報告裡）,所以預設保留。"
   legacy_ans=""
-  if [ -t 0 ]; then
-    read -r -p "  現在刪除它？[Y/n] " legacy_ans || legacy_ans=""
+  if [ "$CHECK_ONLY" -eq 1 ]; then
+    warn "$DRYRUN_NOTE 正式部署時會詢問是否刪除。"
+    legacy_ans="n"
+  elif [ -t 0 ]; then
+    read -r -p "  刪除它？（不確定就按 Enter 保留）[y/N] " legacy_ans || legacy_ans=""
   else
     warn "非互動終端機：不擅自刪除，保留現狀。"
     legacy_ans="n"
   fi
   case "$legacy_ans" in
-    ""|Y|y) rm -f "$LEGACY_FAILOVER" && ok "已刪除 $LEGACY_FAILOVER" ;;
-    *) warn "保留舊格式接管狀態檔。heartbeat 啟動時會把它遷移進身分檔。" ;;
+    Y|y) rm -f "$LEGACY_FAILOVER" && ok "已刪除 $LEGACY_FAILOVER" ;;
+    *) warn "保留舊格式接管狀態檔。heartbeat 啟動時會把它遷移進身分檔;"
+       warn "若確認是殘留,遷移後執行:bash ${SHARE_DIR}/scheduler/failover/failover_ctl.sh clear" ;;
   esac
 fi
 
@@ -316,6 +357,16 @@ info "檢查開機自動執行設定 ..."
 if [ ! -f "$AUTOSTART_INSTALLER" ]; then
   warn "找不到 $AUTOSTART_INSTALLER ，略過開機自動執行設定。"
   AUTOSTART_STATUS="略過（找不到安裝腳本）"
+elif [ "$CHECK_ONLY" -eq 1 ]; then
+  # --check-only 不佈署 unit；改用安裝器自己的 --check-only 回報現況
+  #（它會一併檢查啟動器的必要檔案是否齊全,缺就回 4）。
+  set +e
+  bash "$AUTOSTART_INSTALLER" --check-only
+  AUTOSTART_RC=$?
+  set -e
+  [ "$AUTOSTART_RC" -eq 0 ] \
+    && AUTOSTART_STATUS="現況正常$DRYRUN_NOTE" \
+    || AUTOSTART_STATUS="現況有問題（rc=$AUTOSTART_RC）$DRYRUN_NOTE"
 elif [ ! -t 0 ]; then
   # 非互動終端機：不擅自更動 systemd / linger，僅提示手動指令。
   warn "非互動終端機，略過開機自動執行設定。"
@@ -337,7 +388,10 @@ else
            AUTOSTART_STATUS="已啟用" ;;
         3) warn "開機自動執行：user service 已安裝，但 linger 未開啟；請手動執行 sudo loginctl enable-linger $(id -un)"
            AUTOSTART_STATUS="部分完成（linger 未開啟）" ;;
-        4) warn "開機自動執行：設定失敗（rc=4：找不到腳本 / 無法寫入 unit / user manager 不可用）"
+        4) warn "開機自動執行：設定失敗（rc=4）。可能原因:"
+           warn "  * 缺少啟動器必要檔案(reboot_launcher.sh / reboot_script/roles.conf /"
+           warn "    failover/effective_role.sh)—— 離線包不完整,見上方 install_autostart 的明細"
+           warn "  * 找不到腳本 / 無法寫入 unit / systemd user manager 不可用"
            AUTOSTART_STATUS="設定失敗（rc=4）" ;;
         2) warn "開機自動執行：install_autostart.sh 參數錯誤（rc=2）"
            AUTOSTART_STATUS="設定失敗（參數錯誤）" ;;
@@ -370,6 +424,21 @@ info "檢查週期排程設定 ..."
 if [ ! -f "$TIMERS_INSTALLER" ]; then
   warn "找不到 $TIMERS_INSTALLER ，略過週期排程設定。"
   SCHED_STATUS="略過（找不到安裝腳本）"
+elif [ "$CHECK_ONLY" -eq 1 ]; then
+  # --check-only 不佈署 timer、不裝 sudoers、不重啟 heartbeat;只回報現況。
+  set +e
+  bash "$TIMERS_INSTALLER" --check-only
+  set -e
+  SCHED_STATUS="僅回報現況$DRYRUN_NOTE"
+  [ -f "$SUDOERS_DST" ] && SUDOERS_STATUS="已存在" || SUDOERS_STATUS="未安裝$DRYRUN_NOTE"
+  if [ -f "$HEARTBEAT_INSTALLER" ]; then
+    set +e
+    bash "$HEARTBEAT_INSTALLER" --check-only
+    set -e
+    HEARTBEAT_STATUS="僅回報現況$DRYRUN_NOTE"
+  else
+    HEARTBEAT_STATUS="略過（找不到安裝腳本）"
+  fi
 elif [ ! -t 0 ]; then
   warn "非互動終端機，略過週期排程設定。"
   warn "如需設定，請手動執行：bash $TIMERS_INSTALLER"

@@ -1,12 +1,35 @@
 #!/usr/bin/env bash
 #
-# deploy_offline.sh — 離線快速部署腳本 (sftp_transfer)
+# deploy_offline.sh — 船機的唯一一次人工安裝入口
 # ---------------------------------------------------------------------------
-# 在「完全沒有對外網路」的環境下，使用 deploy/wheelhouse/ 內預先下載的 wheel
-# 檔案，為 sftp_transfer 建立一個「專屬 venv」並安裝所有相依套件。
+# ⚠ 這支腳本的職責早已超出檔名。它最初只做一件事:用 deploy/wheelhouse/ 內預先下載的
+#   wheel 為 sftp_transfer 建立專屬 venv(所以叫 offline —— 指的是**不從 PyPI 下載**,
+#   不是「機器沒有網路」;船上是連得到 SFTP 的 61.56.200.137 的,OTA 整套機制就靠它)。
+#   後來陸續被加上 timer、sudoers 白名單、心跳服務、存活巡檢(見 6fcbcad / 6192841 /
+#   708c781),於是實際上變成「船機唯一的一次性人工安裝流程」。檔頭照實寫,避免誤導。
 #
-# 專屬 venv 預設路徑（與 radar / SHM 等其他專案的慣例一致）：
-#     ~/venv/wanhai_nssms/share/sftp_transfer
+# 三個階段:
+#
+#   A. 一次性人工設定(**所有需要你輸入的東西都集中在這裡**)
+#      1) 船舶身分檔 share/.env/vessel_basic_info.json(vsl_name / ipc)
+#         —— 順便偵測殘留的接管旗標與舊格式 failover_state.json
+#      2) install_autostart.sh   → nssms-boot.service + linger
+#      3) install_timers.sh      → 7 支週期排程 timer
+#      4) sudoers 白名單         → reboot / teamviewer 需要(這一步要輸入一次密碼)
+#      5) install_heartbeat.sh   → nssms-heartbeat.service(雙向心跳/接管)
+#      6) 詢問「之後要不要立即執行完整啟動流程」——**只問，執行在階段 C**
+#      這一段結束後會印「以下不再需要任何輸入」,操作者可以離開終端機。
+#
+#   B. sftp_transfer 專屬 venv(離線、無人干預)
+#      wheelhouse + MANIFEST.txt sha256 校驗 → virtualenv → pip --no-index → 匯入驗證
+#      路徑預設 ~/venv/wanhai_nssms/share/sftp_transfer(與 radar / SHM 的慣例一致)
+#
+#   C. 完整啟動流程與驗證(無人干預)
+#      reboot_launcher.sh:掛載資料碟 → update_booster(SFTP 拉最新程式碼)→ 依角色安裝
+#      各專案環境並啟動服務 → 然後才跑 health_check 與 automation_health_check
+#      (順序是刻意的:啟動要在 venv 之後——SFTP 下載要用它;要在巡檢之前——服務起來後
+#       那份巡檢才第一次真的有意義)
+#      可用 --no-launch 關閉;選 n 也不會壞,下次開機 nssms-boot 會跑同一支啟動器。
 #
 # 目標平台：Linux aarch64 / CPython 3.10 / glibc >= 2.34  (NVIDIA Tegra, mic-733ao)
 #
@@ -22,7 +45,7 @@
 #   ./deploy_offline.sh --python /usr/bin/python3.10 # 指定建立 venv 用的直譯器
 #
 # 特性：
-#   * 全程 --no-index，永不連外網。
+#   * venv 安裝全程 --no-index，永不連 PyPI（階段 C 的 SFTP 下載另當別論）。
 #   * 以 python3.10 -m virtualenv 建立 venv（與 radar / SHM 一致），不再依賴系統的
 #     python3-venv / ensurepip；若 python3.10 尚無 virtualenv，會用隨附的
 #     install_virtualenv_offline.sh + virtualenv_wheels/ 先離線補齊。

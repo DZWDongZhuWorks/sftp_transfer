@@ -16,6 +16,7 @@
 #   ./deploy_offline.sh --with-tests    # （保留相容；現為預設，明確要求安裝測試堆疊）
 #   ./deploy_offline.sh --recreate      # 砍掉重建 venv（乾淨安裝）
 #   ./deploy_offline.sh --no-health-check # 部署後不自動執行能力／自動化健康檢查
+#   ./deploy_offline.sh --no-launch      # 部署後不執行啟動流程（不下載程式碼、不啟動服務）
 #   ./deploy_offline.sh --check-only    # 只驗證 wheel 完整性與環境，不安裝
 #   ./deploy_offline.sh --venv /path/to/venv        # 自訂 venv 路徑
 #   ./deploy_offline.sh --python /usr/bin/python3.10 # 指定建立 venv 用的直譯器
@@ -49,6 +50,8 @@ CHECK_ONLY=0
 SKIP_VERIFY=0
 RECREATE=0
 RUN_HEALTH=1
+# 部署完成後是否立即跑一次完整啟動流程(下載程式碼 + 裝環境 + 啟動服務)。
+RUN_LAUNCH=1
 
 # --- 顏色輸出 --------------------------------------------------------------
 if [ -t 1 ]; then
@@ -72,6 +75,7 @@ while [ $# -gt 0 ]; do
     --skip-verify) SKIP_VERIFY=1 ;;
     --recreate)    RECREATE=1 ;;
     --no-health-check) RUN_HEALTH=0 ;;
+    --no-launch)   RUN_LAUNCH=0 ;;
     --venv)        VENV_DIR="${2:?--venv 需要一個路徑參數}"; shift ;;
     --python)      PYTHON_BIN="${2:?--python 需要一個路徑參數}"; shift ;;
     -h|--help)     usage ;;
@@ -645,6 +649,70 @@ ok "匯入驗證通過"
 echo "-----------------------------------------------------------"
 ok "離線部署完成！專屬 venv：$VENV_DIR"
 
+# --- 立即執行一次完整啟動流程（reboot_launcher.sh） ------------------------
+# 到這裡為止只做完「一次性設定」:身分、systemd 骨架、sudoers、sftp_transfer 的 venv。
+# 各專案的**程式碼、環境安裝與服務啟動**全部在啟動流程裡:
+#     reboot_launcher.sh → update_booster.sh(SFTP 拉最新程式碼)
+#                        → 依角色套用 update+env+run
+# 少了這一步,部署跑完機器上一個 tmux session 都沒有,而總結卻是一排「已啟用」——
+# 操作者很合理會以為部署完成了。
+#
+# 刻意放在 venv 之後:update_booster 的 SFTP 下載要用 sftp_transfer 的 venv。
+# 也刻意放在健康檢查**之前**:服務起來之後,那份巡檢才第一次真的有意義
+#(否則 tmux 段永遠是「預期 session 不存在」)。
+LAUNCHER="${SHARE_DIR}/scheduler/reboot_launcher.sh"
+LAUNCH_STATUS="未執行"
+echo ""
+info "檢查是否立即執行完整啟動流程 ..."
+if [ "$CHECK_ONLY" -eq 1 ]; then
+  warn "--check-only:不執行啟動流程。$DRYRUN_NOTE"
+  LAUNCH_STATUS="略過（--check-only）"
+elif [ "$RUN_LAUNCH" -eq 0 ]; then
+  info "--no-launch:略過啟動流程。"
+  LAUNCH_STATUS="略過（--no-launch）"
+elif [ ! -f "$LAUNCHER" ]; then
+  warn "找不到 $LAUNCHER ，略過啟動流程。"
+  LAUNCH_STATUS="略過（找不到啟動器）"
+else
+  echo ""
+  info "這一步會:掛載資料碟 → SFTP 拉最新程式碼 → 安裝各專案環境 → 啟動服務。"
+  info "首次部署沒有 launcher_state.json,所以是全相位套用,可能需要數分鐘。"
+  if [ "${DEPLOY_VSL_UPPER:-}" = "CLINK" ]; then
+    warn "本機 vsl_name=CLINK(開發機):update_booster 會刻意略過整個 OTA,"
+    warn "所以**不會**下載程式碼,只會用機上現有版本啟動。"
+  fi
+  launch_ans=""
+  if [ -t 0 ]; then
+    read -r -p "  現在執行?（選 n 則需自行 reboot 或 systemctl --user start nssms-boot）[Y/n] " \
+      launch_ans || launch_ans=""
+  else
+    warn "非互動終端機:不擅自啟動服務。"
+    launch_ans="n"
+  fi
+  case "$launch_ans" in
+    ""|Y|y)
+      echo ""
+      set +e
+      bash "$LAUNCHER"
+      LAUNCH_RC=$?
+      set -e
+      if [ "$LAUNCH_RC" -eq 0 ]; then
+        ok "啟動流程完成（所有項目成功）。"
+        LAUNCH_STATUS="已完成"
+      else
+        # 啟動器對個別項目失敗是「記錄並繼續」,所以非 0 代表有項目失敗而非整體中止。
+        warn "啟動流程有項目失敗（exit=$LAUNCH_RC）。詳見上方總結與"
+        warn "  ${SHARE_DIR}/scheduler/logs/launcher.log"
+        LAUNCH_STATUS="有項目失敗（exit=$LAUNCH_RC）"
+      fi
+      ;;
+    *)
+      info "略過。日後請 reboot,或執行:systemctl --user start nssms-boot"
+      LAUNCH_STATUS="使用者略過"
+      ;;
+  esac
+fi
+
 # --- 部署後自動健康檢查 ----------------------------------------------------
 HEALTH_RC=0
 if [ "$RUN_HEALTH" -eq 1 ]; then
@@ -727,6 +795,8 @@ if [ -f "$EFFECTIVE_ROLE_SH" ]; then
 else
   DEPLOY_ROLE="（找不到 effective_role.sh）"
 fi
+# 開發機(CLINK)的 OTA 守門會讓「第一次開機自動下載程式碼」這件事不成立,後面要據此提醒。
+DEPLOY_VSL_UPPER="$(printf '%s' "$(vessel_get vsl_name)" | tr '[:lower:]' '[:upper:]')"
 printf "  本機有效角色    ：%s\n" "$DEPLOY_ROLE"
 printf "  開機自動執行設定：%s\n" "$AUTOSTART_STATUS"
 printf "  週期排程 timer   ：%s\n" "$SCHED_STATUS"
@@ -734,8 +804,38 @@ printf "  心跳/接管服務    ：%s\n" "$HEARTBEAT_STATUS"
 printf "  sudo 白名單      ：%s\n" "$SUDOERS_STATUS"
 [ "$RUN_HEALTH" -eq 1 ] && printf "  健康檢查：%s\n" \
   "$( [ "$HEALTH_RC" -eq 0 ] && echo HEALTHY || echo "有問題（exit=$HEALTH_RC）" )"
+printf "  完整啟動流程    ：%s\n" "$LAUNCH_STATUS"
 printf "  自動化存活巡檢  ：%s\n" "$AUTOMATION_STATUS"
 
+echo ""
+echo "── ⚠ 尚未完成:服務還沒有啟動 ──"
+# 本腳本刻意只做「一次性人工設定」:身分、systemd 骨架、sudoers、sftp_transfer 的 venv。
+# 它不做 SFTP 下載、不跑 update_booster、也不 start nssms-boot(只 enable)。
+# 各專案的程式碼、環境安裝與服務啟動,全部由第一次開機的
+#   nssms-boot → reboot_launcher.sh → update_booster.sh(OTA)→ 依角色全相位套用
+# 完成。不講清楚的話,操作者看到上面一排「已啟用」會以為部署完成了。
+echo "  deploy_offline 只做一次性設定(身分 / systemd / sudoers / sftp_transfer venv)。"
+echo "  各專案的程式碼、環境與服務由第一次開機流程完成:"
+echo "    nssms-boot → reboot_launcher.sh → update_booster.sh(SFTP 拉最新程式碼)"
+echo "                                    → 依角色 $DEPLOY_ROLE 套用 update+env+run"
+echo ""
+echo "  所以接下來請二選一:"
+echo "    sudo reboot                                # 建議:完整走一次真實開機流程"
+echo "    systemctl --user start nssms-boot          # 或立即手動觸發一次(不重開機)"
+echo ""
+echo "  想先確認會做什麼(不執行任何動作):"
+echo "    bash ${SHARE_DIR}/scheduler/reboot_launcher.sh --dry-run"
+echo ""
+echo "  啟動後的驗證:"
+echo "    tmux ls                                     # 應列出本角色該有的 session"
+echo "    tail -f ${SHARE_DIR}/scheduler/logs/launcher.log       # 開機做了什麼"
+echo "    tail -f ${SHARE_DIR}/scheduler/failover/logs/heartbeat.log"
+echo "    ${PYTHON_BIN} ${AUTOMATION_CHECKER}"
+if [ "${DEPLOY_VSL_UPPER:-}" = "CLINK" ]; then
+  echo ""
+  warn "  本機 vsl_name=CLINK(開發機):update_booster 會刻意略過整個 OTA,"
+  warn "  所以程式碼**不會**自動下載,需人工放置或 rsync。"
+fi
 echo ""
 echo "啟用 venv："
 echo "  source \"$VENV_DIR/bin/activate\""

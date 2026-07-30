@@ -532,6 +532,56 @@ else
   esac
 fi
 
+# --- 是否於部署完成後立即執行完整啟動流程（只收集決定，執行在最後面） ------
+# 到目前為止只做完「一次性設定」:身分、systemd 骨架、sudoers。各專案的**程式碼、環境安裝
+# 與服務啟動**全部在啟動流程裡:
+#     reboot_launcher.sh → update_booster.sh(SFTP 拉最新程式碼)→ 依角色套用 update+env+run
+# 少了它,部署跑完機器上一個 tmux session 都沒有,而總結卻是一排「已啟用」。
+#
+# **決定在這裡收集,執行放到最後面。** 理由:接下來的 venv 建置是一長段無人干預的流程,
+# 若把詢問放在它之後,操作者就得守在機器前等它跑完才能回答那一題 —— 所有需要人輸入的東西
+# 都該集中在最前面。(而且啟動流程本身可能要數分鐘,問完就能一路跑到底。)
+#
+# 選 n 也不會壞:只要前面的開機 unit 裝成功了,下次開機 nssms-boot 就會跑同一支啟動器。
+LAUNCHER="${SHARE_DIR}/scheduler/reboot_launcher.sh"
+LAUNCH_STATUS="未執行"
+LAUNCH_DECISION="skip"
+echo ""
+info "檢查是否於部署完成後立即執行完整啟動流程 ..."
+if [ "$CHECK_ONLY" -eq 1 ]; then
+  warn "--check-only:不執行啟動流程。$DRYRUN_NOTE"
+  LAUNCH_STATUS="略過（--check-only）"
+elif [ "$RUN_LAUNCH" -eq 0 ]; then
+  info "--no-launch:略過啟動流程。"
+  LAUNCH_STATUS="略過（--no-launch）"
+elif [ ! -f "$LAUNCHER" ]; then
+  warn "找不到 $LAUNCHER ，略過啟動流程。"
+  LAUNCH_STATUS="略過（找不到啟動器）"
+elif [ ! -t 0 ]; then
+  warn "非互動終端機:不擅自啟動服務。"
+  warn "如需啟動請於部署後執行:bash $LAUNCHER"
+  LAUNCH_STATUS="略過（非互動終端機）"
+else
+  info "它會:掛載資料碟 → SFTP 拉最新程式碼 → 安裝各專案環境 → 啟動服務。"
+  info "首次部署沒有 launcher_state.json,所以是全相位套用,可能需要數分鐘。"
+  info "會在本腳本的最後、健康檢查之前執行(這之後不再需要你輸入任何東西)。"
+  if [ "${DEPLOY_VSL_UPPER:-}" = "CLINK" ]; then
+    warn "本機 vsl_name=CLINK(開發機):update_booster 會刻意略過整個 OTA,"
+    warn "所以**不會**下載程式碼,只會用機上現有版本啟動。"
+  fi
+  launch_ans=""
+  read -r -p "  部署完成後立即執行?（選 n 則下次開機由 nssms-boot 自動跑）[Y/n] " \
+    launch_ans || launch_ans=""
+  case "$launch_ans" in
+    ""|Y|y) LAUNCH_DECISION="run"; ok "已排入:部署完成後會執行一次完整啟動流程。" ;;
+    *) LAUNCH_STATUS="使用者略過"
+       info "略過。下次開機 nssms-boot 會自動執行,或手動:bash $LAUNCHER" ;;
+  esac
+fi
+
+echo ""
+info "以下不再需要任何輸入,可以離開終端機。"
+
 if [ ! -d "$WHEELHOUSE" ]; then
   err "wheelhouse 目錄不存在：$WHEELHOUSE"; exit 1
 fi
@@ -649,68 +699,27 @@ ok "匯入驗證通過"
 echo "-----------------------------------------------------------"
 ok "離線部署完成！專屬 venv：$VENV_DIR"
 
-# --- 立即執行一次完整啟動流程（reboot_launcher.sh） ------------------------
-# 到這裡為止只做完「一次性設定」:身分、systemd 骨架、sudoers、sftp_transfer 的 venv。
-# 各專案的**程式碼、環境安裝與服務啟動**全部在啟動流程裡:
-#     reboot_launcher.sh → update_booster.sh(SFTP 拉最新程式碼)
-#                        → 依角色套用 update+env+run
-# 少了這一步,部署跑完機器上一個 tmux session 都沒有,而總結卻是一排「已啟用」——
-# 操作者很合理會以為部署完成了。
-#
+# --- 執行完整啟動流程（決定已在前面收集，這裡只執行） ----------------------
 # 刻意放在 venv 之後:update_booster 的 SFTP 下載要用 sftp_transfer 的 venv。
 # 也刻意放在健康檢查**之前**:服務起來之後,那份巡檢才第一次真的有意義
-#(否則 tmux 段永遠是「預期 session 不存在」)。
-LAUNCHER="${SHARE_DIR}/scheduler/reboot_launcher.sh"
-LAUNCH_STATUS="未執行"
-echo ""
-info "檢查是否立即執行完整啟動流程 ..."
-if [ "$CHECK_ONLY" -eq 1 ]; then
-  warn "--check-only:不執行啟動流程。$DRYRUN_NOTE"
-  LAUNCH_STATUS="略過（--check-only）"
-elif [ "$RUN_LAUNCH" -eq 0 ]; then
-  info "--no-launch:略過啟動流程。"
-  LAUNCH_STATUS="略過（--no-launch）"
-elif [ ! -f "$LAUNCHER" ]; then
-  warn "找不到 $LAUNCHER ，略過啟動流程。"
-  LAUNCH_STATUS="略過（找不到啟動器）"
-else
+#(否則 tmux 段永遠是「預期 session 不存在」,報告等於白給)。
+# 這裡不再詢問任何事 —— 所有互動都集中在前面,這之後全程無人干預。
+if [ "$LAUNCH_DECISION" = "run" ]; then
   echo ""
-  info "這一步會:掛載資料碟 → SFTP 拉最新程式碼 → 安裝各專案環境 → 啟動服務。"
-  info "首次部署沒有 launcher_state.json,所以是全相位套用,可能需要數分鐘。"
-  if [ "${DEPLOY_VSL_UPPER:-}" = "CLINK" ]; then
-    warn "本機 vsl_name=CLINK(開發機):update_booster 會刻意略過整個 OTA,"
-    warn "所以**不會**下載程式碼,只會用機上現有版本啟動。"
-  fi
-  launch_ans=""
-  if [ -t 0 ]; then
-    read -r -p "  現在執行?（選 n 則需自行 reboot 或 systemctl --user start nssms-boot）[Y/n] " \
-      launch_ans || launch_ans=""
+  echo "── 執行完整啟動流程（reboot_launcher.sh）──"
+  set +e
+  bash "$LAUNCHER"
+  LAUNCH_RC=$?
+  set -e
+  if [ "$LAUNCH_RC" -eq 0 ]; then
+    ok "啟動流程完成（所有項目成功）。"
+    LAUNCH_STATUS="已完成"
   else
-    warn "非互動終端機:不擅自啟動服務。"
-    launch_ans="n"
+    # 啟動器對個別項目失敗是「記錄並繼續」,所以非 0 代表有項目失敗而非整體中止。
+    warn "啟動流程有項目失敗（exit=$LAUNCH_RC）。詳見上方總結與"
+    warn "  ${SHARE_DIR}/scheduler/logs/launcher.log"
+    LAUNCH_STATUS="有項目失敗（exit=$LAUNCH_RC）"
   fi
-  case "$launch_ans" in
-    ""|Y|y)
-      echo ""
-      set +e
-      bash "$LAUNCHER"
-      LAUNCH_RC=$?
-      set -e
-      if [ "$LAUNCH_RC" -eq 0 ]; then
-        ok "啟動流程完成（所有項目成功）。"
-        LAUNCH_STATUS="已完成"
-      else
-        # 啟動器對個別項目失敗是「記錄並繼續」,所以非 0 代表有項目失敗而非整體中止。
-        warn "啟動流程有項目失敗（exit=$LAUNCH_RC）。詳見上方總結與"
-        warn "  ${SHARE_DIR}/scheduler/logs/launcher.log"
-        LAUNCH_STATUS="有項目失敗（exit=$LAUNCH_RC）"
-      fi
-      ;;
-    *)
-      info "略過。日後請 reboot,或執行:systemctl --user start nssms-boot"
-      LAUNCH_STATUS="使用者略過"
-      ;;
-  esac
 fi
 
 # --- 部署後自動健康檢查 ----------------------------------------------------

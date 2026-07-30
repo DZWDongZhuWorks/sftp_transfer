@@ -10,7 +10,7 @@ BASE_DIR="$(dirname "$SCRIPT_DIR")"
 cd "$BASE_DIR"
 
 # 開發機 (CLINK) 守門：見 _dev_guard.sh。自我更新會 overwrite 覆蓋本專案 live 目錄，
-# 在 CLINK 上一律略過，避免覆蓋未提交的修改。無論被 reboot_tmux.sh、timer 或人工直接
+# 在 CLINK 上一律略過，避免覆蓋未提交的修改。無論被 reboot_launcher.sh、timer 或人工直接
 # 呼叫都能自我保護，不再單靠外部呼叫端把關。
 source "$SCRIPT_DIR/_dev_guard.sh"
 dev_guard "$BASE_DIR"

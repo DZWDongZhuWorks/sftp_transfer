@@ -37,12 +37,14 @@ SHARE_DIR = PROJECT_DIR.parent
 SCHEDULER_DIR = SHARE_DIR / "scheduler"
 TIMERS_DIR = SCHEDULER_DIR / "timers"
 FAILOVER_DIR = SCHEDULER_DIR / "failover"
-# 身分與接管狀態檔。兩者都可用環境變數覆蓋（測試專用），與 sftp_transfer/settings.py
-# 的 VESSEL_INFO_PATH、heartbeat.py 與 reboot_tmux.sh 的 FAILOVER_STATE_PATH 同一慣例。
+# 身分檔。身分與接管狀態都在這一個檔裡(ipc + failover + failover_since)。
+# 可用環境變數覆蓋（測試專用），與 sftp_transfer/settings.py 同一慣例。
 VESSEL_INFO = Path(
     os.environ.get("VESSEL_INFO_PATH") or SHARE_DIR / ".env" / "vessel_basic_info.json"
 )
-FAILOVER_STATE = Path(
+# 舊格式的獨立接管狀態檔,已廢除;heartbeat 啟動時會遷移。這裡只是讓它可見。
+# 【移除條件】全隊確認升級完成後,連同 scheduler/failover/role.py 的遷移碼一起刪掉。
+LEGACY_FAILOVER_STATE = Path(
     os.environ.get("FAILOVER_STATE_PATH") or SHARE_DIR / ".env" / "failover_state.json"
 )
 USER_UNIT_DIR = Path.home() / ".config" / "systemd" / "user"
@@ -55,6 +57,8 @@ TAKEOVER_WARN_HOURS = 24
 
 CORE_SERVICES = ("nssms-boot.service", "nssms-heartbeat.service")
 TIMERS = (
+    "nssms-device-monitor-probe",
+    "nssms-device-monitor-report",
     "nssms-reboot",
     "nssms-teamviewer",
     "nssms-warm-env",
@@ -62,8 +66,15 @@ TIMERS = (
     "nssms-wave-update",
 )
 OPTIONAL_WAVE = {"nssms-wave-send", "nssms-wave-update"}
-EXPECTED_TMUX = {
+
+# 角色 → 預期的 tmux session。**由 scheduler/reboot_script/roles.conf 推導**,不再硬編碼:
+# 那份表是啟動器的唯一真相,在這裡放第二份清單會漂移,而且漂移不會有任何執行期錯誤
+# ——正是這支巡檢器要抓的那種安靜失效。讀不到時 record FAIL 並退回下面的保底值,
+# 絕不拋例外(deploy_offline.sh 把本程式當作首次部署唯一的驗證關卡)。
+ROLES_CONF = SCHEDULER_DIR / "reboot_script" / "roles.conf"
+FALLBACK_EXPECTED_TMUX = {
     "ipc1": {"shm", "radar", "wave", "ecdis", "flag"},
+    "ipc1emer": {"shm", "radar", "wave", "ecdis", "flag"},
     "ipc2": {"shm"},
     "ipc2emer": {"shm", "radar", "wave", "ecdis", "flag"},
 }
@@ -160,10 +171,24 @@ def read_json(path: Path) -> dict:
     return data
 
 
+def _failover_on(value) -> bool:
+    """身分檔的 failover 欄位是否為真。
+
+    規則必須與 scheduler/failover/role.py 的 is_failover_on()、effective_role.sh 的
+    nssms_failover_on() 及 device_monitor/_common.py 的 _failover_on() 逐字相同;
+    四份實作由 scheduler/tests/test_role_contract.py 保證不漂移。
+    """
+    text = str(value).strip().lower()
+    if text in {"true", "1", "yes"}:
+        return True
+    return False
+
+
 def check_identity() -> tuple[str, str]:
     heading("身分與路徑")
     role = "unknown"
     vessel = "unknown"
+    info: dict = {}
     try:
         info = read_json(VESSEL_INFO)
         vessel = str(info.get("vsl_name", "")).strip() or "unknown"
@@ -176,53 +201,49 @@ def check_identity() -> tuple[str, str]:
     except Exception as exc:  # noqa: BLE001
         record("identity", "船舶／IPC 身分", "FAIL", f"{VESSEL_INFO}: {exc}")
 
-    if FAILOVER_STATE.exists():
-        try:
-            state = read_json(FAILOVER_STATE)
-            if role == "ipc2" and state.get("state") == "takeover":
-                role = "ipc2emer"
-                since_desc = state.get("since_iso", state.get("since"))
-                age_h = _takeover_age_hours(state.get("since"))
-                if age_h is None:
-                    # since 壞掉 → heartbeat 會 clamp 成現在（見 heartbeat.sanitize_since），
-                    # 接管不會中斷，但最短停留的計時會被重設，值得提出來。
-                    record(
-                        "identity",
-                        "接管狀態",
-                        "WARN",
-                        f"ipc2emer，但 since 不是合法時間（{state.get('since')!r}）；"
-                        "heartbeat 會以當下時間重新起算最短停留",
-                    )
-                elif age_h >= TAKEOVER_WARN_HOURS:
-                    # 真實接管撐過一天代表 ipc1 一直沒修好，該有人知道；
-                    # 測試留下的殘留檔也會從這裡浮出來。
-                    record(
-                        "identity",
-                        "接管狀態",
-                        "WARN",
-                        f"ipc2emer 已持續 {age_h:.1f} 小時（≥ {TAKEOVER_WARN_HOURS}）"
-                        f"，since={since_desc}；"
-                        "請確認 ipc1 是否真的故障，若為測試殘留請執行 "
-                        "scheduler/failover/failover_ctl.sh clear",
-                    )
-                else:
-                    record(
-                        "identity",
-                        "接管狀態",
-                        "INFO",
-                        f"ipc2emer，已持續 {age_h:.1f} 小時，since={since_desc}",
-                    )
-            else:
-                record(
-                    "identity",
-                    "接管狀態",
-                    "WARN",
-                    f"狀態檔存在但與目前角色不一致：{state}",
-                )
-        except Exception as exc:  # noqa: BLE001
-            record("identity", "接管狀態", "FAIL", f"狀態檔無法解析：{exc}")
+    # 接管狀態 = 身分檔的 failover 旗標(兩個方向都可能)。
+    if role in {"ipc1", "ipc2"} and _failover_on(info.get("failover")):
+        peer = "ipc2" if role == "ipc1" else "ipc1"
+        role += "emer"
+        raw_since = info.get("failover_since")
+        since_desc = info.get("failover_since_iso", raw_since)
+        age_h = _takeover_age_hours(raw_since)
+        if age_h is None:
+            # since 壞掉 → heartbeat 會 clamp 成現在（見 role.sanitize_since），
+            # 接管不會中斷，但最短停留的計時會被重設，值得提出來。
+            record(
+                "identity", "接管狀態", "WARN",
+                f"{role}，但 failover_since 不是合法時間（{raw_since!r}）；"
+                "heartbeat 會以當下時間重新起算最短停留",
+            )
+        elif age_h >= TAKEOVER_WARN_HOURS:
+            # 真實接管撐過一天代表對方一直沒修好，該有人知道；
+            # 測試留下的殘留旗標也會從這裡浮出來。
+            record(
+                "identity", "接管狀態", "WARN",
+                f"{role} 已持續 {age_h:.1f} 小時（≥ {TAKEOVER_WARN_HOURS}）"
+                f"，since={since_desc}；"
+                f"請確認 {peer} 是否真的故障，若為測試殘留請執行 "
+                "scheduler/failover/failover_ctl.sh clear",
+            )
+        else:
+            record("identity", "接管狀態", "INFO",
+                   f"{role}（接管 {peer}），已持續 {age_h:.1f} 小時，since={since_desc}")
+    elif info.get("failover") is not None:
+        # 有欄位但不是真:白名單外的值一律視為未接管並告警(見 _failover_on)。
+        record("identity", "接管狀態", "WARN",
+               f"身分檔有 failover={info.get('failover')!r}，非明確的 true → 視為未接管")
     else:
-        record("identity", "接管狀態", "INFO", "NORMAL（無 failover_state.json）")
+        record("identity", "接管狀態", "INFO", "NORMAL（身分檔無 failover 旗標）")
+
+    # 舊格式的獨立狀態檔:heartbeat 啟動時會遷移,但在那之前它仍會影響角色判定。
+    if LEGACY_FAILOVER_STATE.exists():
+        record(
+            "identity", "舊格式接管狀態檔", "WARN",
+            f"{LEGACY_FAILOVER_STATE} 仍存在（已廢除）。heartbeat 啟動時會併進身分檔的 "
+            "failover 欄位並刪除；要立即完成請執行 "
+            "systemctl --user restart nssms-heartbeat",
+        )
 
     if vessel.upper() == "CLINK":
         record("identity", "OTA 守門", "INFO", "CLINK 開發機會刻意略過開機 SFTP OTA")
@@ -556,46 +577,114 @@ def check_sudoers() -> None:
         )
 
 
+DEFAULT_PEERS = {"ipc1": "192.168.8.115", "ipc2": "192.168.8.220"}
+
+
+def resolve_peer_addr(config: dict, peer: str) -> str:
+    """對方的位址。規則與 heartbeat.resolve_peer() 相同(含舊 peer_ip 鍵的相容)。"""
+    peers = config.get("peers") or {}
+    # 舊設定檔的 peer_ip 指的一律是 ipc1(改版前只有 ipc2→ipc1 這個方向)。
+    if peer == "ipc1" and str(config.get("peer_ip") or "").strip():
+        return str(config["peer_ip"]).strip()
+    return str(peers.get(peer) or "").strip() or DEFAULT_PEERS.get(peer, "")
+
+
 def heartbeat_probe(role: str) -> None:
     heading("heartbeat 實際探針")
     config_path = FAILOVER_DIR / "config.json"
     try:
         config = read_json(config_path)
         port = int(config.get("port", 6100))
-        peer_ip = str(config.get("peer_ip", ""))
         timeout = min(float(config.get("timeout", 3)), 5.0)
     except Exception as exc:  # noqa: BLE001
         record("heartbeat", "設定檔", "FAIL", f"{config_path}: {exc}")
         return
 
-    if role == "ipc1":
-        try:
-            with socket.create_connection(("127.0.0.1", port), timeout=timeout) as sock:
-                sock.settimeout(timeout)
-                reply = sock.recv(128).decode("utf-8", errors="replace").strip()
-            status = "PASS" if reply.startswith("alive ") else "FAIL"
-            record("heartbeat", "responder", status, f"127.0.0.1:{port} → {reply!r}")
-        except OSError as exc:
-            record("heartbeat", "responder", "FAIL", f"127.0.0.1:{port}: {exc}")
-    elif role in {"ipc2", "ipc2emer"}:
-        try:
-            with socket.create_connection((peer_ip, port), timeout=timeout) as sock:
-                sock.settimeout(timeout)
-                reply = sock.recv(128).decode("utf-8", errors="replace").strip()
-            record("heartbeat", "IPC-1 peer", "PASS", f"{peer_ip}:{port} → {reply!r}")
-        except OSError as exc:
-            record(
-                "heartbeat",
-                "IPC-1 peer",
-                "WARN",
-                f"{peer_ip}:{port} 暫時無回應：{exc}；接管仍依 takeover_after 判定",
-            )
-    else:
+    base = role[:-4] if role.endswith("emer") else role
+    if base not in {"ipc1", "ipc2"}:
         record("heartbeat", "角色探針", "FAIL", f"未知角色：{role}")
+        return
+
+    # 心跳現在是雙向的:兩台都同時跑 responder 與 monitor,所以**每個角色**都要驗兩件事。
+    # 1) responder 自檢:本機的心跳埠有沒有在聽(對方就是靠這個判斷本機活著)。
+    try:
+        with socket.create_connection(("127.0.0.1", port), timeout=timeout) as sock:
+            sock.settimeout(timeout)
+            reply = sock.recv(128).decode("utf-8", errors="replace").strip()
+        status = "PASS" if reply.startswith("alive ") else "FAIL"
+        record("heartbeat", "responder 自檢", status, f"127.0.0.1:{port} → {reply!r}")
+    except OSError as exc:
+        record("heartbeat", "responder 自檢", "FAIL",
+               f"127.0.0.1:{port}: {exc}；對方會把本機視為失聯")
+
+    # 2) monitor 方向:探測對方(ipc1 探 ipc2、ipc2 探 ipc1)。
+    peer = "ipc2" if base == "ipc1" else "ipc1"
+    peer_ip = resolve_peer_addr(config, peer)
+    if not peer_ip:
+        record("heartbeat", f"{peer} peer", "FAIL",
+               f"設定檔沒有 {peer} 的位址（peers.{peer}）")
+        return
+    try:
+        with socket.create_connection((peer_ip, port), timeout=timeout) as sock:
+            sock.settimeout(timeout)
+            reply = sock.recv(128).decode("utf-8", errors="replace").strip()
+        record("heartbeat", f"{peer} peer", "PASS", f"{peer_ip}:{port} → {reply!r}")
+    except OSError as exc:
+        record(
+            "heartbeat", f"{peer} peer", "WARN",
+            f"{peer_ip}:{port} 暫時無回應：{exc}；接管仍依 takeover_after 判定",
+        )
+
+
+def load_expected_tmux() -> dict[str, set[str]]:
+    """從 scheduler/reboot_script/roles.conf 推導「角色 → 預期的 tmux session」。
+
+    取 kind=session 且相位含 run 的專案。@inherit <role> from <parent> 會展開。
+    讀不到或解不開時 record FAIL 並退回保底值 —— 這支程式是 deploy_offline.sh 眼中
+    首次部署唯一的驗證關卡,絕不能因為讀一個設定檔就拋例外、讓部署最後一步變成
+    「執行異常」。
+    """
+    try:
+        text = ROLES_CONF.read_text(encoding="utf-8")
+    except OSError as exc:
+        record("tmux", "角色宣告表", "FAIL",
+               f"{ROLES_CONF}: {exc}；改用內建保底清單比對")
+        return dict(FALLBACK_EXPECTED_TMUX)
+
+    expected: dict[str, set[str]] = {}
+    inherits: list[tuple[str, str]] = []
+    for line in text.splitlines():
+        line = line.strip()
+        if not line or line.startswith("#"):
+            continue
+        parts = line.split()
+        if parts[0] == "@inherit":
+            if len(parts) >= 4 and parts[2] == "from":
+                inherits.append((parts[1], parts[3]))
+            continue
+        if len(parts) < 4:
+            continue
+        role_name, project, kind, phases = parts[0], parts[1], parts[2], parts[3]
+        expected.setdefault(role_name, set())
+        if kind == "session" and "run" in phases.split(","):
+            expected[role_name].add(project)
+    for child, parent in inherits:
+        if parent in expected:
+            expected[child] = set(expected[parent]) | expected.get(child, set())
+
+    missing = [r for r in FALLBACK_EXPECTED_TMUX if r not in expected]
+    if missing:
+        record("tmux", "角色宣告表", "FAIL",
+               f"{ROLES_CONF} 缺少角色 {', '.join(sorted(missing))}；改用內建保底清單比對")
+        return dict(FALLBACK_EXPECTED_TMUX)
+    record("tmux", "角色宣告表", "PASS",
+           f"由 {ROLES_CONF.name} 推導 {len(expected)} 個角色的預期 session")
+    return expected
 
 
 def check_tmux(role: str) -> None:
     heading("tmux 工作負載")
+    expected_tmux = load_expected_tmux()
     proc = run(["tmux", "list-sessions", "-F", "#{session_name}"])
     if proc.returncode != 0:
         record(
@@ -606,7 +695,7 @@ def check_tmux(role: str) -> None:
         )
         return
     actual = {line.strip() for line in proc.stdout.splitlines() if line.strip()}
-    expected = EXPECTED_TMUX.get(role, set())
+    expected = expected_tmux.get(role, set())
     for name in sorted(expected):
         if name == "wave" and name not in actual:
             record("tmux", name, "SKIP", "wave 可選功能尚未啟動")

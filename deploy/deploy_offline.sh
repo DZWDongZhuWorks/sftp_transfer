@@ -110,7 +110,14 @@ info "船舶資訊檔    : $VESSEL_INFO"
 # --- 船舶基本資訊檔（vessel_basic_info.json）檢查 / 互動建立 ----------------
 # 剛啟動就先確認它存在且內容正確（需含非空的 vsl_name / ipc）；
 # 缺少或內容不正確時，以互動問答讓使用者輸入並建立該檔。
-vessel_info_show() {  # 印出現有內容；有效回傳 0、檔案不存在回傳 3、內容不正確回傳 2
+# 印出現有內容；有效回傳 0、檔案不存在回傳 3、內容不正確回傳 2、
+# 「欄位有效但處於接管中」回傳 4。
+#
+# 為什麼需要區分 4:身分檔現在同時承載接管旗標(failover / failover_since)。若只檢查
+# vsl_name/ipc 非空，一台帶著 failover=true 的機器重新部署會被判定「有效，沿用現有內容」
+# ——**靜默保留接管狀態**。而重新部署幾乎總是意味著機器被重裝、搬移或換角色，那個旗標
+# 幾乎確定是殘留;殘留下去會讓本機一直以 emer 角色啟動、與對方形成雙主。
+vessel_info_show() {
   "$PYTHON_BIN" - "$VESSEL_INFO" <<'PY'
 import json, sys
 path = sys.argv[1]
@@ -131,7 +138,27 @@ missing = [k for k in ("vsl_name", "ipc") if not str(info.get(k, "")).strip()]
 if missing:
     print("缺少或為空的必要欄位：" + ", ".join(missing))
     sys.exit(2)
+# 真假白名單與 scheduler/failover/role.py 的 is_failover_on() 一致。
+if str(info.get("failover", "")).strip().lower() in {"true", "1", "yes"}:
+    sys.exit(4)
 sys.exit(0)
+PY
+}
+
+# 清除身分檔的接管旗標（只移除那兩個欄位，不動 ipc / vsl_name）。
+clear_failover_flag() {
+  "$PYTHON_BIN" - "$VESSEL_INFO" <<'PY'
+import json, os, sys
+path = sys.argv[1]
+with open(path, encoding="utf-8") as f:
+    info = json.load(f)
+for key in ("failover", "failover_since", "failover_since_iso"):
+    info.pop(key, None)
+tmp = path + ".tmp"
+with open(tmp, "w", encoding="utf-8") as f:
+    json.dump(info, f, ensure_ascii=False, indent=2)
+    f.write("\n")
+os.replace(tmp, path)   # 原子替換，避免任何讀者看到半寫檔
 PY
 }
 
@@ -168,6 +195,14 @@ create_vessel_info() {
     err "請手動建立 $VESSEL_INFO ，內容範例：{\"vsl_name\": \"WH289\", \"ipc\": \"IPC-1\"}"
     exit 1
   fi
+  # 本函式是整檔覆寫（只寫 vsl_name / ipc），所以會連帶清掉接管旗標。這在「內容不正確
+  # 要重建」的路徑上正是想要的效果，但必須明說 —— 否則使用者不會知道自己剛剛結束了接管。
+  # 註：A4 的「只碰兩個欄位、絕不新建」規則約束的是 heartbeat.py 與 failover_ctl.sh
+  # 這兩個自動寫入者；deploy 是身分檔的產生者，整檔覆寫是刻意的例外。
+  if [ -f "$VESSEL_INFO" ] && grep -q '"failover"' "$VESSEL_INFO" 2>/dev/null; then
+    warn "注意：重建身分檔會一併清除接管旗標（failover / failover_since）。"
+    warn "若本機正在替對方接管，重建後角色會回到正常值。"
+  fi
   local vsl ipc ans
   while true; do
     echo ""
@@ -203,12 +238,64 @@ set -e
 [ -n "$VESSEL_OUT" ] && printf '%s\n' "$VESSEL_OUT" | sed 's/^/       /'
 if [ "$VESSEL_RC" -eq 0 ]; then
   ok "船舶基本資訊檔有效，沿用現有內容。"
+elif [ "$VESSEL_RC" -eq 4 ]; then
+  # 欄位有效，但帶著接管旗標。重新部署幾乎總是意味著機器被重裝、搬移或換角色，
+  # 所以預設清除;真的正在接管中(對方確實故障)才選 n。
+  echo ""
+  warn "══════════════════ 本機處於接管狀態 ══════════════════"
+  warn "身分檔帶有 failover 旗標，本機會以 emer 角色啟動（等同對方的完整服務清單）。"
+  warn "若對方其實活著，兩台會同時執行同一批服務（雙主）。"
+  warn "重新部署通常代表機器被重裝／搬移／換角色，此時該旗標幾乎確定是殘留。"
+  warn "═══════════════════════════════════════════════════"
+  clear_ans=""
+  if [ -t 0 ]; then
+    read -r -p "  現在清除接管旗標？（對方確實故障、需維持接管才選 n）[Y/n] " clear_ans \
+      || clear_ans=""
+  else
+    warn "非互動終端機：不擅自更動身分檔，保留現狀。"
+    warn "如需清除請執行：bash ${SHARE_DIR}/scheduler/failover/failover_ctl.sh clear"
+    clear_ans="n"
+  fi
+  case "$clear_ans" in
+    ""|Y|y)
+      if clear_failover_flag; then
+        ok "已清除接管旗標（vsl_name / ipc 未變更）。"
+        info "角色要生效仍需執行：bash ${SHARE_DIR}/scheduler/reboot_launcher.sh --reconcile"
+      else
+        warn "清除失敗，保留現狀。請改用 failover_ctl.sh clear 處理。"
+      fi
+      ;;
+    *) warn "保留接管旗標。本機將繼續以 emer 角色啟動。" ;;
+  esac
 elif [ "$VESSEL_RC" -eq 3 ]; then
   warn "找不到船舶基本資訊檔，將以互動問答建立。"
   create_vessel_info
 else
   warn "船舶基本資訊檔內容不正確，將重新建立。"
   create_vessel_info
+fi
+
+# --- 舊格式的接管狀態檔（已廢除）------------------------------------------
+# 若 .env/ 是從舊機複製過來的，這個檔會讓新機被 heartbeat 遷移成「接管中」——
+# 首次部署的機器不該繼承別台的接管狀態。
+# 【移除條件】全隊確認升級完成後，連同 scheduler/failover/role.py 的遷移碼一起刪掉。
+LEGACY_FAILOVER="${SHARE_DIR}/.env/failover_state.json"
+if [ -f "$LEGACY_FAILOVER" ]; then
+  echo ""
+  warn "偵測到舊格式的接管狀態檔：$LEGACY_FAILOVER"
+  warn "它已廢除。若保留，heartbeat 啟動時會把它遷移成本機的接管狀態 ——"
+  warn "對一台剛部署的機器而言那幾乎確定是錯的（不該繼承別台的接管狀態）。"
+  legacy_ans=""
+  if [ -t 0 ]; then
+    read -r -p "  現在刪除它？[Y/n] " legacy_ans || legacy_ans=""
+  else
+    warn "非互動終端機：不擅自刪除，保留現狀。"
+    legacy_ans="n"
+  fi
+  case "$legacy_ans" in
+    ""|Y|y) rm -f "$LEGACY_FAILOVER" && ok "已刪除 $LEGACY_FAILOVER" ;;
+    *) warn "保留舊格式接管狀態檔。heartbeat 啟動時會把它遷移進身分檔。" ;;
+  esac
 fi
 
 # --- 開機自動執行設定（scheduler/install_autostart.sh） --------------------
@@ -236,7 +323,7 @@ elif [ ! -t 0 ]; then
   AUTOSTART_STATUS="略過（非互動終端機）"
 else
   autostart_ans=""
-  read -r -p "  是否設定開機自動啟動 scheduler（reboot_tmux.sh）？[Y/n] " autostart_ans || autostart_ans=""
+  read -r -p "  是否設定開機自動啟動 scheduler（reboot_launcher.sh）？[Y/n] " autostart_ans || autostart_ans=""
   case "$autostart_ans" in
     ""|Y|y)
       # 捕捉離開碼判讀結果；install_autostart.sh 於非互動/無權限時不會中斷，
@@ -563,6 +650,15 @@ fi
 
 echo ""
 echo "── 部署總結 ──"
+# 首次部署最容易搞錯的就是「這台裝成 IPC-1 還是 IPC-2」,而它決定了會啟動哪些服務。
+# 直接印出啟動器實際會採用的有效角色,一眼可見。
+EFFECTIVE_ROLE_SH="${SHARE_DIR}/scheduler/failover/effective_role.sh"
+if [ -f "$EFFECTIVE_ROLE_SH" ]; then
+  DEPLOY_ROLE="$(bash "$EFFECTIVE_ROLE_SH" --quiet 2>/dev/null || echo "（判定失敗）")"
+else
+  DEPLOY_ROLE="（找不到 effective_role.sh）"
+fi
+printf "  本機有效角色    ：%s\n" "$DEPLOY_ROLE"
 printf "  開機自動執行設定：%s\n" "$AUTOSTART_STATUS"
 printf "  週期排程 timer   ：%s\n" "$SCHED_STATUS"
 printf "  心跳/接管服務    ：%s\n" "$HEARTBEAT_STATUS"

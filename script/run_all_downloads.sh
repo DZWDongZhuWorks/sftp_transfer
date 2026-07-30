@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # 手動執行：遍歷 config/ 內所有「下載」設定檔（*_download_settings.json）並依序執行 SFTP 下載。
 #
-# 供使用者手動一次跑完全部下載用；自動排程（timer / reboot_tmux）不使用本腳本，
+# 供使用者手動一次跑完全部下載用；自動排程（timer / reboot_launcher）不使用本腳本，
 # 而是各自呼叫對應的單一 run_*.sh。實際遍歷與結果彙總由 run_all_downloads.py 負責。
 #
 # 用法：

@@ -14,10 +14,14 @@
 #      1) 船舶身分檔 share/.env/vessel_basic_info.json(vsl_name / ipc)
 #         —— 順便偵測殘留的接管旗標與舊格式 failover_state.json
 #      2) install_autostart.sh   → nssms-boot.service + linger
-#      3) install_timers.sh      → 7 支週期排程 timer
-#      4) sudoers 白名單         → reboot / teamviewer 需要(這一步要輸入一次密碼)
-#      5) install_heartbeat.sh   → nssms-heartbeat.service(雙向心跳/接管)
-#      6) 詢問「之後要不要立即執行完整啟動流程」——**只問，執行在階段 C**
+#      3) 舊 clink_* 遷移        → 停用/移除三支 system unit + 加入 gpio 群組(需密碼)
+#         **必須排在 6) 之前**:舊 clink_alarm_controller / clink_board_server 還活著時,
+#         新的 nssms-alarm-controller / nssms-board-server 會撞 port 起不來。
+#      4) install_timers.sh      → 7 支週期排程 timer
+#      5) sudoers 白名單         → reboot / teamviewer 需要(這一步要輸入一次密碼)
+#      6) install_services.sh    → 4 支常駐服務:heartbeat(雙向心跳/接管)、
+#                                  alarm-controller / board-server / button(綁實體 IPC-1)
+#      7) 詢問「之後要不要立即執行完整啟動流程」——**只問，執行在階段 C**
 #      這一段結束後會印「以下不再需要任何輸入」,操作者可以離開終端機。
 #
 #   B. sftp_transfer 專屬 venv(離線、無人干預)
@@ -433,6 +437,96 @@ else
   esac
 fi
 
+# --- 一次性遷移：舊的 clink_* 系統服務 → nssms 常駐服務 --------------------
+# alarm / board / button 原本是 /etc/systemd/system/ 下的三支 system unit（clink_*），
+# 現已收編為 scheduler/services/ 的 user unit。這一步把舊的停掉並移除。
+#
+# **必須排在 install_services.sh 之前**：舊 unit 還活著時，新的 alarm/board 會撞 port
+# （`OSError: [Errno 98] Address already in use`）。
+#
+# 順帶把使用者加進 gpio 群組：nssms-button 跑的 btn 是用 libgpiod 開 /dev/gpiochip*，
+# 那些節點是 root:gpio 660，所以「gpio 群組成員」就足夠 —— 不需要保留一支 root unit、
+# 不需要 sudoers 白名單。注意群組變更只對**新** session 生效，所以 button 可能要到
+# 重登入 / 重開機才會起來（那是預期行為，不是失敗）。
+#
+# 冪等：舊 unit 不存在、使用者已在群組時，整段安靜跳過。
+LEGACY_UNITS=(clink_alarm_controller clink_board_server clink_button)
+MIGRATE_STATUS="未執行"
+
+legacy_present() {  # 回傳 0 = 至少還有一支舊 unit 存在
+  local u
+  for u in "${LEGACY_UNITS[@]}"; do
+    [ -f "/etc/systemd/system/${u}.service" ] && return 0
+  done
+  return 1
+}
+gpio_needed() {  # 回傳 0 = 需要加入 gpio 群組
+  getent group gpio >/dev/null 2>&1 || return 1   # 沒有 gpio 群組就不用加
+  id -nG "$(id -un)" | tr ' ' '\n' | grep -qx gpio && return 1
+  return 0
+}
+
+echo ""
+info "檢查舊 clink_* 系統服務的遷移狀態 ..."
+if ! legacy_present && ! gpio_needed; then
+  ok "無需遷移（舊 clink_* 不存在，且已在 gpio 群組）。"
+  MIGRATE_STATUS="無需遷移"
+elif [ "$CHECK_ONLY" -eq 1 ]; then
+  legacy_present && warn "仍存在舊 clink_* 系統服務（需遷移）：$(
+    for u in "${LEGACY_UNITS[@]}"; do
+      [ -f "/etc/systemd/system/${u}.service" ] && printf '%s ' "$u"
+    done)"
+  gpio_needed && warn "使用者 $(id -un) 尚未加入 gpio 群組（nssms-button 需要）。"
+  MIGRATE_STATUS="待遷移$DRYRUN_NOTE"
+elif [ ! -t 0 ]; then
+  warn "非互動終端機，略過 clink_* 遷移（需 sudo）。"
+  warn "如需遷移，請手動執行："
+  warn "  sudo systemctl disable --now ${LEGACY_UNITS[*]}"
+  warn "  sudo rm -f /etc/systemd/system/clink_{alarm_controller,board_server,button}.service"
+  warn "  sudo usermod -aG gpio $(id -un)   # 之後需重登入或重開機"
+  MIGRATE_STATUS="略過（非互動終端機）"
+else
+  legacy_present && warn "偵測到舊的 clink_* 系統服務，它們與新的 nssms 常駐服務會撞 port。"
+  gpio_needed && info "另外需把 $(id -un) 加進 gpio 群組（nssms-button 讀 GPIO 用）。"
+  migrate_ans=""
+  read -r -p "  現在執行遷移（停用並移除舊 clink_*、加入 gpio 群組）？（需輸入一次密碼）[Y/n] " migrate_ans || migrate_ans=""
+  case "$migrate_ans" in
+    ""|Y|y)
+      MIGRATE_RC=0
+      if legacy_present; then
+        set +e
+        sudo systemctl disable --now "${LEGACY_UNITS[@]}" 2>/dev/null
+        for u in "${LEGACY_UNITS[@]}"; do
+          sudo rm -f "/etc/systemd/system/${u}.service" || MIGRATE_RC=1
+        done
+        sudo systemctl daemon-reload
+        set -e
+        [ "$MIGRATE_RC" -eq 0 ] && ok "已停用並移除舊 clink_* 系統服務。" \
+                                || warn "舊 clink_* 移除時有項目失敗，請檢視上方訊息。"
+      fi
+      if gpio_needed; then
+        set +e
+        sudo usermod -aG gpio "$(id -un)"
+        GPIO_RC=$?
+        set -e
+        if [ "$GPIO_RC" -eq 0 ]; then
+          ok "已把 $(id -un) 加進 gpio 群組。"
+          warn "群組變更只對新 session 生效 —— nssms-button 要到重登入/重開機才會起來。"
+        else
+          warn "加入 gpio 群組失敗（exit=$GPIO_RC），nssms-button 將無法讀取 GPIO。"
+          MIGRATE_RC=1
+        fi
+      fi
+      [ "$MIGRATE_RC" -eq 0 ] && MIGRATE_STATUS="已遷移" \
+                              || MIGRATE_STATUS="部分完成"
+      ;;
+    *)
+      warn "略過遷移。**新的 alarm / board 常駐服務會因 port 被舊 clink_* 佔用而起不來。**"
+      MIGRATE_STATUS="使用者略過（新服務會撞 port）"
+      ;;
+  esac
+fi
+
 # --- 週期排程設定（scheduler/install_timers.sh + sudoers 白名單） ----------
 # 與開機自動執行同屬「需使用者留意的一次性設定」：
 #   1) install_timers.sh 佈署/啟用 systemd user timer（純 user 層，免 root）。
@@ -440,12 +534,12 @@ fi
 #      放行；安裝白名單需一次性輸入密碼（sudo）——趁部署互動時一併完成。
 # 兩步皆冪等；非互動終端機時不擅自更動，僅印出手動指令。
 TIMERS_INSTALLER="${SHARE_DIR}/scheduler/install_timers.sh"
-HEARTBEAT_INSTALLER="${SHARE_DIR}/scheduler/failover/install_heartbeat.sh"
+SERVICES_INSTALLER="${SHARE_DIR}/scheduler/install_services.sh"
 SUDOERS_SRC="${SHARE_DIR}/scheduler/etc/nssms-scheduler.sudoers"
 SUDOERS_DST="/etc/sudoers.d/nssms-scheduler"
 SCHED_STATUS="未執行"
 SUDOERS_STATUS="未執行"
-HEARTBEAT_STATUS="未執行"
+SERVICES_STATUS="未執行"
 echo ""
 info "檢查週期排程設定 ..."
 if [ ! -f "$TIMERS_INSTALLER" ]; then
@@ -458,13 +552,13 @@ elif [ "$CHECK_ONLY" -eq 1 ]; then
   set -e
   SCHED_STATUS="僅回報現況$DRYRUN_NOTE"
   [ -f "$SUDOERS_DST" ] && SUDOERS_STATUS="已存在" || SUDOERS_STATUS="未安裝$DRYRUN_NOTE"
-  if [ -f "$HEARTBEAT_INSTALLER" ]; then
+  if [ -f "$SERVICES_INSTALLER" ]; then
     set +e
-    bash "$HEARTBEAT_INSTALLER" --check-only
+    bash "$SERVICES_INSTALLER" --check-only
     set -e
-    HEARTBEAT_STATUS="僅回報現況$DRYRUN_NOTE"
+    SERVICES_STATUS="僅回報現況$DRYRUN_NOTE"
   else
-    HEARTBEAT_STATUS="略過（找不到安裝腳本）"
+    SERVICES_STATUS="略過（找不到安裝腳本）"
   fi
 elif [ ! -t 0 ]; then
   warn "非互動終端機，略過週期排程設定。"
@@ -529,22 +623,29 @@ else
         esac
       fi
 
-      # (3) ipc1↔ipc2 心跳/接管服務（user 層,免 root;角色自動分派,兩台都裝）
+      # (3) 常駐服務（user 層,免 root）：
+      #     nssms-heartbeat（兩台都裝,角色自動分派）
+      #     nssms-alarm-controller / nssms-board-server / nssms-button
+      #       （硬體實體綁 IPC-1,unit 內有 ExecCondition 自行判定,兩台裝同一份即可）
+      #
+      #     **必須排在下面 (4) 的舊 clink_* 停用之後嗎？不是 —— 反過來。**
+      #     (4) 已經在本區塊之前執行完（見上方一次性遷移段），因為舊的 system unit 還活著
+      #     時新 unit 會撞 port。這裡只負責裝。
       echo ""
-      if [ ! -f "$HEARTBEAT_INSTALLER" ]; then
-        warn "找不到 $HEARTBEAT_INSTALLER ，略過心跳/接管服務安裝。"
-        HEARTBEAT_STATUS="略過（找不到安裝腳本）"
+      if [ ! -f "$SERVICES_INSTALLER" ]; then
+        warn "找不到 $SERVICES_INSTALLER ，略過常駐服務安裝。"
+        SERVICES_STATUS="略過（找不到安裝腳本）"
       else
         set +e
-        bash "$HEARTBEAT_INSTALLER"
-        HB_RC=$?
+        bash "$SERVICES_INSTALLER"
+        SV_RC=$?
         set -e
-        if [ "$HB_RC" -eq 0 ]; then
-          ok "心跳/接管服務(nssms-heartbeat)已佈署並啟用。"
-          HEARTBEAT_STATUS="已啟用"
+        if [ "$SV_RC" -eq 0 ]; then
+          ok "常駐服務已佈署並啟用（heartbeat / alarm / board / button）。"
+          SERVICES_STATUS="已啟用"
         else
-          warn "心跳/接管服務安裝有問題（exit=$HB_RC），請檢視上方訊息。"
-          HEARTBEAT_STATUS="部分完成（exit=$HB_RC）"
+          warn "常駐服務安裝有項目失敗（exit=$SV_RC），請檢視上方訊息。"
+          SERVICES_STATUS="部分完成（exit=$SV_RC）"
         fi
       fi
       ;;
@@ -832,7 +933,8 @@ DEPLOY_VSL_UPPER="$(printf '%s' "$(vessel_get vsl_name)" | tr '[:lower:]' '[:upp
 printf "  本機有效角色    ：%s\n" "$DEPLOY_ROLE"
 printf "  開機自動執行設定：%s\n" "$AUTOSTART_STATUS"
 printf "  週期排程 timer   ：%s\n" "$SCHED_STATUS"
-printf "  心跳/接管服務    ：%s\n" "$HEARTBEAT_STATUS"
+printf "  常駐服務        ：%s\n" "$SERVICES_STATUS"
+printf "  clink_* 遷移    ：%s\n" "$MIGRATE_STATUS"
 printf "  sudo 白名單      ：%s\n" "$SUDOERS_STATUS"
 [ "$RUN_HEALTH" -eq 1 ] && printf "  健康檢查：%s\n" \
   "$( [ "$HEALTH_RC" -eq 0 ] && echo HEALTHY || echo "有問題（exit=$HEALTH_RC）" )"

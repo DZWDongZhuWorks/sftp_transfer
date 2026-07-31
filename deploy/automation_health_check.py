@@ -36,6 +36,11 @@ PROJECT_DIR = SCRIPT_DIR.parent
 SHARE_DIR = PROJECT_DIR.parent
 SCHEDULER_DIR = SHARE_DIR / "scheduler"
 TIMERS_DIR = SCHEDULER_DIR / "timers"
+# 常駐服務的母體目錄。nssms-heartbeat.service 原本在 failover/,隨「timer / service 架構
+# 拆分」搬到這裡,與 alarm-controller / board-server / button 同列(由 install_services.sh
+# 安裝)。這一份清單必須跟著 services/ 走 —— 忘了改的話,unit-sync 會回報「找不到 repo
+# 母體」而讓整份巡檢變 UNHEALTHY(實際發生過)。
+SERVICES_DIR = SCHEDULER_DIR / "services"
 FAILOVER_DIR = SCHEDULER_DIR / "failover"
 # 身分檔。身分與接管狀態都在這一個檔裡(ipc + failover + failover_since)。
 # 可用環境變數覆蓋（測試專用），與 sftp_transfer/settings.py 同一慣例。
@@ -393,15 +398,24 @@ def check_core_services() -> None:
 
 
 def unit_source_path(unit: str) -> Path | None:
-    if unit == "nssms-heartbeat.service":
-        return FAILOVER_DIR / unit
-    candidate = TIMERS_DIR / unit
-    return candidate if candidate.exists() else None
+    """unit 檔名 → repo 母體路徑。
+
+    刻意不再對 nssms-heartbeat.service 做特例:改成依序在 services/ 與 timers/ 找。
+    這樣日後 services/ 新增常駐服務時,本檔不必跟著改一個硬編碼的名字。
+    """
+    for directory in (SERVICES_DIR, TIMERS_DIR):
+        candidate = directory / unit
+        if candidate.exists():
+            return candidate
+    return None
 
 
 def check_unit_sources() -> None:
     heading("unit 母體與實際安裝版本")
-    units = ["nssms-heartbeat.service"]
+    # 常駐服務由 services/ 目錄列舉,不硬編碼名字 —— 新增一支就自動納入比對。
+    units = sorted(p.name for p in SERVICES_DIR.glob("*.service")) if SERVICES_DIR.is_dir() else []
+    if not units:
+        record("unit-sync", "services/", "FAIL", f"找不到常駐服務母體目錄：{SERVICES_DIR}")
     for stem in TIMERS:
         units.extend((f"{stem}.timer", f"{stem}.service"))
 

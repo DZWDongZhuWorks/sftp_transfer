@@ -4,7 +4,7 @@
 
 預設同時列出 ``*_download_settings.json`` 與
 ``*_upload_settings.json``；真正傳輸時仍沿用 main.py 的 CLI 流程。
-下載的 CLINK 開發機守門規則與 run_all_downloads.py 相同。
+方向採雙向守門：CLINK 發佈端只可上傳，其餘部署端只可下載。
 """
 from __future__ import annotations
 
@@ -66,13 +66,24 @@ def visible_items(items: list[TransferItem], mode_filter: str) -> list[TransferI
     return [item for item in items if item.mode == mode_filter]
 
 
-def is_selectable(item: TransferItem, downloads_disabled: bool) -> bool:
-    return not (downloads_disabled and item.mode == "download")
+def locked_mode_for_role(dev_machine: bool) -> str:
+    """CLINK 鎖下載；其餘（含無法辨識角色）鎖上傳，失效方向安全。"""
+    return "download" if dev_machine else "upload"
 
 
-def toggle_item(state: SelectionState, item: TransferItem, downloads_disabled: bool) -> None:
-    if not is_selectable(item, downloads_disabled):
-        state.message = "CLINK 開發機禁止下載，這個項目不能勾選。"
+def policy_message(locked_mode: str) -> str:
+    if locked_mode == "download":
+        return "CLINK 發佈端禁止下載，只允許上傳。"
+    return "部署端禁止上傳，只允許下載，避免舊程式回灌 OTA。"
+
+
+def is_selectable(item: TransferItem, locked_mode: str) -> bool:
+    return item.mode != locked_mode
+
+
+def toggle_item(state: SelectionState, item: TransferItem, locked_mode: str) -> None:
+    if not is_selectable(item, locked_mode):
+        state.message = policy_message(locked_mode)
         return
     if item.path in state.selected:
         state.selected.remove(item.path)
@@ -84,9 +95,9 @@ def toggle_item(state: SelectionState, item: TransferItem, downloads_disabled: b
 def toggle_all_visible(
     state: SelectionState,
     items: list[TransferItem],
-    downloads_disabled: bool,
+    locked_mode: str,
 ) -> None:
-    paths = {item.path for item in items if is_selectable(item, downloads_disabled)}
+    paths = {item.path for item in items if is_selectable(item, locked_mode)}
     if paths and paths <= state.selected:
         state.selected.difference_update(paths)
     else:
@@ -169,7 +180,7 @@ def _draw(
     state: SelectionState,
     all_items: list[TransferItem],
     rows: list[TransferItem],
-    downloads_disabled: bool,
+    locked_mode: str,
 ) -> None:
     stdscr.erase()
     maxy, maxx = stdscr.getmaxyx()
@@ -186,14 +197,11 @@ def _draw(
         f"已選 下載 {selected_downloads}、上傳 {selected_uploads}｜顯示 {filter_label}"
     )
     _addstr(stdscr, 0, 0, fit_display(head, width), curses.A_BOLD)
-    if downloads_disabled:
-        warning = " CLINK 開發機：下載項目已鎖定，只允許上傳。"
-        warning_attr = curses.A_BOLD
-        if curses.has_colors():
-            warning_attr |= curses.color_pair(3)
-        _addstr(stdscr, 1, 0, fit_display(warning, width), warning_attr)
-    else:
-        _addstr(stdscr, 1, 0, fit_display(" 空白鍵勾選；初始不預選，避免誤傳。", width), curses.A_DIM)
+    warning = " " + policy_message(locked_mode)
+    warning_attr = curses.A_BOLD
+    if curses.has_colors():
+        warning_attr |= curses.color_pair(3)
+    _addstr(stdscr, 1, 0, fit_display(warning, width), warning_attr)
 
     body_top = 3
     body_height = maxy - body_top - 2
@@ -209,7 +217,7 @@ def _draw(
         if row_index >= len(rows):
             break
         item = rows[row_index]
-        locked = not is_selectable(item, downloads_disabled)
+        locked = not is_selectable(item, locked_mode)
         checked = item.path in state.selected
         mark = "[-]" if locked else ("[x]" if checked else "[ ]")
         mode = f"[{MODE_LABEL[item.mode]}]"
@@ -259,7 +267,7 @@ def _confirm(stdscr, selected: list[TransferItem]) -> bool:
             return False
 
 
-def _main_loop(stdscr, config_dir: Path, scan_mode: str, downloads_disabled: bool):
+def _main_loop(stdscr, config_dir: Path, scan_mode: str, locked_mode: str):
     curses.curs_set(0)
     if curses.has_colors():
         curses.start_color()
@@ -276,7 +284,7 @@ def _main_loop(stdscr, config_dir: Path, scan_mode: str, downloads_disabled: boo
     while True:
         rows = visible_items(items, state.mode_filter)
         clamp_state(state, rows)
-        _draw(stdscr, state, items, rows, downloads_disabled)
+        _draw(stdscr, state, items, rows, locked_mode)
         action = key_action(stdscr.getch())
         page = max(1, stdscr.getmaxyx()[0] - 5)
         if action == "quit":
@@ -294,9 +302,9 @@ def _main_loop(stdscr, config_dir: Path, scan_mode: str, downloads_disabled: boo
         elif action == "end":
             state.index = max(0, len(rows) - 1)
         elif action == "toggle" and rows:
-            toggle_item(state, rows[state.index], downloads_disabled)
+            toggle_item(state, rows[state.index], locked_mode)
         elif action == "all":
-            toggle_all_visible(state, rows, downloads_disabled)
+            toggle_all_visible(state, rows, locked_mode)
         elif action == "clear":
             state.selected.clear()
             state.message = "已清除全部勾選。"
@@ -319,7 +327,14 @@ def _main_loop(stdscr, config_dir: Path, scan_mode: str, downloads_disabled: boo
         clamp_state(state, rows)
 
 
-def execute_selected(items: list[TransferItem]) -> int:
+def execute_selected(items: list[TransferItem], locked_mode: str) -> int:
+    forbidden = [item for item in items if not is_selectable(item, locked_mode)]
+    if forbidden:
+        print(f"錯誤：{policy_message(locked_mode)}", file=sys.stderr)
+        for item in forbidden:
+            print(f"  [已阻擋] [{MODE_LABEL[item.mode]}] {item.path.name}", file=sys.stderr)
+        return 3
+
     results: list[tuple[TransferItem, int]] = []
     total = len(items)
     for index, item in enumerate(items, 1):
@@ -374,9 +389,12 @@ def main(argv: list[str] | None = None) -> int:
     if not items:
         print(f"錯誤：{config_dir} 內找不到符合方向的 *_settings.json", file=sys.stderr)
         return 1
+    locked_mode = locked_mode_for_role(is_dev_machine())
     if args.list:
+        print(f"規則：{policy_message(locked_mode)}")
         for item in items:
-            print(f"{item.mode:<8} {item.project:<30} {item.path.name}")
+            status = "locked" if item.mode == locked_mode else "enabled"
+            print(f"{item.mode:<8} {status:<7} {item.project:<30} {item.path.name}")
         return 0
     if not MAIN_SCRIPT.is_file():
         print(f"錯誤：找不到傳輸入口 {MAIN_SCRIPT}", file=sys.stderr)
@@ -385,15 +403,14 @@ def main(argv: list[str] | None = None) -> int:
         print("錯誤：互動選單需要 TTY；可先用 --list 檢查掃描結果。", file=sys.stderr)
         return 2
 
-    downloads_disabled = is_dev_machine()
     try:
-        selected = curses.wrapper(_main_loop, config_dir, args.mode, downloads_disabled)
+        selected = curses.wrapper(_main_loop, config_dir, args.mode, locked_mode)
     except KeyboardInterrupt:
         selected = None
     if selected is None:
         print("已取消，沒有執行任何傳輸。")
         return 0
-    return execute_selected(selected)
+    return execute_selected(selected, locked_mode)
 
 
 if __name__ == "__main__":

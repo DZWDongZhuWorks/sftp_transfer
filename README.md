@@ -191,7 +191,8 @@ GUI：啟動後於右上角「模式」切換到「上傳」，來源/目的地�
 - `script/run_selected_transfers.sh`：同時掃描下載／上傳設定，初始不預選；以 `Space` 勾選、`Enter` 確認執行。
 - `script/run_selected_transfers.sh --mode download` 或 `--mode upload`：只顯示單一方向。
 - `m` 切換顯示方向、`a` 全選目前畫面、`x` 清除、`r` 重掃 config、`q` 不執行直接離開。
-- 在 CLINK 開發機上，下載項目會維持鎖定，避免覆蓋尚未發佈的開發修改；上傳仍可選擇。
+- 在 CLINK 發佈端，下載項目會維持鎖定，只允許上傳，避免覆蓋尚未發佈的開發修改。
+- 在其餘部署端（包含船舶資訊缺失或無法辨識角色時），上傳項目會維持鎖定，只允許下載，避免舊程式反向回灌 OTA。
 
 > **命名慣例**：`config/` 內的設定檔請以 `*_download_settings.json`（下載）或 `*_upload_settings.json`（上傳）結尾，兩支 `run_all_*` 腳本各自只會挑選對應方向的設定檔，彼此不會誤觸。
 

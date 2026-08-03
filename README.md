@@ -14,6 +14,7 @@
 - `example_settings.json`：下載設定檔範本，複製改名為 `settings.json` 後填入實際值即可使用。
 - `example_upload_settings.json`：上傳設定檔範本（`mode` 為 `upload`）。
 - `run_all_downloads.py` / `run_all_uploads.py`：分別遍歷 `config/` 內 `*_download_settings.json` / `*_upload_settings.json` 並依序執行。
+- `run_selected_transfers.py`（或 `script/run_selected_transfers.sh`）：以 curses 掃描上述兩類設定檔，讓操作者勾選本次真正要執行的下載／上傳專案。
 - `example_download_ignore.txt`：「忽略設定檔」範本，複製改名後依需求增刪規則即可使用。
 - `tests/`：pytest 單元測試（`downloader.py`／`uploader.py`／`gitignore.py`／`settings.py`／`main.py`），詳見下方【開發：執行單元測試】。
 
@@ -186,6 +187,12 @@ GUI：啟動後於右上角「模式」切換到「上傳」，來源/目的地�
 - `python run_all_downloads.py`（或 `script/run_all_downloads.sh`）：只挑選 `*_download_settings.json` 依序下載。
 - `script/run_sftp_upload.sh`：單一上傳設定檔的範例腳本（指向 `config/sftp_upload_settings.json`）。
 
+人工挑選本次傳輸：
+- `script/run_selected_transfers.sh`：同時掃描下載／上傳設定，初始不預選；以 `Space` 勾選、`Enter` 確認執行。
+- `script/run_selected_transfers.sh --mode download` 或 `--mode upload`：只顯示單一方向。
+- `m` 切換顯示方向、`a` 全選目前畫面、`x` 清除、`r` 重掃 config、`q` 不執行直接離開。
+- 在 CLINK 開發機上，下載項目會維持鎖定，避免覆蓋尚未發佈的開發修改；上傳仍可選擇。
+
 > **命名慣例**：`config/` 內的設定檔請以 `*_download_settings.json`（下載）或 `*_upload_settings.json`（上傳）結尾，兩支 `run_all_*` 腳本各自只會挑選對應方向的設定檔，彼此不會誤觸。
 
 ---
@@ -346,4 +353,3 @@ GUI：啟動後於右上角「模式」切換到「上傳」，來源/目的地�
    產生的報告在 `htmlcov/index.html`，用瀏覽器開啟即可依檔案、行數檢視覆蓋狀況。
 
 只想跑單一檔案或單一測試時，可以用 `python -m pytest tests/test_downloader.py`，或加上 `-k 關鍵字` 只跑名稱符合的測試（例如 `python -m pytest -k duplicate_mode`）。
-

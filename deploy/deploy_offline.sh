@@ -15,13 +15,16 @@
 #         —— 順便偵測殘留的接管旗標與舊格式 failover_state.json
 #      2) install_autostart.sh   → nssms-boot.service + linger
 #      3) 舊 clink_* 遷移        → 停用/移除三支 system unit + 加入 gpio 群組(需密碼)
-#         **必須排在 6) 之前**:舊 clink_alarm_controller / clink_board_server 還活著時,
+#         **必須排在 7) 之前**:舊 clink_alarm_controller / clink_board_server 還活著時,
 #         新的 nssms-alarm-controller / nssms-board-server 會撞 port 起不來。
-#      4) install_timers.sh      → 7 支週期排程 timer
-#      5) sudoers 白名單         → reboot / teamviewer 需要(這一步要輸入一次密碼)
-#      6) install_services.sh    → 4 支常駐服務:heartbeat(雙向心跳/接管)、
+#      4) install_docker_group.sh → 把使用者加進 docker 群組(需密碼)。web 平台
+#         (start_web_docker.sh)跑在 systemd user session 裡、無法輸入 sudo 密碼,
+#         所以「免 sudo 使用 docker」是它能開機自啟的前提。群組變更需重開機才生效。
+#      5) install_timers.sh      → 7 支週期排程 timer
+#      6) sudoers 白名單         → reboot / teamviewer 需要(這一步要輸入一次密碼)
+#      7) install_services.sh    → 4 支常駐服務:heartbeat(雙向心跳/接管)、
 #                                  alarm-controller / board-server / button(綁實體 IPC-1)
-#      7) 詢問「之後要不要立即執行完整啟動流程」——**只問，執行在階段 C**
+#      8) 詢問「之後要不要立即執行完整啟動流程」——**只問，執行在階段 C**
 #      這一段結束後會印「以下不再需要任何輸入」,操作者可以離開終端機。
 #
 #   B. sftp_transfer 專屬 venv(離線、無人干預)
@@ -527,6 +530,82 @@ else
   esac
 fi
 
+# --- docker 群組（scheduler/install_docker_group.sh） ----------------------
+# web 平台的 docker compose 現在由 reboot_script/start_web_docker.sh 在開機流程中啟動,
+# 而那支腳本跑在 systemd user session 裡 —— 沒有終端機、無法輸入 sudo 密碼。所以
+# `sudo docker compose up -d`（web/site/install.sh 的做法）在開機流程裡行不通,必須讓
+# 使用者本身就是 docker 群組成員。
+#
+# 語意與上面那段的「加入 gpio 群組」完全相同,擺在它後面是刻意的:兩者都是群組變更、
+# 都需要密碼、都要重開機才生效,操作者一次看完一組同類型的事。
+#
+# 冪等：已在群組時安裝器自己會判斷並安靜跳過（rc=0）。
+# 這一步失敗不中斷部署：web 起不來不影響 SHM / radar / 心跳等主要服務。
+DOCKER_GROUP_INSTALLER="${SHARE_DIR}/scheduler/install_docker_group.sh"
+DOCKER_GROUP_STATUS="未執行"
+echo ""
+info "檢查 docker 群組（web 平台開機自啟的前提）..."
+if [ ! -f "$DOCKER_GROUP_INSTALLER" ]; then
+  warn "找不到 $DOCKER_GROUP_INSTALLER ，略過 docker 群組設定。"
+  warn "web 平台將無法由開機流程啟動（仍可人工 sudo docker compose up -d）。"
+  DOCKER_GROUP_STATUS="略過（找不到安裝腳本）"
+elif [ "$CHECK_ONLY" -eq 1 ]; then
+  set +e
+  bash "$DOCKER_GROUP_INSTALLER" --check-only
+  DOCKER_RC=$?
+  set -e
+  case "$DOCKER_RC" in
+    0) DOCKER_GROUP_STATUS="已就緒" ;;
+    3) DOCKER_GROUP_STATUS="已加入，待重開機生效" ;;
+    4) DOCKER_GROUP_STATUS="docker 未安裝$DRYRUN_NOTE" ;;
+    *) DOCKER_GROUP_STATUS="未加入$DRYRUN_NOTE" ;;
+  esac
+elif [ ! -t 0 ]; then
+  warn "非互動終端機，略過 docker 群組設定（需 sudo）。"
+  warn "如需設定，請手動執行：bash $DOCKER_GROUP_INSTALLER"
+  DOCKER_GROUP_STATUS="略過（非互動終端機）"
+else
+  set +e
+  bash "$DOCKER_GROUP_INSTALLER" --check-only >/dev/null 2>&1
+  DOCKER_RC=$?
+  set -e
+  if [ "$DOCKER_RC" -eq 0 ]; then
+    ok "docker 群組已就緒（$(id -un) 可直接使用 docker）。"
+    DOCKER_GROUP_STATUS="已就緒"
+  elif [ "$DOCKER_RC" -eq 3 ]; then
+    ok "docker 群組已設定，等重開機後生效。"
+    DOCKER_GROUP_STATUS="已加入，待重開機生效"
+  elif [ "$DOCKER_RC" -eq 4 ]; then
+    warn "本機沒有 docker（或沒有 docker 群組），略過。web 平台無法在此機器上啟動。"
+    DOCKER_GROUP_STATUS="docker 未安裝"
+  else
+    docker_ans=""
+    read -r -p "  把 $(id -un) 加進 docker 群組（web 平台開機自啟的前提）？（需輸入一次密碼）[Y/n] " docker_ans || docker_ans=""
+    case "$docker_ans" in
+      ""|Y|y)
+        set +e
+        bash "$DOCKER_GROUP_INSTALLER"
+        DOCKER_RC=$?
+        set -e
+        case "$DOCKER_RC" in
+          0) ok "docker 群組已就緒。"
+             DOCKER_GROUP_STATUS="已就緒" ;;
+          3) ok "已加入 docker 群組；群組變更只對新 session 生效 —— 需重開機。"
+             warn "在重開機之前，start_web_docker.sh 會因權限不足而起不來 web 平台（預期行為）。"
+             DOCKER_GROUP_STATUS="已加入，待重開機生效" ;;
+          *) warn "docker 群組設定失敗（exit=$DOCKER_RC），web 平台將無法由開機流程啟動。"
+             DOCKER_GROUP_STATUS="失敗（exit=$DOCKER_RC）" ;;
+        esac
+        ;;
+      *)
+        info "略過 docker 群組設定。日後可執行：bash $DOCKER_GROUP_INSTALLER"
+        warn "未加入群組時，開機流程中的 web 平台（start_web_docker.sh）會起不來。"
+        DOCKER_GROUP_STATUS="使用者略過"
+        ;;
+    esac
+  fi
+fi
+
 # --- 週期排程設定（scheduler/install_timers.sh + sudoers 白名單） ----------
 # 與開機自動執行同屬「需使用者留意的一次性設定」：
 #   1) install_timers.sh 佈署/啟用 systemd user timer（純 user 層，免 root）。
@@ -935,6 +1014,7 @@ printf "  開機自動執行設定：%s\n" "$AUTOSTART_STATUS"
 printf "  週期排程 timer   ：%s\n" "$SCHED_STATUS"
 printf "  常駐服務        ：%s\n" "$SERVICES_STATUS"
 printf "  clink_* 遷移    ：%s\n" "$MIGRATE_STATUS"
+printf "  docker 群組      ：%s\n" "$DOCKER_GROUP_STATUS"
 printf "  sudo 白名單      ：%s\n" "$SUDOERS_STATUS"
 [ "$RUN_HEALTH" -eq 1 ] && printf "  健康檢查：%s\n" \
   "$( [ "$HEALTH_RC" -eq 0 ] && echo HEALTHY || echo "有問題（exit=$HEALTH_RC）" )"
@@ -956,6 +1036,14 @@ echo ""
 echo "  所以接下來請二選一:"
 echo "    sudo reboot                                # 建議:完整走一次真實開機流程"
 echo "    systemctl --user start nssms-boot          # 或立即手動觸發一次(不重開機)"
+case "$DOCKER_GROUP_STATUS" in
+  已加入*)
+    echo ""
+    warn "  本次剛把 $(id -un) 加進 docker 群組,而群組變更只對**新** session 生效。"
+    warn "  所以這一輪請務必選 sudo reboot ——「不重開機」那條路徑下 systemd user manager"
+    warn "  仍是舊的群組,web 平台(start_web_docker.sh)會因權限不足而起不來。"
+    ;;
+esac
 echo ""
 echo "  想先確認會做什麼(不執行任何動作):"
 echo "    bash ${SHARE_DIR}/scheduler/reboot_launcher.sh --dry-run"

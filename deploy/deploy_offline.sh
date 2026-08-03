@@ -94,7 +94,10 @@ ok()    { printf "%s[ OK ]%s %s\n"  "$G" "$N" "$*"; }
 warn()  { printf "%s[WARN]%s %s\n"  "$Y" "$N" "$*"; }
 err()   { printf "%s[FAIL]%s %s\n"  "$R" "$N" "$*" >&2; }
 
-usage() { grep '^#' "$0" | sed 's/^# \{0,1\}//'; exit 0; }
+# --help 只印檔頭那一段（第 2 行到第一個非註解行為止）。原本是 grep '^#' "$0"，
+# 會把全檔 170 多行 column-0 實作註解一起倒出來 —— 這支腳本的實作註解特別多、特別長，
+# 於是 --help 反而是最難讀的那份說明。
+usage() { awk 'NR == 1 { next } !/^#/ { exit } { sub(/^# ?/, ""); print }' "$0"; exit 0; }
 
 # --- 解析參數 --------------------------------------------------------------
 while [ $# -gt 0 ]; do
@@ -343,6 +346,23 @@ else
   warn "船舶基本資訊檔內容不正確，將重新建立。"
   create_vessel_info
 fi
+
+# --- 由身分檔推導出的兩個顯示值 --------------------------------------------
+# 刻意算在這裡（而不是總結段）:兩者都只依賴身分檔，而身分檔到上一行才定案
+#（可能剛被建立、也可能剛清掉接管旗標）。
+#
+# DEPLOY_VSL_UPPER 原本在總結段才賦值，但**啟動流程的提示比它早 200 行**就要用它判斷
+# 「本機是不是 CLINK 開發機」—— 那裡讀到的一直是空字串（寫成 ${DEPLOY_VSL_UPPER:-}
+# 所以 set -u 也不會抱怨），於是那句「開發機不會下載程式碼」的警告從來沒印出過。
+# effective_role.sh 與 vessel_get 都是唯讀的，提前呼叫不影響 --check-only 的承諾。
+EFFECTIVE_ROLE_SH="${SHARE_DIR}/scheduler/failover/effective_role.sh"
+if [ -f "$EFFECTIVE_ROLE_SH" ]; then
+  DEPLOY_ROLE="$(bash "$EFFECTIVE_ROLE_SH" --quiet 2>/dev/null || echo "（判定失敗）")"
+else
+  DEPLOY_ROLE="（找不到 effective_role.sh）"
+fi
+# 開發機(CLINK)的 OTA 守門會讓「第一次開機自動下載程式碼」這件事不成立,後面要據此提醒。
+DEPLOY_VSL_UPPER="$(printf '%s' "$(vessel_get vsl_name)" | tr '[:lower:]' '[:upper:]')"
 
 # --- 舊格式的接管狀態檔（已廢除）------------------------------------------
 # 若 .env/ 是從舊機複製過來的，這個檔會讓新機被 heartbeat 遷移成「接管中」——
@@ -1001,14 +1021,7 @@ echo ""
 echo "── 部署總結 ──"
 # 首次部署最容易搞錯的就是「這台裝成 IPC-1 還是 IPC-2」,而它決定了會啟動哪些服務。
 # 直接印出啟動器實際會採用的有效角色,一眼可見。
-EFFECTIVE_ROLE_SH="${SHARE_DIR}/scheduler/failover/effective_role.sh"
-if [ -f "$EFFECTIVE_ROLE_SH" ]; then
-  DEPLOY_ROLE="$(bash "$EFFECTIVE_ROLE_SH" --quiet 2>/dev/null || echo "（判定失敗）")"
-else
-  DEPLOY_ROLE="（找不到 effective_role.sh）"
-fi
-# 開發機(CLINK)的 OTA 守門會讓「第一次開機自動下載程式碼」這件事不成立,後面要據此提醒。
-DEPLOY_VSL_UPPER="$(printf '%s' "$(vessel_get vsl_name)" | tr '[:lower:]' '[:upper:]')"
+#（DEPLOY_ROLE / DEPLOY_VSL_UPPER 在身分檔定案後就算好了,見上方「由身分檔推導」段。）
 printf "  本機有效角色    ：%s\n" "$DEPLOY_ROLE"
 printf "  開機自動執行設定：%s\n" "$AUTOSTART_STATUS"
 printf "  週期排程 timer   ：%s\n" "$SCHED_STATUS"
@@ -1021,38 +1034,69 @@ printf "  sudo 白名單      ：%s\n" "$SUDOERS_STATUS"
 printf "  完整啟動流程    ：%s\n" "$LAUNCH_STATUS"
 printf "  自動化存活巡檢  ：%s\n" "$AUTOMATION_STATUS"
 
+print_verification() {  # 兩條收尾路徑都要印的驗證指令
+  echo "    tmux ls                                     # 應列出本角色該有的 session"
+  echo "    tail -f ${SHARE_DIR}/scheduler/logs/launcher.log       # 開機做了什麼"
+  echo "    tail -f ${SHARE_DIR}/scheduler/failover/logs/heartbeat.log"
+  echo "    ${PYTHON_BIN} ${AUTOMATION_CHECKER}"
+}
+print_docker_reboot_warning() {  # 剛加入 docker 群組時,重開機不是建議而是必要
+  case "$DOCKER_GROUP_STATUS" in
+    已加入*)
+      echo ""
+      warn "  本次剛把 $(id -un) 加進 docker 群組,而群組變更只對**新** session 生效。"
+      warn "  所以這一輪請務必重開機 —— 不重開機的話 systemd user manager 仍是舊的群組,"
+      warn "  web 平台(start_web_docker.sh)會因權限不足而起不來。"
+      ;;
+  esac
+}
+
 echo ""
-echo "── ⚠ 尚未完成:服務還沒有啟動 ──"
-# 本腳本刻意只做「一次性人工設定」:身分、systemd 骨架、sudoers、sftp_transfer 的 venv。
-# 它不做 SFTP 下載、不跑 update_booster、也不 start nssms-boot(只 enable)。
-# 各專案的程式碼、環境安裝與服務啟動,全部由第一次開機的
-#   nssms-boot → reboot_launcher.sh → update_booster.sh(OTA)→ 依角色全相位套用
-# 完成。不講清楚的話,操作者看到上面一排「已啟用」會以為部署完成了。
-echo "  deploy_offline 只做一次性設定(身分 / systemd / sudoers / sftp_transfer venv)。"
-echo "  各專案的程式碼、環境與服務由第一次開機流程完成:"
-echo "    nssms-boot → reboot_launcher.sh → update_booster.sh(SFTP 拉最新程式碼)"
-echo "                                    → 依角色 $DEPLOY_ROLE 套用 update+env+run"
-echo ""
-echo "  所以接下來請二選一:"
-echo "    sudo reboot                                # 建議:完整走一次真實開機流程"
-echo "    systemctl --user start nssms-boot          # 或立即手動觸發一次(不重開機)"
-case "$DOCKER_GROUP_STATUS" in
-  已加入*)
+# 這一段的文案取決於啟動流程到底跑了沒。原本無條件印「⚠ 尚未完成:服務還沒有啟動」+
+# 「接下來請二選一」,那是 4647125 把啟動流程納進本腳本**之前**的事實 —— 之後就變成
+# 總結上一行剛寫「完整啟動流程:已完成」,下一段卻叫操作者去把服務啟動起來。
+case "$LAUNCH_STATUS" in
+  已完成|有項目失敗*)
+    if [ "$LAUNCH_STATUS" = "已完成" ]; then
+      echo "── 部署完成:服務已啟動 ──"
+      echo "  已依角色 $DEPLOY_ROLE 走完 update+env+run,本角色該有的服務應該都在跑了。"
+    else
+      echo "── ⚠ 部署完成,但啟動流程有項目失敗 ──"
+      echo "  已依角色 $DEPLOY_ROLE 嘗試套用 update+env+run,有項目未成功。"
+      echo "  啟動器對個別項目是「記錄並繼續」,所以其餘服務仍可能正常運作 —— 先看是哪一項:"
+      echo "    tail -50 ${SHARE_DIR}/scheduler/logs/launcher.log"
+    fi
     echo ""
-    warn "  本次剛把 $(id -un) 加進 docker 群組,而群組變更只對**新** session 生效。"
-    warn "  所以這一輪請務必選 sudo reboot ——「不重開機」那條路徑下 systemd user manager"
-    warn "  仍是舊的群組,web 平台(start_web_docker.sh)會因權限不足而起不來。"
+    echo "  請驗證:"
+    print_verification
+    echo ""
+    echo "  建議仍在方便時重開機一次,完整走過真實開機路徑(nssms-boot → reboot_launcher):"
+    echo "    sudo reboot"
+    print_docker_reboot_warning
+    ;;
+  *)
+    echo "── ⚠ 尚未完成:服務還沒有啟動 ──"
+    # 沒跑啟動流程時,本腳本就只做了「一次性人工設定」:身分、systemd 骨架、sudoers、
+    # sftp_transfer 的 venv。各專案的程式碼、環境安裝與服務啟動,全部由第一次開機的
+    #   nssms-boot → reboot_launcher.sh → update_booster.sh(OTA)→ 依角色全相位套用
+    # 完成。不講清楚的話,操作者看到上面一排「已啟用」會以為部署完成了。
+    echo "  本次只做了一次性設定(身分 / systemd / sudoers / sftp_transfer venv)。"
+    echo "  各專案的程式碼、環境與服務由第一次開機流程完成:"
+    echo "    nssms-boot → reboot_launcher.sh → update_booster.sh(SFTP 拉最新程式碼)"
+    echo "                                    → 依角色 $DEPLOY_ROLE 套用 update+env+run"
+    echo ""
+    echo "  所以接下來請二選一:"
+    echo "    sudo reboot                                # 建議:完整走一次真實開機流程"
+    echo "    systemctl --user start nssms-boot          # 或立即手動觸發一次(不重開機)"
+    print_docker_reboot_warning
+    echo ""
+    echo "  想先確認會做什麼(不執行任何動作):"
+    echo "    bash ${SHARE_DIR}/scheduler/reboot_launcher.sh --dry-run"
+    echo ""
+    echo "  啟動後的驗證:"
+    print_verification
     ;;
 esac
-echo ""
-echo "  想先確認會做什麼(不執行任何動作):"
-echo "    bash ${SHARE_DIR}/scheduler/reboot_launcher.sh --dry-run"
-echo ""
-echo "  啟動後的驗證:"
-echo "    tmux ls                                     # 應列出本角色該有的 session"
-echo "    tail -f ${SHARE_DIR}/scheduler/logs/launcher.log       # 開機做了什麼"
-echo "    tail -f ${SHARE_DIR}/scheduler/failover/logs/heartbeat.log"
-echo "    ${PYTHON_BIN} ${AUTOMATION_CHECKER}"
 if [ "${DEPLOY_VSL_UPPER:-}" = "CLINK" ]; then
   echo ""
   warn "  本機 vsl_name=CLINK(開發機):update_booster 會刻意略過整個 OTA,"

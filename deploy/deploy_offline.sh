@@ -20,12 +20,16 @@
 #      4) install_docker_group.sh → 把使用者加進 docker 群組(需密碼)。web 平台
 #         (start_web_docker.sh)跑在 systemd user session 裡、無法輸入 sudo 密碼,
 #         所以「免 sudo 使用 docker」是它能開機自啟的前提。群組變更需重開機才生效。
-#      5) install_timers.sh      → 7 支週期排程 timer
-#      6) sudoers 白名單         → reboot / teamviewer 需要(這一步要輸入一次密碼)
-#      7) install_services.sh    → 4 支常駐服務:heartbeat(雙向心跳/接管)、
-#                                  alarm-controller / board-server / button(綁實體 IPC-1)
+#      5~7) 以下三步由**同一個問題**一併決定(它們是一個概念單位:週期排程與 ipc 接管):
+#         5) install_timers.sh      → 7 支週期排程 timer
+#         6) sudoers 白名單         → reboot / teamviewer 需要(這一步要輸入一次密碼)
+#         7) install_services.sh    → 4 支常駐服務:heartbeat(雙向心跳/接管)、
+#                                     alarm-controller / board-server / button(綁實體 IPC-1)
 #      8) 詢問「之後要不要立即執行完整啟動流程」——**只問，執行在階段 C**
 #      這一段結束後會印「以下不再需要任何輸入」,操作者可以離開終端機。
+#
+# 實作對應:上面這份大綱就是檔尾 main() 的內容,一行一個 stage_* 函式。改流程請同時改
+# 兩邊 —— 或者只讀 main(),它才是權威。
 #
 #   B. sftp_transfer 專屬 venv(離線、無人干預)
 #      wheelhouse + MANIFEST.txt sha256 校驗 → virtualenv → pip --no-index → 匯入驗證
@@ -144,49 +148,53 @@ mutating() {  # $1... = 動作說明
 }
 
 # --- 解析參數 --------------------------------------------------------------
-while [ $# -gt 0 ]; do
-  case "$1" in
-    --with-tests)  INSTALL_TESTS=1 ;;
-    --skip-tests)  INSTALL_TESTS=0 ;;
-    --check-only)  CHECK_ONLY=1 ;;
-    --skip-verify) SKIP_VERIFY=1 ;;
-    --recreate)    RECREATE=1 ;;
-    --no-health-check) RUN_HEALTH=0 ;;
-    --no-launch)   RUN_LAUNCH=0 ;;
-    --venv)        VENV_DIR="${2:?--venv 需要一個路徑參數}"; shift ;;
-    --python)      PYTHON_BIN="${2:?--python 需要一個路徑參數}"; shift ;;
-    -h|--help)     usage ;;
-    *) err "未知參數：$1"; echo "執行 --help 查看用法" >&2; exit 2 ;;
-  esac
-  shift
-done
+parse_args() {
+  while [ $# -gt 0 ]; do
+    case "$1" in
+      --with-tests)  INSTALL_TESTS=1 ;;
+      --skip-tests)  INSTALL_TESTS=0 ;;
+      --check-only)  CHECK_ONLY=1 ;;
+      --skip-verify) SKIP_VERIFY=1 ;;
+      --recreate)    RECREATE=1 ;;
+      --no-health-check) RUN_HEALTH=0 ;;
+      --no-launch)   RUN_LAUNCH=0 ;;
+      --venv)        VENV_DIR="${2:?--venv 需要一個路徑參數}"; shift ;;
+      --python)      PYTHON_BIN="${2:?--python 需要一個路徑參數}"; shift ;;
+      -h|--help)     usage ;;
+      *) err "未知參數：$1"; echo "執行 --help 查看用法" >&2; exit 2 ;;
+    esac
+    shift
+  done
 
-# 未指定 --python 時自動選直譯器：優先 python3.10（下游 install_env.sh 與 wheelhouse
-# 的 cp310 wheel 皆以此為準），退而求其次才用 python3。
-if [ -z "$PYTHON_BIN" ]; then
-  if command -v python3.10 >/dev/null 2>&1; then
-    PYTHON_BIN="python3.10"
-  else
-    PYTHON_BIN="python3"
+  # 未指定 --python 時自動選直譯器：優先 python3.10（下游 install_env.sh 與 wheelhouse
+  # 的 cp310 wheel 皆以此為準），退而求其次才用 python3。
+  if [ -z "$PYTHON_BIN" ]; then
+    if command -v python3.10 >/dev/null 2>&1; then
+      PYTHON_BIN="python3.10"
+    else
+      PYTHON_BIN="python3"
+    fi
   fi
-fi
+}
 
-echo "==========================================================="
-echo " sftp_transfer 離線部署 (offline deploy — 專屬 venv)"
-echo "==========================================================="
+banner_and_preflight() {
+  echo "==========================================================="
+  echo " sftp_transfer 離線部署 (offline deploy — 專屬 venv)"
+  echo "==========================================================="
 
-# --- 前置檢查 --------------------------------------------------------------
-if ! command -v "$PYTHON_BIN" >/dev/null 2>&1; then
-  err "找不到 Python 直譯器：$PYTHON_BIN"; exit 1
-fi
-PY_VER="$("$PYTHON_BIN" -c 'import sys;print(".".join(map(str,sys.version_info[:3])))')"
-PY_TAG="$("$PYTHON_BIN" -c 'import sys;print("cp%d%d"%sys.version_info[:2])')"
-info "基底直譯器    : $PYTHON_BIN ($PY_VER, $PY_TAG)"
-info "系統架構      : $(uname -m) ($(uname -s) $(uname -r))"
-info "Wheelhouse    : $WHEELHOUSE"
-info "專案目錄      : $PROJECT_DIR"
-info "專屬 venv     : $VENV_DIR"
-info "船舶資訊檔    : $VESSEL_INFO"
+  # --- 前置檢查 --------------------------------------------------------------
+  if ! command -v "$PYTHON_BIN" >/dev/null 2>&1; then
+    err "找不到 Python 直譯器：$PYTHON_BIN"; exit 1
+  fi
+  PY_VER="$("$PYTHON_BIN" -c 'import sys;print(".".join(map(str,sys.version_info[:3])))')"
+  PY_TAG="$("$PYTHON_BIN" -c 'import sys;print("cp%d%d"%sys.version_info[:2])')"
+  info "基底直譯器    : $PYTHON_BIN ($PY_VER, $PY_TAG)"
+  info "系統架構      : $(uname -m) ($(uname -s) $(uname -r))"
+  info "Wheelhouse    : $WHEELHOUSE"
+  info "專案目錄      : $PROJECT_DIR"
+  info "專屬 venv     : $VENV_DIR"
+  info "船舶資訊檔    : $VESSEL_INFO"
+}
 
 # --- 船舶基本資訊檔（vessel_basic_info.json）檢查 / 互動建立 ----------------
 # 剛啟動就先確認它存在且內容正確（需含非空的 vsl_name / ipc）；
@@ -316,72 +324,76 @@ PY
 # 這個 guard 是後補的：CHECK_ONLY 原本要到 venv 那一段才被檢查，於是 --check-only 會
 # 一路把身分檔與 systemd 都改掉。加入「清除接管旗標」「刪除舊格式狀態檔」之後風險升級
 # ——對一台真的正在接管中的船,那會直接讓它失去接管。
-DRYRUN_NOTE=""
-if [ "$CHECK_ONLY" -eq 1 ]; then
-  DRYRUN_NOTE="（--check-only：只回報，不執行）"
-  echo ""
-  info "--check-only：以下一次性設定只回報現況，不做任何變更。"
-fi
-
-echo ""
-info "檢查船舶基本資訊檔 ..."
-VESSEL_RC=0
-VESSEL_OUT="$(vessel_info_show)" || VESSEL_RC=$?
-[ -n "$VESSEL_OUT" ] && printf '%s\n' "$VESSEL_OUT" | sed 's/^/       /'
-if [ "$CHECK_ONLY" -eq 1 ]; then
-  case "$VESSEL_RC" in
-    0) ok   "船舶基本資訊檔有效。" ;;
-    4) warn "船舶基本資訊檔有效，但**帶著 failover 接管旗標** —— 本機會以 emer 角色啟動。$DRYRUN_NOTE" ;;
-    3) warn "找不到船舶基本資訊檔；正式部署時會以互動問答建立。$DRYRUN_NOTE" ;;
-    *) warn "船舶基本資訊檔內容不正確；正式部署時會重新建立。$DRYRUN_NOTE" ;;
-  esac
-elif [ "$VESSEL_RC" -eq 0 ]; then
-  ok "船舶基本資訊檔有效，沿用現有內容。"
-elif [ "$VESSEL_RC" -eq 4 ]; then
-  # 欄位有效，但帶著接管旗標。重新部署幾乎總是意味著機器被重裝、搬移或換角色，
-  # 所以預設清除;真的正在接管中(對方確實故障)才選 n。
-  echo ""
-  warn "══════════════════ 本機處於接管狀態 ══════════════════"
-  warn "身分檔帶有 failover 旗標，本機會以 emer 角色啟動（等同對方的完整服務清單）。"
-  warn "═══════════════════════════════════════════════════"
-  # 不猜預設值,把證據給操作者。成本是不對稱的:
-  #   誤清 → 若對方真的死了,船上立刻失去那些服務,而且沒有任何告警(安靜的嚴重故障)
-  #   誤留 → 啟動器每次都印雙主警告、巡檢 24 小時後升 WARN、status 直接顯示(很吵,可回復)
-  # 所以預設保留(Enter = N),並先跑一次唯讀的 status 讓操作者看對方到底活不活著。
-  FAILOVER_CTL="${SHARE_DIR}/scheduler/failover/failover_ctl.sh"
-  if [ -f "$FAILOVER_CTL" ]; then
+announce_check_only() {
+  DRYRUN_NOTE=""
+  if [ "$CHECK_ONLY" -eq 1 ]; then
+    DRYRUN_NOTE="（--check-only：只回報，不執行）"
     echo ""
-    info "先確認對方是否還活著（failover_ctl.sh status，唯讀）："
-    # 唯讀查詢，對端沒回應時會回非 0 —— 那正是我們要給操作者看的資訊，不是錯誤。
-    bash "$FAILOVER_CTL" status 2>&1 | sed 's/^/       /' || true
+    info "--check-only：以下一次性設定只回報現況，不做任何變更。"
   fi
+}
+
+stage_vessel_info() {
   echo ""
-  warn "判讀:"
-  warn "  * 上面顯示對方**有回應** → 這個旗標是殘留,應該清除(否則兩台同時跑同一批服務)"
-  warn "  * 上面顯示對方**無回應** → 本機可能真的在替它接管,清除會讓船上失去那些服務"
-  if [ ! -t 0 ]; then
-    warn "非互動終端機：不擅自更動身分檔，保留現狀。"
-    warn "如需清除請執行：bash $FAILOVER_CTL clear"
-  fi
-  # 預設 N（保留）—— 誤清是安靜的嚴重故障，誤留是很吵但可回復的，見上方成本分析。
-  if ask_yn "  清除接管旗標？（不確定就按 Enter 保留，之後可用 failover_ctl.sh clear）[y/N] " N; then
-    mutating "清除身分檔的接管旗標"
-    if clear_failover_flag; then
-      ok "已清除接管旗標（vsl_name / ipc 未變更）。"
-      info "角色要生效仍需執行：bash ${SHARE_DIR}/scheduler/reboot_launcher.sh --reconcile"
-    else
-      warn "清除失敗，保留現狀。請改用 failover_ctl.sh clear 處理。"
+  info "檢查船舶基本資訊檔 ..."
+  VESSEL_RC=0
+  VESSEL_OUT="$(vessel_info_show)" || VESSEL_RC=$?
+  [ -n "$VESSEL_OUT" ] && printf '%s\n' "$VESSEL_OUT" | sed 's/^/       /'
+  if [ "$CHECK_ONLY" -eq 1 ]; then
+    case "$VESSEL_RC" in
+      0) ok   "船舶基本資訊檔有效。" ;;
+      4) warn "船舶基本資訊檔有效，但**帶著 failover 接管旗標** —— 本機會以 emer 角色啟動。$DRYRUN_NOTE" ;;
+      3) warn "找不到船舶基本資訊檔；正式部署時會以互動問答建立。$DRYRUN_NOTE" ;;
+      *) warn "船舶基本資訊檔內容不正確；正式部署時會重新建立。$DRYRUN_NOTE" ;;
+    esac
+  elif [ "$VESSEL_RC" -eq 0 ]; then
+    ok "船舶基本資訊檔有效，沿用現有內容。"
+  elif [ "$VESSEL_RC" -eq 4 ]; then
+    # 欄位有效，但帶著接管旗標。重新部署幾乎總是意味著機器被重裝、搬移或換角色，
+    # 所以預設清除;真的正在接管中(對方確實故障)才選 n。
+    echo ""
+    warn "══════════════════ 本機處於接管狀態 ══════════════════"
+    warn "身分檔帶有 failover 旗標，本機會以 emer 角色啟動（等同對方的完整服務清單）。"
+    warn "═══════════════════════════════════════════════════"
+    # 不猜預設值,把證據給操作者。成本是不對稱的:
+    #   誤清 → 若對方真的死了,船上立刻失去那些服務,而且沒有任何告警(安靜的嚴重故障)
+    #   誤留 → 啟動器每次都印雙主警告、巡檢 24 小時後升 WARN、status 直接顯示(很吵,可回復)
+    # 所以預設保留(Enter = N),並先跑一次唯讀的 status 讓操作者看對方到底活不活著。
+    FAILOVER_CTL="${SHARE_DIR}/scheduler/failover/failover_ctl.sh"
+    if [ -f "$FAILOVER_CTL" ]; then
+      echo ""
+      info "先確認對方是否還活著（failover_ctl.sh status，唯讀）："
+      # 唯讀查詢，對端沒回應時會回非 0 —— 那正是我們要給操作者看的資訊，不是錯誤。
+      bash "$FAILOVER_CTL" status 2>&1 | sed 's/^/       /' || true
     fi
+    echo ""
+    warn "判讀:"
+    warn "  * 上面顯示對方**有回應** → 這個旗標是殘留,應該清除(否則兩台同時跑同一批服務)"
+    warn "  * 上面顯示對方**無回應** → 本機可能真的在替它接管,清除會讓船上失去那些服務"
+    if [ ! -t 0 ]; then
+      warn "非互動終端機：不擅自更動身分檔，保留現狀。"
+      warn "如需清除請執行：bash $FAILOVER_CTL clear"
+    fi
+    # 預設 N（保留）—— 誤清是安靜的嚴重故障，誤留是很吵但可回復的，見上方成本分析。
+    if ask_yn "  清除接管旗標？（不確定就按 Enter 保留，之後可用 failover_ctl.sh clear）[y/N] " N; then
+      mutating "清除身分檔的接管旗標"
+      if clear_failover_flag; then
+        ok "已清除接管旗標（vsl_name / ipc 未變更）。"
+        info "角色要生效仍需執行：bash ${SHARE_DIR}/scheduler/reboot_launcher.sh --reconcile"
+      else
+        warn "清除失敗，保留現狀。請改用 failover_ctl.sh clear 處理。"
+      fi
+    else
+      warn "保留接管旗標。本機將繼續以 emer 角色啟動。"
+    fi
+  elif [ "$VESSEL_RC" -eq 3 ]; then
+    warn "找不到船舶基本資訊檔，將以互動問答建立。"
+    create_vessel_info
   else
-    warn "保留接管旗標。本機將繼續以 emer 角色啟動。"
+    warn "船舶基本資訊檔內容不正確，將重新建立。"
+    create_vessel_info
   fi
-elif [ "$VESSEL_RC" -eq 3 ]; then
-  warn "找不到船舶基本資訊檔，將以互動問答建立。"
-  create_vessel_info
-else
-  warn "船舶基本資訊檔內容不正確，將重新建立。"
-  create_vessel_info
-fi
+}
 
 # --- 由身分檔推導出的兩個顯示值 --------------------------------------------
 # 刻意算在這裡（而不是總結段）:兩者都只依賴身分檔，而身分檔到上一行才定案
@@ -391,42 +403,46 @@ fi
 # 「本機是不是 CLINK 開發機」—— 那裡讀到的一直是空字串（寫成 ${DEPLOY_VSL_UPPER:-}
 # 所以 set -u 也不會抱怨），於是那句「開發機不會下載程式碼」的警告從來沒印出過。
 # effective_role.sh 與 vessel_get 都是唯讀的，提前呼叫不影響 --check-only 的承諾。
-EFFECTIVE_ROLE_SH="${SHARE_DIR}/scheduler/failover/effective_role.sh"
-if [ -f "$EFFECTIVE_ROLE_SH" ]; then
-  DEPLOY_ROLE="$(bash "$EFFECTIVE_ROLE_SH" --quiet 2>/dev/null || echo "（判定失敗）")"
-else
-  DEPLOY_ROLE="（找不到 effective_role.sh）"
-fi
-# 開發機(CLINK)的 OTA 守門會讓「第一次開機自動下載程式碼」這件事不成立,後面要據此提醒。
-DEPLOY_VSL_UPPER="$(printf '%s' "$(vessel_get vsl_name)" | tr '[:lower:]' '[:upper:]')"
+compute_identity() {
+  EFFECTIVE_ROLE_SH="${SHARE_DIR}/scheduler/failover/effective_role.sh"
+  if [ -f "$EFFECTIVE_ROLE_SH" ]; then
+    DEPLOY_ROLE="$(bash "$EFFECTIVE_ROLE_SH" --quiet 2>/dev/null || echo "（判定失敗）")"
+  else
+    DEPLOY_ROLE="（找不到 effective_role.sh）"
+  fi
+  # 開發機(CLINK)的 OTA 守門會讓「第一次開機自動下載程式碼」這件事不成立,後面要據此提醒。
+  DEPLOY_VSL_UPPER="$(printf '%s' "$(vessel_get vsl_name)" | tr '[:lower:]' '[:upper:]')"
+}
 
 # --- 舊格式的接管狀態檔（已廢除）------------------------------------------
 # 若 .env/ 是從舊機複製過來的，這個檔會讓新機被 heartbeat 遷移成「接管中」——
 # 首次部署的機器不該繼承別台的接管狀態。
 # 【移除條件】全隊確認升級完成後，連同 scheduler/failover/role.py 的遷移碼一起刪掉。
-LEGACY_FAILOVER="${SHARE_DIR}/.env/failover_state.json"
-if [ -f "$LEGACY_FAILOVER" ]; then
-  echo ""
-  warn "偵測到舊格式的接管狀態檔：$LEGACY_FAILOVER"
-  warn "它已廢除。若保留，heartbeat 啟動時會把它遷移成本機的接管狀態。"
-  warn "判讀與上面同一個道理:若 .env/ 是從舊機複製過來的,這是殘留,該刪;"
-  warn "若本機真的在替一台死掉的對端接管,刪掉就會失去接管。"
-  warn "保留是可回復的（遷移後會出現在 failover_ctl.sh status 與巡檢報告裡）,所以預設保留。"
-  legacy_del=1   # 1 = 保留（預設）
-  if [ "$CHECK_ONLY" -eq 1 ]; then
-    warn "$DRYRUN_NOTE 正式部署時會詢問是否刪除。"
-  else
-    [ -t 0 ] || warn "非互動終端機：不擅自刪除，保留現狀。"
-    ask_yn "  刪除它？（不確定就按 Enter 保留）[y/N] " N && legacy_del=0
+stage_legacy_failover_state() {
+  LEGACY_FAILOVER="${SHARE_DIR}/.env/failover_state.json"
+  if [ -f "$LEGACY_FAILOVER" ]; then
+    echo ""
+    warn "偵測到舊格式的接管狀態檔：$LEGACY_FAILOVER"
+    warn "它已廢除。若保留，heartbeat 啟動時會把它遷移成本機的接管狀態。"
+    warn "判讀與上面同一個道理:若 .env/ 是從舊機複製過來的,這是殘留,該刪;"
+    warn "若本機真的在替一台死掉的對端接管,刪掉就會失去接管。"
+    warn "保留是可回復的（遷移後會出現在 failover_ctl.sh status 與巡檢報告裡）,所以預設保留。"
+    legacy_del=1   # 1 = 保留（預設）
+    if [ "$CHECK_ONLY" -eq 1 ]; then
+      warn "$DRYRUN_NOTE 正式部署時會詢問是否刪除。"
+    else
+      [ -t 0 ] || warn "非互動終端機：不擅自刪除，保留現狀。"
+      ask_yn "  刪除它？（不確定就按 Enter 保留）[y/N] " N && legacy_del=0
+    fi
+    if [ "$legacy_del" -eq 0 ]; then
+      mutating "刪除舊格式接管狀態檔"
+      rm -f "$LEGACY_FAILOVER" && ok "已刪除 $LEGACY_FAILOVER"
+    else
+      warn "保留舊格式接管狀態檔。heartbeat 啟動時會把它遷移進身分檔;"
+      warn "若確認是殘留,遷移後執行:bash ${SHARE_DIR}/scheduler/failover/failover_ctl.sh clear"
+    fi
   fi
-  if [ "$legacy_del" -eq 0 ]; then
-    mutating "刪除舊格式接管狀態檔"
-    rm -f "$LEGACY_FAILOVER" && ok "已刪除 $LEGACY_FAILOVER"
-  else
-    warn "保留舊格式接管狀態檔。heartbeat 啟動時會把它遷移進身分檔;"
-    warn "若確認是殘留,遷移後執行:bash ${SHARE_DIR}/scheduler/failover/failover_ctl.sh clear"
-  fi
-fi
+}
 
 # --- 開機自動執行設定（scheduler/install_autostart.sh） --------------------
 # 與船舶資訊檔一樣，是需要使用者留意的一次性設定：詢問是否設定開機自動啟動
@@ -439,51 +455,53 @@ fi
 #   4 = 設定失敗(找不到腳本 / 無法寫入 unit / user manager 不可用)
 #   2 = install_autostart.sh 參數錯誤
 # AUTOSTART_STATUS 供最後的部署總結顯示；先給預設值(set -u 下需先定義)。
-AUTOSTART_INSTALLER="${SHARE_DIR}/scheduler/install_autostart.sh"
-AUTOSTART_STATUS="未執行"
-echo ""
-info "檢查開機自動執行設定 ..."
-if [ ! -f "$AUTOSTART_INSTALLER" ]; then
-  warn "找不到 $AUTOSTART_INSTALLER ，略過開機自動執行設定。"
-  AUTOSTART_STATUS="略過（找不到安裝腳本）"
-elif [ "$CHECK_ONLY" -eq 1 ]; then
-  # --check-only 不佈署 unit；改用安裝器自己的 --check-only 回報現況
-  #（它會一併檢查啟動器的必要檔案是否齊全,缺就回 4）。
-  run_rc bash "$AUTOSTART_INSTALLER" --check-only
-  AUTOSTART_RC="$RC"
-  [ "$AUTOSTART_RC" -eq 0 ] \
-    && AUTOSTART_STATUS="現況正常$DRYRUN_NOTE" \
-    || AUTOSTART_STATUS="現況有問題（rc=$AUTOSTART_RC）$DRYRUN_NOTE"
-elif [ ! -t 0 ]; then
-  # 非互動終端機：不擅自更動 systemd / linger，僅提示手動指令。
-  warn "非互動終端機，略過開機自動執行設定。"
-  warn "如需設定，請手動執行：bash $AUTOSTART_INSTALLER"
-  AUTOSTART_STATUS="略過（非互動終端機）"
-elif ask_yn "  是否設定開機自動啟動 scheduler（reboot_launcher.sh）？[Y/n] " Y; then
-  # 捕捉離開碼判讀結果；install_autostart.sh 於非互動/無權限時不會中斷，
-  # 這裡即使回非 0 也只警告，不影響 sftp_transfer 的部署結果。
-  mutating "佈署 nssms-boot user unit"
-  run_rc bash "$AUTOSTART_INSTALLER" --require-linger
-  AUTOSTART_RC="$RC"
-  case "$AUTOSTART_RC" in
-    0) ok   "開機自動執行：已設定並啟用（service enabled + linger on）"
-       AUTOSTART_STATUS="已啟用" ;;
-    3) warn "開機自動執行：user service 已安裝，但 linger 未開啟；請手動執行 sudo loginctl enable-linger $(id -un)"
-       AUTOSTART_STATUS="部分完成（linger 未開啟）" ;;
-    4) warn "開機自動執行：設定失敗（rc=4）。可能原因:"
-       warn "  * 缺少啟動器必要檔案(reboot_launcher.sh / reboot_script/roles.conf /"
-       warn "    failover/effective_role.sh)—— 離線包不完整,見上方 install_autostart 的明細"
-       warn "  * 找不到腳本 / 無法寫入 unit / systemd user manager 不可用"
-       AUTOSTART_STATUS="設定失敗（rc=4）" ;;
-    2) warn "開機自動執行：install_autostart.sh 參數錯誤（rc=2）"
-       AUTOSTART_STATUS="設定失敗（參數錯誤）" ;;
-    *) warn "開機自動執行：未預期的結果（rc=$AUTOSTART_RC），請檢視上方訊息"
-       AUTOSTART_STATUS="未知（rc=$AUTOSTART_RC）" ;;
-  esac
-else
-  info "略過開機自動執行設定。日後可執行：bash $AUTOSTART_INSTALLER"
-  AUTOSTART_STATUS="使用者略過"
-fi
+stage_autostart() {
+  AUTOSTART_INSTALLER="${SHARE_DIR}/scheduler/install_autostart.sh"
+  AUTOSTART_STATUS="未執行"
+  echo ""
+  info "檢查開機自動執行設定 ..."
+  if [ ! -f "$AUTOSTART_INSTALLER" ]; then
+    warn "找不到 $AUTOSTART_INSTALLER ，略過開機自動執行設定。"
+    AUTOSTART_STATUS="略過（找不到安裝腳本）"
+  elif [ "$CHECK_ONLY" -eq 1 ]; then
+    # --check-only 不佈署 unit；改用安裝器自己的 --check-only 回報現況
+    #（它會一併檢查啟動器的必要檔案是否齊全,缺就回 4）。
+    run_rc bash "$AUTOSTART_INSTALLER" --check-only
+    AUTOSTART_RC="$RC"
+    [ "$AUTOSTART_RC" -eq 0 ] \
+      && AUTOSTART_STATUS="現況正常$DRYRUN_NOTE" \
+      || AUTOSTART_STATUS="現況有問題（rc=$AUTOSTART_RC）$DRYRUN_NOTE"
+  elif [ ! -t 0 ]; then
+    # 非互動終端機：不擅自更動 systemd / linger，僅提示手動指令。
+    warn "非互動終端機，略過開機自動執行設定。"
+    warn "如需設定，請手動執行：bash $AUTOSTART_INSTALLER"
+    AUTOSTART_STATUS="略過（非互動終端機）"
+  elif ask_yn "  是否設定開機自動啟動 scheduler（reboot_launcher.sh）？[Y/n] " Y; then
+    # 捕捉離開碼判讀結果；install_autostart.sh 於非互動/無權限時不會中斷，
+    # 這裡即使回非 0 也只警告，不影響 sftp_transfer 的部署結果。
+    mutating "佈署 nssms-boot user unit"
+    run_rc bash "$AUTOSTART_INSTALLER" --require-linger
+    AUTOSTART_RC="$RC"
+    case "$AUTOSTART_RC" in
+      0) ok   "開機自動執行：已設定並啟用（service enabled + linger on）"
+         AUTOSTART_STATUS="已啟用" ;;
+      3) warn "開機自動執行：user service 已安裝，但 linger 未開啟；請手動執行 sudo loginctl enable-linger $(id -un)"
+         AUTOSTART_STATUS="部分完成（linger 未開啟）" ;;
+      4) warn "開機自動執行：設定失敗（rc=4）。可能原因:"
+         warn "  * 缺少啟動器必要檔案(reboot_launcher.sh / reboot_script/roles.conf /"
+         warn "    failover/effective_role.sh)—— 離線包不完整,見上方 install_autostart 的明細"
+         warn "  * 找不到腳本 / 無法寫入 unit / systemd user manager 不可用"
+         AUTOSTART_STATUS="設定失敗（rc=4）" ;;
+      2) warn "開機自動執行：install_autostart.sh 參數錯誤（rc=2）"
+         AUTOSTART_STATUS="設定失敗（參數錯誤）" ;;
+      *) warn "開機自動執行：未預期的結果（rc=$AUTOSTART_RC），請檢視上方訊息"
+         AUTOSTART_STATUS="未知（rc=$AUTOSTART_RC）" ;;
+    esac
+  else
+    info "略過開機自動執行設定。日後可執行：bash $AUTOSTART_INSTALLER"
+    AUTOSTART_STATUS="使用者略過"
+  fi
+}
 
 # --- 一次性遷移：舊的 clink_* 系統服務 → nssms 常駐服務 --------------------
 # alarm / board / button 原本是 /etc/systemd/system/ 下的三支 system unit（clink_*），
@@ -514,58 +532,60 @@ gpio_needed() {  # 回傳 0 = 需要加入 gpio 群組
   return 0
 }
 
-echo ""
-info "檢查舊 clink_* 系統服務的遷移狀態 ..."
-if ! legacy_present && ! gpio_needed; then
-  ok "無需遷移（舊 clink_* 不存在，且已在 gpio 群組）。"
-  MIGRATE_STATUS="無需遷移"
-elif [ "$CHECK_ONLY" -eq 1 ]; then
-  legacy_present && warn "仍存在舊 clink_* 系統服務（需遷移）：$(
-    for u in "${LEGACY_UNITS[@]}"; do
-      [ -f "/etc/systemd/system/${u}.service" ] && printf '%s ' "$u"
-    done)"
-  gpio_needed && warn "使用者 $(id -un) 尚未加入 gpio 群組（nssms-button 需要）。"
-  MIGRATE_STATUS="待遷移$DRYRUN_NOTE"
-elif [ ! -t 0 ]; then
-  warn "非互動終端機，略過 clink_* 遷移（需 sudo）。"
-  warn "如需遷移，請手動執行："
-  warn "  sudo systemctl disable --now ${LEGACY_UNITS[*]}"
-  warn "  sudo rm -f /etc/systemd/system/clink_{alarm_controller,board_server,button}.service"
-  warn "  sudo usermod -aG gpio $(id -un)   # 之後需重登入或重開機"
-  MIGRATE_STATUS="略過（非互動終端機）"
-else
-  legacy_present && warn "偵測到舊的 clink_* 系統服務，它們與新的 nssms 常駐服務會撞 port。"
-  gpio_needed && info "另外需把 $(id -un) 加進 gpio 群組（nssms-button 讀 GPIO 用）。"
-  if ask_yn "  現在執行遷移（停用並移除舊 clink_*、加入 gpio 群組）？（需輸入一次密碼）[Y/n] " Y; then
-    mutating "停用移除舊 clink_* system unit / 加入 gpio 群組"
-    MIGRATE_RC=0
-    if legacy_present; then
-      # 舊 unit 可能已經 disable 或本來就沒 enable，disable 失敗不算錯。
-      sudo systemctl disable --now "${LEGACY_UNITS[@]}" 2>/dev/null || true
+stage_clink_migration() {
+  echo ""
+  info "檢查舊 clink_* 系統服務的遷移狀態 ..."
+  if ! legacy_present && ! gpio_needed; then
+    ok "無需遷移（舊 clink_* 不存在，且已在 gpio 群組）。"
+    MIGRATE_STATUS="無需遷移"
+  elif [ "$CHECK_ONLY" -eq 1 ]; then
+    legacy_present && warn "仍存在舊 clink_* 系統服務（需遷移）：$(
       for u in "${LEGACY_UNITS[@]}"; do
-        sudo rm -f "/etc/systemd/system/${u}.service" || MIGRATE_RC=1
-      done
-      sudo systemctl daemon-reload || MIGRATE_RC=1
-      [ "$MIGRATE_RC" -eq 0 ] && ok "已停用並移除舊 clink_* 系統服務。" \
-                              || warn "舊 clink_* 移除時有項目失敗，請檢視上方訊息。"
-    fi
-    if gpio_needed; then
-      run_rc sudo usermod -aG gpio "$(id -un)"
-      if [ "$RC" -eq 0 ]; then
-        ok "已把 $(id -un) 加進 gpio 群組。"
-        warn "群組變更只對新 session 生效 —— nssms-button 要到重登入/重開機才會起來。"
-      else
-        warn "加入 gpio 群組失敗（exit=$RC），nssms-button 將無法讀取 GPIO。"
-        MIGRATE_RC=1
-      fi
-    fi
-    [ "$MIGRATE_RC" -eq 0 ] && MIGRATE_STATUS="已遷移" \
-                            || MIGRATE_STATUS="部分完成"
+        [ -f "/etc/systemd/system/${u}.service" ] && printf '%s ' "$u"
+      done)"
+    gpio_needed && warn "使用者 $(id -un) 尚未加入 gpio 群組（nssms-button 需要）。"
+    MIGRATE_STATUS="待遷移$DRYRUN_NOTE"
+  elif [ ! -t 0 ]; then
+    warn "非互動終端機，略過 clink_* 遷移（需 sudo）。"
+    warn "如需遷移，請手動執行："
+    warn "  sudo systemctl disable --now ${LEGACY_UNITS[*]}"
+    warn "  sudo rm -f /etc/systemd/system/clink_{alarm_controller,board_server,button}.service"
+    warn "  sudo usermod -aG gpio $(id -un)   # 之後需重登入或重開機"
+    MIGRATE_STATUS="略過（非互動終端機）"
   else
-    warn "略過遷移。**新的 alarm / board 常駐服務會因 port 被舊 clink_* 佔用而起不來。**"
-    MIGRATE_STATUS="使用者略過（新服務會撞 port）"
+    legacy_present && warn "偵測到舊的 clink_* 系統服務，它們與新的 nssms 常駐服務會撞 port。"
+    gpio_needed && info "另外需把 $(id -un) 加進 gpio 群組（nssms-button 讀 GPIO 用）。"
+    if ask_yn "  現在執行遷移（停用並移除舊 clink_*、加入 gpio 群組）？（需輸入一次密碼）[Y/n] " Y; then
+      mutating "停用移除舊 clink_* system unit / 加入 gpio 群組"
+      MIGRATE_RC=0
+      if legacy_present; then
+        # 舊 unit 可能已經 disable 或本來就沒 enable，disable 失敗不算錯。
+        sudo systemctl disable --now "${LEGACY_UNITS[@]}" 2>/dev/null || true
+        for u in "${LEGACY_UNITS[@]}"; do
+          sudo rm -f "/etc/systemd/system/${u}.service" || MIGRATE_RC=1
+        done
+        sudo systemctl daemon-reload || MIGRATE_RC=1
+        [ "$MIGRATE_RC" -eq 0 ] && ok "已停用並移除舊 clink_* 系統服務。" \
+                                || warn "舊 clink_* 移除時有項目失敗，請檢視上方訊息。"
+      fi
+      if gpio_needed; then
+        run_rc sudo usermod -aG gpio "$(id -un)"
+        if [ "$RC" -eq 0 ]; then
+          ok "已把 $(id -un) 加進 gpio 群組。"
+          warn "群組變更只對新 session 生效 —— nssms-button 要到重登入/重開機才會起來。"
+        else
+          warn "加入 gpio 群組失敗（exit=$RC），nssms-button 將無法讀取 GPIO。"
+          MIGRATE_RC=1
+        fi
+      fi
+      [ "$MIGRATE_RC" -eq 0 ] && MIGRATE_STATUS="已遷移" \
+                              || MIGRATE_STATUS="部分完成"
+    else
+      warn "略過遷移。**新的 alarm / board 常駐服務會因 port 被舊 clink_* 佔用而起不來。**"
+      MIGRATE_STATUS="使用者略過（新服務會撞 port）"
+    fi
   fi
-fi
+}
 
 # --- docker 群組（scheduler/install_docker_group.sh） ----------------------
 # web 平台的 docker compose 現在由 reboot_script/start_web_docker.sh 在開機流程中啟動,
@@ -578,61 +598,63 @@ fi
 #
 # 冪等：已在群組時安裝器自己會判斷並安靜跳過（rc=0）。
 # 這一步失敗不中斷部署：web 起不來不影響 SHM / radar / 心跳等主要服務。
-DOCKER_GROUP_INSTALLER="${SHARE_DIR}/scheduler/install_docker_group.sh"
-DOCKER_GROUP_STATUS="未執行"
-echo ""
-info "檢查 docker 群組（web 平台開機自啟的前提）..."
-if [ ! -f "$DOCKER_GROUP_INSTALLER" ]; then
-  warn "找不到 $DOCKER_GROUP_INSTALLER ，略過 docker 群組設定。"
-  warn "web 平台將無法由開機流程啟動（仍可人工 sudo docker compose up -d）。"
-  DOCKER_GROUP_STATUS="略過（找不到安裝腳本）"
-elif [ "$CHECK_ONLY" -eq 1 ]; then
-  run_rc bash "$DOCKER_GROUP_INSTALLER" --check-only
-  DOCKER_RC="$RC"
-  case "$DOCKER_RC" in
-    0) DOCKER_GROUP_STATUS="已就緒" ;;
-    3) DOCKER_GROUP_STATUS="已加入，待重開機生效" ;;
-    4) DOCKER_GROUP_STATUS="docker 未安裝$DRYRUN_NOTE" ;;
-    *) DOCKER_GROUP_STATUS="未加入$DRYRUN_NOTE" ;;
-  esac
-elif [ ! -t 0 ]; then
-  warn "非互動終端機，略過 docker 群組設定（需 sudo）。"
-  warn "如需設定，請手動執行：bash $DOCKER_GROUP_INSTALLER"
-  DOCKER_GROUP_STATUS="略過（非互動終端機）"
-else
-  # 先唯讀探一次:已就緒/已加入待重開機/沒 docker 這三種情況都不需要問任何問題。
-  run_rc bash "$DOCKER_GROUP_INSTALLER" --check-only >/dev/null 2>&1
-  DOCKER_RC="$RC"
-  if [ "$DOCKER_RC" -eq 0 ]; then
-    ok "docker 群組已就緒（$(id -un) 可直接使用 docker）。"
-    DOCKER_GROUP_STATUS="已就緒"
-  elif [ "$DOCKER_RC" -eq 3 ]; then
-    ok "docker 群組已設定，等重開機後生效。"
-    DOCKER_GROUP_STATUS="已加入，待重開機生效"
-  elif [ "$DOCKER_RC" -eq 4 ]; then
-    warn "本機沒有 docker（或沒有 docker 群組），略過。web 平台無法在此機器上啟動。"
-    DOCKER_GROUP_STATUS="docker 未安裝"
+stage_docker_group() {
+  DOCKER_GROUP_INSTALLER="${SHARE_DIR}/scheduler/install_docker_group.sh"
+  DOCKER_GROUP_STATUS="未執行"
+  echo ""
+  info "檢查 docker 群組（web 平台開機自啟的前提）..."
+  if [ ! -f "$DOCKER_GROUP_INSTALLER" ]; then
+    warn "找不到 $DOCKER_GROUP_INSTALLER ，略過 docker 群組設定。"
+    warn "web 平台將無法由開機流程啟動（仍可人工 sudo docker compose up -d）。"
+    DOCKER_GROUP_STATUS="略過（找不到安裝腳本）"
+  elif [ "$CHECK_ONLY" -eq 1 ]; then
+    run_rc bash "$DOCKER_GROUP_INSTALLER" --check-only
+    DOCKER_RC="$RC"
+    case "$DOCKER_RC" in
+      0) DOCKER_GROUP_STATUS="已就緒" ;;
+      3) DOCKER_GROUP_STATUS="已加入，待重開機生效" ;;
+      4) DOCKER_GROUP_STATUS="docker 未安裝$DRYRUN_NOTE" ;;
+      *) DOCKER_GROUP_STATUS="未加入$DRYRUN_NOTE" ;;
+    esac
+  elif [ ! -t 0 ]; then
+    warn "非互動終端機，略過 docker 群組設定（需 sudo）。"
+    warn "如需設定，請手動執行：bash $DOCKER_GROUP_INSTALLER"
+    DOCKER_GROUP_STATUS="略過（非互動終端機）"
   else
-    if ask_yn "  把 $(id -un) 加進 docker 群組（web 平台開機自啟的前提）？（需輸入一次密碼）[Y/n] " Y; then
-      mutating "把使用者加進 docker 群組"
-      run_rc bash "$DOCKER_GROUP_INSTALLER"
-      DOCKER_RC="$RC"
-      case "$DOCKER_RC" in
-        0) ok "docker 群組已就緒。"
-           DOCKER_GROUP_STATUS="已就緒" ;;
-        3) ok "已加入 docker 群組；群組變更只對新 session 生效 —— 需重開機。"
-           warn "在重開機之前，start_web_docker.sh 會因權限不足而起不來 web 平台（預期行為）。"
-           DOCKER_GROUP_STATUS="已加入，待重開機生效" ;;
-        *) warn "docker 群組設定失敗（exit=$DOCKER_RC），web 平台將無法由開機流程啟動。"
-           DOCKER_GROUP_STATUS="失敗（exit=$DOCKER_RC）" ;;
-      esac
+    # 先唯讀探一次:已就緒/已加入待重開機/沒 docker 這三種情況都不需要問任何問題。
+    run_rc bash "$DOCKER_GROUP_INSTALLER" --check-only >/dev/null 2>&1
+    DOCKER_RC="$RC"
+    if [ "$DOCKER_RC" -eq 0 ]; then
+      ok "docker 群組已就緒（$(id -un) 可直接使用 docker）。"
+      DOCKER_GROUP_STATUS="已就緒"
+    elif [ "$DOCKER_RC" -eq 3 ]; then
+      ok "docker 群組已設定，等重開機後生效。"
+      DOCKER_GROUP_STATUS="已加入，待重開機生效"
+    elif [ "$DOCKER_RC" -eq 4 ]; then
+      warn "本機沒有 docker（或沒有 docker 群組），略過。web 平台無法在此機器上啟動。"
+      DOCKER_GROUP_STATUS="docker 未安裝"
     else
-      info "略過 docker 群組設定。日後可執行：bash $DOCKER_GROUP_INSTALLER"
-      warn "未加入群組時，開機流程中的 web 平台（start_web_docker.sh）會起不來。"
-      DOCKER_GROUP_STATUS="使用者略過"
+      if ask_yn "  把 $(id -un) 加進 docker 群組（web 平台開機自啟的前提）？（需輸入一次密碼）[Y/n] " Y; then
+        mutating "把使用者加進 docker 群組"
+        run_rc bash "$DOCKER_GROUP_INSTALLER"
+        DOCKER_RC="$RC"
+        case "$DOCKER_RC" in
+          0) ok "docker 群組已就緒。"
+             DOCKER_GROUP_STATUS="已就緒" ;;
+          3) ok "已加入 docker 群組；群組變更只對新 session 生效 —— 需重開機。"
+             warn "在重開機之前，start_web_docker.sh 會因權限不足而起不來 web 平台（預期行為）。"
+             DOCKER_GROUP_STATUS="已加入，待重開機生效" ;;
+          *) warn "docker 群組設定失敗（exit=$DOCKER_RC），web 平台將無法由開機流程啟動。"
+             DOCKER_GROUP_STATUS="失敗（exit=$DOCKER_RC）" ;;
+        esac
+      else
+        info "略過 docker 群組設定。日後可執行：bash $DOCKER_GROUP_INSTALLER"
+        warn "未加入群組時，開機流程中的 web 平台（start_web_docker.sh）會起不來。"
+        DOCKER_GROUP_STATUS="使用者略過"
+      fi
     fi
   fi
-fi
+}
 
 # --- 週期排程設定（scheduler/install_timers.sh + sudoers 白名單） ----------
 # 與開機自動執行同屬「需使用者留意的一次性設定」：
@@ -640,109 +662,111 @@ fi
 #   2) reboot / teamviewer 這兩支 timer 需 root，改由極窄的 /etc/sudoers.d 白名單
 #      放行；安裝白名單需一次性輸入密碼（sudo）——趁部署互動時一併完成。
 # 兩步皆冪等；非互動終端機時不擅自更動，僅印出手動指令。
-TIMERS_INSTALLER="${SHARE_DIR}/scheduler/install_timers.sh"
-SERVICES_INSTALLER="${SHARE_DIR}/scheduler/install_services.sh"
-SUDOERS_SRC="${SHARE_DIR}/scheduler/etc/nssms-scheduler.sudoers"
-SUDOERS_DST="/etc/sudoers.d/nssms-scheduler"
-SCHED_STATUS="未執行"
-SUDOERS_STATUS="未執行"
-SERVICES_STATUS="未執行"
-echo ""
-info "檢查週期排程設定 ..."
-if [ ! -f "$TIMERS_INSTALLER" ]; then
-  warn "找不到 $TIMERS_INSTALLER ，略過週期排程設定。"
-  SCHED_STATUS="略過（找不到安裝腳本）"
-elif [ "$CHECK_ONLY" -eq 1 ]; then
-  # --check-only 不佈署 timer、不裝 sudoers、不重啟 heartbeat;只回報現況。
-  run_rc bash "$TIMERS_INSTALLER" --check-only
-  SCHED_STATUS="僅回報現況$DRYRUN_NOTE"
-  [ -f "$SUDOERS_DST" ] && SUDOERS_STATUS="已存在" || SUDOERS_STATUS="未安裝$DRYRUN_NOTE"
-  if [ -f "$SERVICES_INSTALLER" ]; then
-    run_rc bash "$SERVICES_INSTALLER" --check-only
-    SERVICES_STATUS="僅回報現況$DRYRUN_NOTE"
-  else
-    SERVICES_STATUS="略過（找不到安裝腳本）"
-  fi
-elif [ ! -t 0 ]; then
-  warn "非互動終端機，略過週期排程設定。"
-  warn "如需設定，請手動執行：bash $TIMERS_INSTALLER"
-  warn "reboot / teamviewer 需 sudo 白名單，見 $SUDOERS_SRC 檔頭安裝說明。"
-  SCHED_STATUS="略過（非互動終端機）"
-elif ask_yn "  是否設定週期排程與 ipc 接管（timer + 心跳/接管服務 + sudo 白名單）？[Y/n] " Y; then
-  # 三個動作(timer / sudoers / 常駐服務)刻意只問一題:它們是同一個概念單位,分開問只會
-  # 讓操作者面對三個不知道能不能各自拒絕的問題。
-  mutating "佈署 timer / sudoers / 常駐服務"
-
-  # (1) 佈署 / 啟用 timer（user 層，免 root；失敗只警告不中斷部署）
-  run_rc bash "$TIMERS_INSTALLER"
-  TIMERS_RC="$RC"
-  if [ "$TIMERS_RC" -eq 0 ]; then
-    ok "週期排程 timer 已佈署並啟用。"
-    SCHED_STATUS="已啟用"
-  else
-    warn "週期排程 timer 設定有項目失敗（exit=$TIMERS_RC），請檢視上方訊息。"
-    SCHED_STATUS="部分完成（exit=$TIMERS_RC）"
-  fi
-
-  # (2) sudo 白名單（reboot / teamviewer 需要；此步需輸入密碼一次）
+stage_scheduler_units() {
+  TIMERS_INSTALLER="${SHARE_DIR}/scheduler/install_timers.sh"
+  SERVICES_INSTALLER="${SHARE_DIR}/scheduler/install_services.sh"
+  SUDOERS_SRC="${SHARE_DIR}/scheduler/etc/nssms-scheduler.sudoers"
+  SUDOERS_DST="/etc/sudoers.d/nssms-scheduler"
+  SCHED_STATUS="未執行"
+  SUDOERS_STATUS="未執行"
+  SERVICES_STATUS="未執行"
   echo ""
-  if [ ! -f "$SUDOERS_SRC" ]; then
-    warn "找不到 $SUDOERS_SRC ，略過 sudo 白名單安裝。"
-    warn "未安裝白名單時，reboot / teamviewer 兩支 timer 會因 sudo 需密碼而失敗。"
-    SUDOERS_STATUS="略過（找不到來源檔）"
-  elif [ -f "$SUDOERS_DST" ]; then
-    ok "sudo 白名單已存在（$SUDOERS_DST），沿用現有設定。"
-    SUDOERS_STATUS="已存在"
-  elif ask_yn "  reboot / teamviewer 需 sudo 白名單，現在安裝？（需輸入一次密碼）[Y/n] " Y; then
-    # 以目前使用者名稱套用（來源檔預設 mic-733ao；換人也正確）。
-    CUR_USER="$(id -un)"
-    TMP_SUDOERS="$(mktemp)"
-    sed "s/^mic-733ao /${CUR_USER} /" "$SUDOERS_SRC" > "$TMP_SUDOERS"
-    # 先驗證語法（絕不安裝壞掉的 sudoers，以免打壞整個 sudo）。
-    if sudo visudo -c -f "$TMP_SUDOERS" >/dev/null 2>&1; then
-      if sudo install -m 0440 -o root -g root "$TMP_SUDOERS" "$SUDOERS_DST"; then
-        ok "已安裝 sudo 白名單：$SUDOERS_DST"
-        SUDOERS_STATUS="已安裝"
+  info "檢查週期排程設定 ..."
+  if [ ! -f "$TIMERS_INSTALLER" ]; then
+    warn "找不到 $TIMERS_INSTALLER ，略過週期排程設定。"
+    SCHED_STATUS="略過（找不到安裝腳本）"
+  elif [ "$CHECK_ONLY" -eq 1 ]; then
+    # --check-only 不佈署 timer、不裝 sudoers、不重啟 heartbeat;只回報現況。
+    run_rc bash "$TIMERS_INSTALLER" --check-only
+    SCHED_STATUS="僅回報現況$DRYRUN_NOTE"
+    [ -f "$SUDOERS_DST" ] && SUDOERS_STATUS="已存在" || SUDOERS_STATUS="未安裝$DRYRUN_NOTE"
+    if [ -f "$SERVICES_INSTALLER" ]; then
+      run_rc bash "$SERVICES_INSTALLER" --check-only
+      SERVICES_STATUS="僅回報現況$DRYRUN_NOTE"
+    else
+      SERVICES_STATUS="略過（找不到安裝腳本）"
+    fi
+  elif [ ! -t 0 ]; then
+    warn "非互動終端機，略過週期排程設定。"
+    warn "如需設定，請手動執行：bash $TIMERS_INSTALLER"
+    warn "reboot / teamviewer 需 sudo 白名單，見 $SUDOERS_SRC 檔頭安裝說明。"
+    SCHED_STATUS="略過（非互動終端機）"
+  elif ask_yn "  是否設定週期排程與 ipc 接管（timer + 心跳/接管服務 + sudo 白名單）？[Y/n] " Y; then
+    # 三個動作(timer / sudoers / 常駐服務)刻意只問一題:它們是同一個概念單位,分開問只會
+    # 讓操作者面對三個不知道能不能各自拒絕的問題。
+    mutating "佈署 timer / sudoers / 常駐服務"
+
+    # (1) 佈署 / 啟用 timer（user 層，免 root；失敗只警告不中斷部署）
+    run_rc bash "$TIMERS_INSTALLER"
+    TIMERS_RC="$RC"
+    if [ "$TIMERS_RC" -eq 0 ]; then
+      ok "週期排程 timer 已佈署並啟用。"
+      SCHED_STATUS="已啟用"
+    else
+      warn "週期排程 timer 設定有項目失敗（exit=$TIMERS_RC），請檢視上方訊息。"
+      SCHED_STATUS="部分完成（exit=$TIMERS_RC）"
+    fi
+
+    # (2) sudo 白名單（reboot / teamviewer 需要；此步需輸入密碼一次）
+    echo ""
+    if [ ! -f "$SUDOERS_SRC" ]; then
+      warn "找不到 $SUDOERS_SRC ，略過 sudo 白名單安裝。"
+      warn "未安裝白名單時，reboot / teamviewer 兩支 timer 會因 sudo 需密碼而失敗。"
+      SUDOERS_STATUS="略過（找不到來源檔）"
+    elif [ -f "$SUDOERS_DST" ]; then
+      ok "sudo 白名單已存在（$SUDOERS_DST），沿用現有設定。"
+      SUDOERS_STATUS="已存在"
+    elif ask_yn "  reboot / teamviewer 需 sudo 白名單，現在安裝？（需輸入一次密碼）[Y/n] " Y; then
+      # 以目前使用者名稱套用（來源檔預設 mic-733ao；換人也正確）。
+      CUR_USER="$(id -un)"
+      TMP_SUDOERS="$(mktemp)"
+      sed "s/^mic-733ao /${CUR_USER} /" "$SUDOERS_SRC" > "$TMP_SUDOERS"
+      # 先驗證語法（絕不安裝壞掉的 sudoers，以免打壞整個 sudo）。
+      if sudo visudo -c -f "$TMP_SUDOERS" >/dev/null 2>&1; then
+        if sudo install -m 0440 -o root -g root "$TMP_SUDOERS" "$SUDOERS_DST"; then
+          ok "已安裝 sudo 白名單：$SUDOERS_DST"
+          SUDOERS_STATUS="已安裝"
+        else
+          warn "sudo 白名單安裝失敗（install 失敗）。"
+          SUDOERS_STATUS="安裝失敗"
+        fi
       else
-        warn "sudo 白名單安裝失敗（install 失敗）。"
-        SUDOERS_STATUS="安裝失敗"
+        warn "sudo 白名單語法驗證未通過，未安裝（避免打壞 sudo）。"
+        SUDOERS_STATUS="驗證失敗（未安裝）"
       fi
+      rm -f "$TMP_SUDOERS"
     else
-      warn "sudo 白名單語法驗證未通過，未安裝（避免打壞 sudo）。"
-      SUDOERS_STATUS="驗證失敗（未安裝）"
+      info "略過 sudo 白名單安裝。日後可依 $SUDOERS_SRC 檔頭說明手動安裝。"
+      SUDOERS_STATUS="使用者略過"
     fi
-    rm -f "$TMP_SUDOERS"
-  else
-    info "略過 sudo 白名單安裝。日後可依 $SUDOERS_SRC 檔頭說明手動安裝。"
-    SUDOERS_STATUS="使用者略過"
-  fi
 
-  # (3) 常駐服務（user 層,免 root）：
-  #     nssms-heartbeat（兩台都裝,角色自動分派）
-  #     nssms-alarm-controller / nssms-board-server / nssms-button
-  #       （硬體實體綁 IPC-1,unit 內有 ExecCondition 自行判定,兩台裝同一份即可）
-  #
-  #     舊 clink_* 的停用**必須排在這之前**（見上方一次性遷移段）：舊的 system unit 還
-  #     活著時，新 unit 會撞 port。這裡只負責裝。
-  echo ""
-  if [ ! -f "$SERVICES_INSTALLER" ]; then
-    warn "找不到 $SERVICES_INSTALLER ，略過常駐服務安裝。"
-    SERVICES_STATUS="略過（找不到安裝腳本）"
-  else
-    run_rc bash "$SERVICES_INSTALLER"
-    SV_RC="$RC"
-    if [ "$SV_RC" -eq 0 ]; then
-      ok "常駐服務已佈署並啟用（heartbeat / alarm / board / button）。"
-      SERVICES_STATUS="已啟用"
+    # (3) 常駐服務（user 層,免 root）：
+    #     nssms-heartbeat（兩台都裝,角色自動分派）
+    #     nssms-alarm-controller / nssms-board-server / nssms-button
+    #       （硬體實體綁 IPC-1,unit 內有 ExecCondition 自行判定,兩台裝同一份即可）
+    #
+    #     舊 clink_* 的停用**必須排在這之前**（見上方一次性遷移段）：舊的 system unit 還
+    #     活著時，新 unit 會撞 port。這裡只負責裝。
+    echo ""
+    if [ ! -f "$SERVICES_INSTALLER" ]; then
+      warn "找不到 $SERVICES_INSTALLER ，略過常駐服務安裝。"
+      SERVICES_STATUS="略過（找不到安裝腳本）"
     else
-      warn "常駐服務安裝有項目失敗（exit=$SV_RC），請檢視上方訊息。"
-      SERVICES_STATUS="部分完成（exit=$SV_RC）"
+      run_rc bash "$SERVICES_INSTALLER"
+      SV_RC="$RC"
+      if [ "$SV_RC" -eq 0 ]; then
+        ok "常駐服務已佈署並啟用（heartbeat / alarm / board / button）。"
+        SERVICES_STATUS="已啟用"
+      else
+        warn "常駐服務安裝有項目失敗（exit=$SV_RC），請檢視上方訊息。"
+        SERVICES_STATUS="部分完成（exit=$SV_RC）"
+      fi
     fi
+  else
+    info "略過週期排程設定。日後可執行：bash $TIMERS_INSTALLER"
+    SCHED_STATUS="使用者略過"
   fi
-else
-  info "略過週期排程設定。日後可執行：bash $TIMERS_INSTALLER"
-  SCHED_STATUS="使用者略過"
-fi
+}
 
 # --- 是否於部署完成後立即執行完整啟動流程（只收集決定，執行在最後面） ------
 # 到目前為止只做完「一次性設定」:身分、systemd 骨架、sudoers。各專案的**程式碼、環境安裝
@@ -755,144 +779,143 @@ fi
 # 都該集中在最前面。(而且啟動流程本身可能要數分鐘,問完就能一路跑到底。)
 #
 # 選 n 也不會壞:只要前面的開機 unit 裝成功了,下次開機 nssms-boot 就會跑同一支啟動器。
-LAUNCHER="${SHARE_DIR}/scheduler/reboot_launcher.sh"
-LAUNCH_STATUS="未執行"
-LAUNCH_DECISION="skip"
-echo ""
-info "檢查是否於部署完成後立即執行完整啟動流程 ..."
-if [ "$CHECK_ONLY" -eq 1 ]; then
-  warn "--check-only:不執行啟動流程。$DRYRUN_NOTE"
-  LAUNCH_STATUS="略過（--check-only）"
-elif [ "$RUN_LAUNCH" -eq 0 ]; then
-  info "--no-launch:略過啟動流程。"
-  LAUNCH_STATUS="略過（--no-launch）"
-elif [ ! -f "$LAUNCHER" ]; then
-  warn "找不到 $LAUNCHER ，略過啟動流程。"
-  LAUNCH_STATUS="略過（找不到啟動器）"
-elif [ ! -t 0 ]; then
-  warn "非互動終端機:不擅自啟動服務。"
-  warn "如需啟動請於部署後執行:bash $LAUNCHER"
-  LAUNCH_STATUS="略過（非互動終端機）"
-else
-  info "它會:掛載資料碟 → SFTP 拉最新程式碼 → 安裝各專案環境 → 啟動服務。"
-  info "首次部署沒有 launcher_state.json,所以是全相位套用,可能需要數分鐘。"
-  info "會在本腳本的最後、健康檢查之前執行(這之後不再需要你輸入任何東西)。"
-  if [ "${DEPLOY_VSL_UPPER:-}" = "CLINK" ]; then
-    warn "本機 vsl_name=CLINK(開發機):update_booster 會刻意略過整個 OTA,"
-    warn "所以**不會**下載程式碼,只會用機上現有版本啟動。"
-  fi
-  if ask_yn "  部署完成後立即執行?（選 n 則下次開機由 nssms-boot 自動跑）[Y/n] " Y; then
-    LAUNCH_DECISION="run"; ok "已排入:部署完成後會執行一次完整啟動流程。"
+stage_launch_decision() {
+  LAUNCHER="${SHARE_DIR}/scheduler/reboot_launcher.sh"
+  LAUNCH_STATUS="未執行"
+  LAUNCH_DECISION="skip"
+  echo ""
+  info "檢查是否於部署完成後立即執行完整啟動流程 ..."
+  if [ "$CHECK_ONLY" -eq 1 ]; then
+    warn "--check-only:不執行啟動流程。$DRYRUN_NOTE"
+    LAUNCH_STATUS="略過（--check-only）"
+  elif [ "$RUN_LAUNCH" -eq 0 ]; then
+    info "--no-launch:略過啟動流程。"
+    LAUNCH_STATUS="略過（--no-launch）"
+  elif [ ! -f "$LAUNCHER" ]; then
+    warn "找不到 $LAUNCHER ，略過啟動流程。"
+    LAUNCH_STATUS="略過（找不到啟動器）"
+  elif [ ! -t 0 ]; then
+    warn "非互動終端機:不擅自啟動服務。"
+    warn "如需啟動請於部署後執行:bash $LAUNCHER"
+    LAUNCH_STATUS="略過（非互動終端機）"
   else
-    LAUNCH_STATUS="使用者略過"
-    info "略過。下次開機 nssms-boot 會自動執行,或手動:bash $LAUNCHER"
+    info "它會:掛載資料碟 → SFTP 拉最新程式碼 → 安裝各專案環境 → 啟動服務。"
+    info "首次部署沒有 launcher_state.json,所以是全相位套用,可能需要數分鐘。"
+    info "會在本腳本的最後、健康檢查之前執行(這之後不再需要你輸入任何東西)。"
+    if [ "${DEPLOY_VSL_UPPER:-}" = "CLINK" ]; then
+      warn "本機 vsl_name=CLINK(開發機):update_booster 會刻意略過整個 OTA,"
+      warn "所以**不會**下載程式碼,只會用機上現有版本啟動。"
+    fi
+    if ask_yn "  部署完成後立即執行?（選 n 則下次開機由 nssms-boot 自動跑）[Y/n] " Y; then
+      LAUNCH_DECISION="run"; ok "已排入:部署完成後會執行一次完整啟動流程。"
+    else
+      LAUNCH_STATUS="使用者略過"
+      info "略過。下次開機 nssms-boot 會自動執行,或手動:bash $LAUNCHER"
+    fi
   fi
-fi
+}
 
-echo ""
-info "以下不再需要任何輸入,可以離開終端機。"
-# 這行宣告從此變成可執行的約束:之後任何提示都會讓 ask_yn 當場中止（見它的註解）。
-# 原本這條不變式只靠 scheduler/tests/test_first_deploy.sh 比對「檔案裡最後一個讀取提示
-# 的行號」來守,那是文字層面的近似;提示全部改走 ask_yn 之後行號已經守不住,改由執行期把關。
-NO_MORE_INPUT=1
 
-if [ ! -d "$WHEELHOUSE" ]; then
-  err "wheelhouse 目錄不存在：$WHEELHOUSE"; exit 1
-fi
-WHL_COUNT=$(find "$WHEELHOUSE" -maxdepth 1 -name '*.whl' | wc -l | tr -d ' ')
-if [ "$WHL_COUNT" -eq 0 ]; then
-  err "wheelhouse 內沒有任何 .whl 檔案"; exit 1
-fi
-ok "找到 $WHL_COUNT 個 wheel 檔案"
-
-# 建立 venv 改用 python3.10 -m virtualenv（與 radar / SHM 一致，不再依賴系統
-# python3-venv / ensurepip）。若目標直譯器尚未安裝 virtualenv，先以隨附的離線
-# 安裝腳本補齊（install_virtualenv_offline.sh + virtualenv_wheels/）。
-VENV_INSTALLER="${SCRIPT_DIR}/install_virtualenv_offline.sh"
-if "$PYTHON_BIN" -m virtualenv --version >/dev/null 2>&1; then
-  ok "virtualenv 可用：$("$PYTHON_BIN" -m virtualenv --version 2>&1 | awk '{print $2}')"
-elif [ "$CHECK_ONLY" -eq 1 ]; then
-  # --check-only 只驗證、不安裝；僅回報缺 virtualenv，實際部署時才會離線補齊。
-  warn "$PYTHON_BIN 尚未安裝 virtualenv（--check-only 不進行安裝）。"
-  warn "實際部署時將以 $VENV_INSTALLER 離線補齊。"
-else
-  warn "$PYTHON_BIN 尚未安裝 virtualenv，將以隨附腳本離線安裝 ..."
-  if [ ! -f "$VENV_INSTALLER" ]; then
-    err "找不到離線安裝腳本：$VENV_INSTALLER"; exit 1
+stage_wheelhouse_and_venv() {
+  if [ ! -d "$WHEELHOUSE" ]; then
+    err "wheelhouse 目錄不存在：$WHEELHOUSE"; exit 1
   fi
-  bash "$VENV_INSTALLER"
-  if ! "$PYTHON_BIN" -m virtualenv --version >/dev/null 2>&1; then
-    err "virtualenv 離線安裝後，$PYTHON_BIN 仍無法使用（可能裝到了其他解譯器）。"
-    err "請確認 $PYTHON_BIN 與 install_virtualenv_offline.sh 選用的解譯器一致。"
-    exit 1
+  WHL_COUNT=$(find "$WHEELHOUSE" -maxdepth 1 -name '*.whl' | wc -l | tr -d ' ')
+  if [ "$WHL_COUNT" -eq 0 ]; then
+    err "wheelhouse 內沒有任何 .whl 檔案"; exit 1
   fi
-  ok "virtualenv 離線安裝完成並可用：$("$PYTHON_BIN" -m virtualenv --version 2>&1 | awk '{print $2}')"
-fi
+  ok "找到 $WHL_COUNT 個 wheel 檔案"
 
-# --- 校驗 wheel 完整性 ------------------------------------------------------
-if [ "$SKIP_VERIFY" -eq 0 ] && [ -f "$MANIFEST" ]; then
-  info "以 MANIFEST.txt 校驗 wheel sha256 ..."
-  if ( cd "$WHEELHOUSE" && grep -E '^[0-9a-f]{64}  ' "$MANIFEST" | sha256sum -c --quiet ) 2>/dev/null; then
-    ok "所有 wheel 檔案 sha256 校驗通過"
+  # 建立 venv 改用 python3.10 -m virtualenv（與 radar / SHM 一致，不再依賴系統
+  # python3-venv / ensurepip）。若目標直譯器尚未安裝 virtualenv，先以隨附的離線
+  # 安裝腳本補齊（install_virtualenv_offline.sh + virtualenv_wheels/）。
+  VENV_INSTALLER="${SCRIPT_DIR}/install_virtualenv_offline.sh"
+  if "$PYTHON_BIN" -m virtualenv --version >/dev/null 2>&1; then
+    ok "virtualenv 可用：$("$PYTHON_BIN" -m virtualenv --version 2>&1 | awk '{print $2}')"
+  elif [ "$CHECK_ONLY" -eq 1 ]; then
+    # --check-only 只驗證、不安裝；僅回報缺 virtualenv，實際部署時才會離線補齊。
+    warn "$PYTHON_BIN 尚未安裝 virtualenv（--check-only 不進行安裝）。"
+    warn "實際部署時將以 $VENV_INSTALLER 離線補齊。"
   else
-    err "wheel 校驗失敗，檔案可能損毀或被竄改。可用 --skip-verify 強制略過。"; exit 1
+    warn "$PYTHON_BIN 尚未安裝 virtualenv，將以隨附腳本離線安裝 ..."
+    if [ ! -f "$VENV_INSTALLER" ]; then
+      err "找不到離線安裝腳本：$VENV_INSTALLER"; exit 1
+    fi
+    bash "$VENV_INSTALLER"
+    if ! "$PYTHON_BIN" -m virtualenv --version >/dev/null 2>&1; then
+      err "virtualenv 離線安裝後，$PYTHON_BIN 仍無法使用（可能裝到了其他解譯器）。"
+      err "請確認 $PYTHON_BIN 與 install_virtualenv_offline.sh 選用的解譯器一致。"
+      exit 1
+    fi
+    ok "virtualenv 離線安裝完成並可用：$("$PYTHON_BIN" -m virtualenv --version 2>&1 | awk '{print $2}')"
   fi
-else
-  warn "略過 wheel sha256 校驗"
-fi
 
-if [ "$CHECK_ONLY" -eq 1 ]; then
-  ok "--check-only 完成：環境與 wheel 皆就緒，未執行安裝。"
-  exit 0
-fi
-
-# --- 建立 / 沿用 venv ------------------------------------------------------
-VENV_PY="${VENV_DIR}/bin/python"
-if [ "$RECREATE" -eq 1 ] && [ -d "$VENV_DIR" ]; then
-  warn "--recreate：移除既有 venv $VENV_DIR"
-  rm -rf "$VENV_DIR"
-fi
-
-if [ -x "$VENV_PY" ]; then
-  ok "沿用既有 venv：$VENV_DIR"
-else
-  info "建立專屬 venv（$PYTHON_BIN -m virtualenv，離線，含 pip）..."
-  mkdir -p "$(dirname "$VENV_DIR")"
-  "$PYTHON_BIN" -m virtualenv "$VENV_DIR"
-  if [ ! -x "$VENV_PY" ]; then
-    err "venv 建立失敗：找不到 $VENV_PY"; exit 1
+  # --- 校驗 wheel 完整性 ------------------------------------------------------
+  if [ "$SKIP_VERIFY" -eq 0 ] && [ -f "$MANIFEST" ]; then
+    info "以 MANIFEST.txt 校驗 wheel sha256 ..."
+    if ( cd "$WHEELHOUSE" && grep -E '^[0-9a-f]{64}  ' "$MANIFEST" | sha256sum -c --quiet ) 2>/dev/null; then
+      ok "所有 wheel 檔案 sha256 校驗通過"
+    else
+      err "wheel 校驗失敗，檔案可能損毀或被竄改。可用 --skip-verify 強制略過。"; exit 1
+    fi
+  else
+    warn "略過 wheel sha256 校驗"
   fi
-  ok "venv 建立完成"
-fi
-info "venv pip 版本 : $("$VENV_PY" -m pip --version 2>/dev/null | awk '{print $2}')"
 
-# --- 執行離線安裝 ----------------------------------------------------------
-RUNTIME_PKGS=(paramiko bcrypt cryptography pynacl cffi pycparser invoke typing-extensions)
-TEST_PKGS=(pytest pytest-cov coverage pluggy iniconfig packaging pygments tomli exceptiongroup)
+  if [ "$CHECK_ONLY" -eq 1 ]; then
+    ok "--check-only 完成：環境與 wheel 皆就緒，未執行安裝。"
+    exit 0
+  fi
 
-PKGS=("${RUNTIME_PKGS[@]}")
-if [ "$INSTALL_TESTS" -eq 1 ]; then
-  PKGS+=("${TEST_PKGS[@]}")
-  info "安裝範圍      : 執行期相依 + 測試堆疊 (pytest；預設)"
-else
-  info "安裝範圍      : 執行期相依 (paramiko 堆疊；--skip-tests)"
-fi
+  # --- 建立 / 沿用 venv ------------------------------------------------------
+  VENV_PY="${VENV_DIR}/bin/python"
+  if [ "$RECREATE" -eq 1 ] && [ -d "$VENV_DIR" ]; then
+    warn "--recreate：移除既有 venv $VENV_DIR"
+    rm -rf "$VENV_DIR"
+  fi
 
-info "開始離線安裝到 venv（--no-index，不連外網）..."
-run_rc "$VENV_PY" -m pip install \
-  --no-index \
-  --find-links "$WHEELHOUSE" \
-  --upgrade \
-  "${PKGS[@]}"
-PIP_RC="$RC"
-if [ "$PIP_RC" -ne 0 ]; then
-  err "pip 安裝失敗（exit=$PIP_RC）。"; exit "$PIP_RC"
-fi
-ok "套件安裝完成"
+  if [ -x "$VENV_PY" ]; then
+    ok "沿用既有 venv：$VENV_DIR"
+  else
+    info "建立專屬 venv（$PYTHON_BIN -m virtualenv，離線，含 pip）..."
+    mkdir -p "$(dirname "$VENV_DIR")"
+    "$PYTHON_BIN" -m virtualenv "$VENV_DIR"
+    if [ ! -x "$VENV_PY" ]; then
+      err "venv 建立失敗：找不到 $VENV_PY"; exit 1
+    fi
+    ok "venv 建立完成"
+  fi
+  info "venv pip 版本 : $("$VENV_PY" -m pip --version 2>/dev/null | awk '{print $2}')"
 
-# --- 安裝後驗證 ------------------------------------------------------------
-info "在 venv 內驗證關鍵套件可正常匯入 ..."
-"$VENV_PY" - <<'PY'
+  # --- 執行離線安裝 ----------------------------------------------------------
+  RUNTIME_PKGS=(paramiko bcrypt cryptography pynacl cffi pycparser invoke typing-extensions)
+  TEST_PKGS=(pytest pytest-cov coverage pluggy iniconfig packaging pygments tomli exceptiongroup)
+
+  PKGS=("${RUNTIME_PKGS[@]}")
+  if [ "$INSTALL_TESTS" -eq 1 ]; then
+    PKGS+=("${TEST_PKGS[@]}")
+    info "安裝範圍      : 執行期相依 + 測試堆疊 (pytest；預設)"
+  else
+    info "安裝範圍      : 執行期相依 (paramiko 堆疊；--skip-tests)"
+  fi
+
+  info "開始離線安裝到 venv（--no-index，不連外網）..."
+  run_rc "$VENV_PY" -m pip install \
+    --no-index \
+    --find-links "$WHEELHOUSE" \
+    --upgrade \
+    "${PKGS[@]}"
+  PIP_RC="$RC"
+  if [ "$PIP_RC" -ne 0 ]; then
+    err "pip 安裝失敗（exit=$PIP_RC）。"; exit "$PIP_RC"
+  fi
+  ok "套件安裝完成"
+
+  # --- 安裝後驗證 ------------------------------------------------------------
+  info "在 venv 內驗證關鍵套件可正常匯入 ..."
+  # 以下到 PY 為止刻意不縮排:heredoc 的終止符不允許有前導空白,而中間是 Python 程式
+  # —— 跟著函式縮排就是不同的程式(IndentationError)。請不要「順手對齊」它。
+  "$VENV_PY" - <<'PY'
 import importlib, sys
 mods = ["paramiko", "cryptography", "nacl", "bcrypt", "cffi"]
 fail = False
@@ -906,116 +929,106 @@ for m in mods:
         fail = True
 sys.exit(1 if fail else 0)
 PY
-ok "匯入驗證通過"
+  ok "匯入驗證通過"
 
-echo "-----------------------------------------------------------"
-ok "離線部署完成！專屬 venv：$VENV_DIR"
+  echo "-----------------------------------------------------------"
+  ok "離線部署完成！專屬 venv：$VENV_DIR"
+}
 
 # --- 執行完整啟動流程（決定已在前面收集，這裡只執行） ----------------------
 # 刻意放在 venv 之後:update_booster 的 SFTP 下載要用 sftp_transfer 的 venv。
 # 也刻意放在健康檢查**之前**:服務起來之後,那份巡檢才第一次真的有意義
 #(否則 tmux 段永遠是「預期 session 不存在」,報告等於白給)。
 # 這裡不再詢問任何事 —— 所有互動都集中在前面,這之後全程無人干預。
-if [ "$LAUNCH_DECISION" = "run" ]; then
-  echo ""
-  echo "── 執行完整啟動流程（reboot_launcher.sh）──"
-  run_rc bash "$LAUNCHER"
-  LAUNCH_RC="$RC"
-  if [ "$LAUNCH_RC" -eq 0 ]; then
-    ok "啟動流程完成（所有項目成功）。"
-    LAUNCH_STATUS="已完成"
-  else
-    # 啟動器對個別項目失敗是「記錄並繼續」,所以非 0 代表有項目失敗而非整體中止。
-    warn "啟動流程有項目失敗（exit=$LAUNCH_RC）。詳見上方總結與"
-    warn "  ${SHARE_DIR}/scheduler/logs/launcher.log"
-    LAUNCH_STATUS="有項目失敗（exit=$LAUNCH_RC）"
+stage_launch_exec() {
+  if [ "$LAUNCH_DECISION" = "run" ]; then
+    echo ""
+    echo "── 執行完整啟動流程（reboot_launcher.sh）──"
+    run_rc bash "$LAUNCHER"
+    LAUNCH_RC="$RC"
+    if [ "$LAUNCH_RC" -eq 0 ]; then
+      ok "啟動流程完成（所有項目成功）。"
+      LAUNCH_STATUS="已完成"
+    else
+      # 啟動器對個別項目失敗是「記錄並繼續」,所以非 0 代表有項目失敗而非整體中止。
+      warn "啟動流程有項目失敗（exit=$LAUNCH_RC）。詳見上方總結與"
+      warn "  ${SHARE_DIR}/scheduler/logs/launcher.log"
+      LAUNCH_STATUS="有項目失敗（exit=$LAUNCH_RC）"
+    fi
   fi
-fi
+}
 
 # --- 部署後自動健康檢查 ----------------------------------------------------
-HEALTH_RC=0
-if [ "$RUN_HEALTH" -eq 1 ]; then
-  if [ -f "$SCRIPT_DIR/health_check.py" ]; then
-    echo ""
-    info "自動執行健康檢查（能力測試 + SFTP 連線 + 健康報告）..."
-    echo "==========================================================="
-    # 未安裝測試堆疊（--skip-tests）時，轉傳 --skip-tests 讓 health_check 直接略過
-    # 單元測試那一項（記 INFO 而非 WARN）。預設有裝 pytest 時則實際跑測試。
-    HEALTH_ARGS=()
-    [ "$INSTALL_TESTS" -eq 0 ] && HEALTH_ARGS+=(--skip-tests)
-    run_rc "$VENV_PY" "$SCRIPT_DIR/health_check.py" "${HEALTH_ARGS[@]}"
-    HEALTH_RC="$RC"
-    echo "==========================================================="
-    if [ "$HEALTH_RC" -eq 0 ]; then
-      ok "健康檢查結果：HEALTHY"
+stage_health_check() {
+  HEALTH_RC=0
+  if [ "$RUN_HEALTH" -eq 1 ]; then
+    if [ -f "$SCRIPT_DIR/health_check.py" ]; then
+      echo ""
+      info "自動執行健康檢查（能力測試 + SFTP 連線 + 健康報告）..."
+      echo "==========================================================="
+      # 未安裝測試堆疊（--skip-tests）時，轉傳 --skip-tests 讓 health_check 直接略過
+      # 單元測試那一項（記 INFO 而非 WARN）。預設有裝 pytest 時則實際跑測試。
+      HEALTH_ARGS=()
+      [ "$INSTALL_TESTS" -eq 0 ] && HEALTH_ARGS+=(--skip-tests)
+      run_rc "$VENV_PY" "$SCRIPT_DIR/health_check.py" "${HEALTH_ARGS[@]}"
+      HEALTH_RC="$RC"
+      echo "==========================================================="
+      if [ "$HEALTH_RC" -eq 0 ]; then
+        ok "健康檢查結果：HEALTHY"
+      else
+        warn "健康檢查發現問題（exit=$HEALTH_RC），請檢視上方報告。"
+      fi
     else
-      warn "健康檢查發現問題（exit=$HEALTH_RC），請檢視上方報告。"
+      warn "找不到 health_check.py，略過自動健康檢查。"
     fi
   else
-    warn "找不到 health_check.py，略過自動健康檢查。"
+    info "已指定 --no-health-check，略過能力健康檢查。"
   fi
-else
-  info "已指定 --no-health-check，略過能力健康檢查。"
-fi
+}
 
 # --- 隱性自動化存活巡檢 ----------------------------------------------------
 # 放在部署流程最後，以實際 systemd 狀態驗證：user manager / linger / unit /
 # timer / sudoers / heartbeat / tmux。使用 --compact --fail-on-warn，部署畫面
 # 只顯示 WARN/FAIL 與總結；完整明細仍寫入 logs/automation_health_report_<時間>.md。
 # wave 尚未提供時由巡檢器列為 SKIP，不影響整體健康。
-AUTOMATION_CHECKER="${SCRIPT_DIR}/automation_health_check.py"
-AUTOMATION_RC=0
-AUTOMATION_STATUS="未執行"
-if [ "$RUN_HEALTH" -eq 1 ]; then
-  echo ""
-  info "執行隱性自動化存活巡檢（compact）..."
-  if [ -f "$AUTOMATION_CHECKER" ]; then
-    run_rc "$PYTHON_BIN" "$AUTOMATION_CHECKER" --compact --fail-on-warn
-    AUTOMATION_RC="$RC"
-    case "$AUTOMATION_RC" in
-      0)
-        ok "自動化存活巡檢：HEALTHY"
-        AUTOMATION_STATUS="HEALTHY"
-        ;;
-      1)
-        warn "自動化存活巡檢：UNHEALTHY（有 FAIL；請查看上方與 Markdown 報告）"
-        AUTOMATION_STATUS="UNHEALTHY（exit=1）"
-        ;;
-      2)
-        warn "自動化存活巡檢：DEGRADED（有 WARN；請查看上方與 Markdown 報告）"
-        AUTOMATION_STATUS="DEGRADED（exit=2）"
-        ;;
-      *)
-        warn "自動化存活巡檢未預期結束（exit=$AUTOMATION_RC）"
-        AUTOMATION_STATUS="執行異常（exit=$AUTOMATION_RC）"
-        ;;
-    esac
+stage_automation_check() {
+  AUTOMATION_CHECKER="${SCRIPT_DIR}/automation_health_check.py"
+  AUTOMATION_RC=0
+  AUTOMATION_STATUS="未執行"
+  if [ "$RUN_HEALTH" -eq 1 ]; then
+    echo ""
+    info "執行隱性自動化存活巡檢（compact）..."
+    if [ -f "$AUTOMATION_CHECKER" ]; then
+      run_rc "$PYTHON_BIN" "$AUTOMATION_CHECKER" --compact --fail-on-warn
+      AUTOMATION_RC="$RC"
+      case "$AUTOMATION_RC" in
+        0)
+          ok "自動化存活巡檢：HEALTHY"
+          AUTOMATION_STATUS="HEALTHY"
+          ;;
+        1)
+          warn "自動化存活巡檢：UNHEALTHY（有 FAIL；請查看上方與 Markdown 報告）"
+          AUTOMATION_STATUS="UNHEALTHY（exit=1）"
+          ;;
+        2)
+          warn "自動化存活巡檢：DEGRADED（有 WARN；請查看上方與 Markdown 報告）"
+          AUTOMATION_STATUS="DEGRADED（exit=2）"
+          ;;
+        *)
+          warn "自動化存活巡檢未預期結束（exit=$AUTOMATION_RC）"
+          AUTOMATION_STATUS="執行異常（exit=$AUTOMATION_RC）"
+          ;;
+      esac
+    else
+      warn "找不到 $AUTOMATION_CHECKER，略過自動化存活巡檢。"
+      AUTOMATION_RC=127
+      AUTOMATION_STATUS="略過（找不到巡檢腳本）"
+    fi
   else
-    warn "找不到 $AUTOMATION_CHECKER，略過自動化存活巡檢。"
-    AUTOMATION_RC=127
-    AUTOMATION_STATUS="略過（找不到巡檢腳本）"
+    info "已指定 --no-health-check，略過自動化存活巡檢。"
+    AUTOMATION_STATUS="略過（--no-health-check）"
   fi
-else
-  info "已指定 --no-health-check，略過自動化存活巡檢。"
-  AUTOMATION_STATUS="略過（--no-health-check）"
-fi
-
-echo ""
-echo "── 部署總結 ──"
-# 首次部署最容易搞錯的就是「這台裝成 IPC-1 還是 IPC-2」,而它決定了會啟動哪些服務。
-# 直接印出啟動器實際會採用的有效角色,一眼可見。
-#（DEPLOY_ROLE / DEPLOY_VSL_UPPER 在身分檔定案後就算好了,見上方「由身分檔推導」段。）
-printf "  本機有效角色    ：%s\n" "$DEPLOY_ROLE"
-printf "  開機自動執行設定：%s\n" "$AUTOSTART_STATUS"
-printf "  週期排程 timer   ：%s\n" "$SCHED_STATUS"
-printf "  常駐服務        ：%s\n" "$SERVICES_STATUS"
-printf "  clink_* 遷移    ：%s\n" "$MIGRATE_STATUS"
-printf "  docker 群組      ：%s\n" "$DOCKER_GROUP_STATUS"
-printf "  sudo 白名單      ：%s\n" "$SUDOERS_STATUS"
-[ "$RUN_HEALTH" -eq 1 ] && printf "  健康檢查        ：%s\n" \
-  "$( [ "$HEALTH_RC" -eq 0 ] && echo HEALTHY || echo "有問題（exit=$HEALTH_RC）" )"
-printf "  完整啟動流程    ：%s\n" "$LAUNCH_STATUS"
-printf "  自動化存活巡檢  ：%s\n" "$AUTOMATION_STATUS"
+}
 
 print_verification() {  # 兩條收尾路徑都要印的驗證指令
   echo "    tmux ls                                     # 應列出本角色該有的 session"
@@ -1034,70 +1047,130 @@ print_docker_reboot_warning() {  # 剛加入 docker 群組時,重開機不是建
   esac
 }
 
-echo ""
-# 這一段的文案取決於啟動流程到底跑了沒。原本無條件印「⚠ 尚未完成:服務還沒有啟動」+
-# 「接下來請二選一」,那是 4647125 把啟動流程納進本腳本**之前**的事實 —— 之後就變成
-# 總結上一行剛寫「完整啟動流程:已完成」,下一段卻叫操作者去把服務啟動起來。
-case "$LAUNCH_STATUS" in
-  已完成|有項目失敗*)
-    if [ "$LAUNCH_STATUS" = "已完成" ]; then
-      echo "── 部署完成:服務已啟動 ──"
-      echo "  已依角色 $DEPLOY_ROLE 走完 update+env+run,本角色該有的服務應該都在跑了。"
-    else
-      echo "── ⚠ 部署完成,但啟動流程有項目失敗 ──"
-      echo "  已依角色 $DEPLOY_ROLE 嘗試套用 update+env+run,有項目未成功。"
-      echo "  啟動器對個別項目是「記錄並繼續」,所以其餘服務仍可能正常運作 —— 先看是哪一項:"
-      echo "    tail -50 ${SHARE_DIR}/scheduler/logs/launcher.log"
-    fi
-    echo ""
-    echo "  請驗證:"
-    print_verification
-    echo ""
-    echo "  建議仍在方便時重開機一次,完整走過真實開機路徑(nssms-boot → reboot_launcher):"
-    echo "    sudo reboot"
-    print_docker_reboot_warning
-    ;;
-  *)
-    echo "── ⚠ 尚未完成:服務還沒有啟動 ──"
-    # 沒跑啟動流程時,本腳本就只做了「一次性人工設定」:身分、systemd 骨架、sudoers、
-    # sftp_transfer 的 venv。各專案的程式碼、環境安裝與服務啟動,全部由第一次開機的
-    #   nssms-boot → reboot_launcher.sh → update_booster.sh(OTA)→ 依角色全相位套用
-    # 完成。不講清楚的話,操作者看到上面一排「已啟用」會以為部署完成了。
-    echo "  本次只做了一次性設定(身分 / systemd / sudoers / sftp_transfer venv)。"
-    echo "  各專案的程式碼、環境與服務由第一次開機流程完成:"
-    echo "    nssms-boot → reboot_launcher.sh → update_booster.sh(SFTP 拉最新程式碼)"
-    echo "                                    → 依角色 $DEPLOY_ROLE 套用 update+env+run"
-    echo ""
-    echo "  所以接下來請二選一:"
-    echo "    sudo reboot                                # 建議:完整走一次真實開機流程"
-    echo "    systemctl --user start nssms-boot          # 或立即手動觸發一次(不重開機)"
-    print_docker_reboot_warning
-    echo ""
-    echo "  想先確認會做什麼(不執行任何動作):"
-    echo "    bash ${SHARE_DIR}/scheduler/reboot_launcher.sh --dry-run"
-    echo ""
-    echo "  啟動後的驗證:"
-    print_verification
-    ;;
-esac
-if [ "${DEPLOY_VSL_UPPER:-}" = "CLINK" ]; then
+stage_summary() {
   echo ""
-  warn "  本機 vsl_name=CLINK(開發機):update_booster 會刻意略過整個 OTA,"
-  warn "  所以程式碼**不會**自動下載,需人工放置或 rsync。"
-fi
-echo ""
-echo "啟用 venv："
-echo "  source \"$VENV_DIR/bin/activate\""
-echo ""
-echo "以此 venv 執行工具（不啟用也可以直接用絕對路徑）："
-echo "  \"$VENV_PY\" \"$PROJECT_DIR/main.py\" --cli"
-echo ""
-echo "如需單獨再跑一次健康檢查："
-echo "  \"$VENV_PY\" \"$SCRIPT_DIR/health_check.py\""
-echo ""
-echo "如需單獨再跑一次自動化存活巡檢："
-echo "  \"$PYTHON_BIN\" \"$AUTOMATION_CHECKER\""
-echo "==========================================================="
+  echo "── 部署總結 ──"
+  # 首次部署最容易搞錯的就是「這台裝成 IPC-1 還是 IPC-2」,而它決定了會啟動哪些服務。
+  # 直接印出啟動器實際會採用的有效角色,一眼可見。
+  #（DEPLOY_ROLE / DEPLOY_VSL_UPPER 在身分檔定案後就算好了,見上方「由身分檔推導」段。）
+  printf "  本機有效角色    ：%s\n" "$DEPLOY_ROLE"
+  printf "  開機自動執行設定：%s\n" "$AUTOSTART_STATUS"
+  printf "  週期排程 timer   ：%s\n" "$SCHED_STATUS"
+  printf "  常駐服務        ：%s\n" "$SERVICES_STATUS"
+  printf "  clink_* 遷移    ：%s\n" "$MIGRATE_STATUS"
+  printf "  docker 群組      ：%s\n" "$DOCKER_GROUP_STATUS"
+  printf "  sudo 白名單      ：%s\n" "$SUDOERS_STATUS"
+  [ "$RUN_HEALTH" -eq 1 ] && printf "  健康檢查        ：%s\n" \
+    "$( [ "$HEALTH_RC" -eq 0 ] && echo HEALTHY || echo "有問題（exit=$HEALTH_RC）" )"
+  printf "  完整啟動流程    ：%s\n" "$LAUNCH_STATUS"
+  printf "  自動化存活巡檢  ：%s\n" "$AUTOMATION_STATUS"
 
-# 部署本身成功即回傳 0；健康檢查結果另以訊息呈現，不影響部署離開碼。
-exit 0
+  echo ""
+  # 這一段的文案取決於啟動流程到底跑了沒。原本無條件印「⚠ 尚未完成:服務還沒有啟動」+
+  # 「接下來請二選一」,那是 4647125 把啟動流程納進本腳本**之前**的事實 —— 之後就變成
+  # 總結上一行剛寫「完整啟動流程:已完成」,下一段卻叫操作者去把服務啟動起來。
+  case "$LAUNCH_STATUS" in
+    已完成|有項目失敗*)
+      if [ "$LAUNCH_STATUS" = "已完成" ]; then
+        echo "── 部署完成:服務已啟動 ──"
+        echo "  已依角色 $DEPLOY_ROLE 走完 update+env+run,本角色該有的服務應該都在跑了。"
+      else
+        echo "── ⚠ 部署完成,但啟動流程有項目失敗 ──"
+        echo "  已依角色 $DEPLOY_ROLE 嘗試套用 update+env+run,有項目未成功。"
+        echo "  啟動器對個別項目是「記錄並繼續」,所以其餘服務仍可能正常運作 —— 先看是哪一項:"
+        echo "    tail -50 ${SHARE_DIR}/scheduler/logs/launcher.log"
+      fi
+      echo ""
+      echo "  請驗證:"
+      print_verification
+      echo ""
+      echo "  建議仍在方便時重開機一次,完整走過真實開機路徑(nssms-boot → reboot_launcher):"
+      echo "    sudo reboot"
+      print_docker_reboot_warning
+      ;;
+    *)
+      echo "── ⚠ 尚未完成:服務還沒有啟動 ──"
+      # 沒跑啟動流程時,本腳本就只做了「一次性人工設定」:身分、systemd 骨架、sudoers、
+      # sftp_transfer 的 venv。各專案的程式碼、環境安裝與服務啟動,全部由第一次開機的
+      #   nssms-boot → reboot_launcher.sh → update_booster.sh(OTA)→ 依角色全相位套用
+      # 完成。不講清楚的話,操作者看到上面一排「已啟用」會以為部署完成了。
+      echo "  本次只做了一次性設定(身分 / systemd / sudoers / sftp_transfer venv)。"
+      echo "  各專案的程式碼、環境與服務由第一次開機流程完成:"
+      echo "    nssms-boot → reboot_launcher.sh → update_booster.sh(SFTP 拉最新程式碼)"
+      echo "                                    → 依角色 $DEPLOY_ROLE 套用 update+env+run"
+      echo ""
+      echo "  所以接下來請二選一:"
+      echo "    sudo reboot                                # 建議:完整走一次真實開機流程"
+      echo "    systemctl --user start nssms-boot          # 或立即手動觸發一次(不重開機)"
+      print_docker_reboot_warning
+      echo ""
+      echo "  想先確認會做什麼(不執行任何動作):"
+      echo "    bash ${SHARE_DIR}/scheduler/reboot_launcher.sh --dry-run"
+      echo ""
+      echo "  啟動後的驗證:"
+      print_verification
+      ;;
+  esac
+  if [ "${DEPLOY_VSL_UPPER:-}" = "CLINK" ]; then
+    echo ""
+    warn "  本機 vsl_name=CLINK(開發機):update_booster 會刻意略過整個 OTA,"
+    warn "  所以程式碼**不會**自動下載,需人工放置或 rsync。"
+  fi
+  echo ""
+  echo "啟用 venv："
+  echo "  source \"$VENV_DIR/bin/activate\""
+  echo ""
+  echo "以此 venv 執行工具（不啟用也可以直接用絕對路徑）："
+  echo "  \"$VENV_PY\" \"$PROJECT_DIR/main.py\" --cli"
+  echo ""
+  echo "如需單獨再跑一次健康檢查："
+  echo "  \"$VENV_PY\" \"$SCRIPT_DIR/health_check.py\""
+  echo ""
+  echo "如需單獨再跑一次自動化存活巡檢："
+  echo "  \"$PYTHON_BIN\" \"$AUTOMATION_CHECKER\""
+  echo "==========================================================="
+}
+
+# --- 主流程 ----------------------------------------------------------------
+# 這個函式就是檔頭那份 A/B/C 大綱本身。原本它是一支 1100 行的直線腳本，流程只存在於
+# 檔頭的註解裡 —— 而註解會漂移（A4~A7 的編號就漂過一次），main() 不會跟自己漂移。
+#
+# 定義順序刻意等於呼叫順序：scheduler/tests/test_first_deploy.sh 用「某句註解的行號
+# 先後」來守幾條順序不變式（venv → 啟動 → 巡檢、遷移 → install_services），那些斷言
+# 看的是文字位置，所以搬動段落時文字順序必須跟著執行順序。
+main() {
+  parse_args "$@"
+  banner_and_preflight
+
+  # ---- 階段 A：一次性人工設定（所有需要輸入的東西都在這一段）----
+  announce_check_only
+  stage_vessel_info                  # A1 身分檔（含殘留接管旗標的判讀）
+  compute_identity                   # 由身分檔推導 DEPLOY_ROLE / DEPLOY_VSL_UPPER
+  stage_legacy_failover_state        #    舊格式接管狀態檔
+  stage_autostart                    # A2 nssms-boot.service + linger
+  stage_clink_migration              # A3 舊 clink_* —— **必須早於 A7，否則撞 port**
+  stage_docker_group                 # A4 docker 群組（web 平台開機自啟的前提）
+  stage_scheduler_units              # A5/A6/A7 timer + sudoers + 常駐服務
+  stage_launch_decision              # A8 只收集決定，執行在階段 C
+
+  echo ""
+  info "以下不再需要任何輸入,可以離開終端機。"
+  # 這行宣告從此變成可執行的約束:之後任何提示都會讓 ask_yn 當場中止（見它的註解）。
+  # 原本這條不變式只靠 scheduler/tests/test_first_deploy.sh 比對「檔案裡最後一個讀取提示
+  # 的行號」來守,那是文字層面的近似;提示全部改走 ask_yn 之後行號已經守不住,改由執行期把關。
+  NO_MORE_INPUT=1
+
+  # ---- 階段 B：sftp_transfer 專屬 venv（離線、無人干預）----
+  stage_wheelhouse_and_venv
+
+  # ---- 階段 C：完整啟動流程與驗證（無人干預）----
+  stage_launch_exec                  # 刻意在 venv 之後（SFTP 下載要用它）
+  stage_health_check                 # 也刻意在啟動之後（否則巡檢的 tmux 段沒有意義）
+  stage_automation_check
+  stage_summary
+
+  # 部署本身成功即回傳 0；健康檢查結果另以訊息呈現，不影響部署離開碼。
+  exit 0
+}
+
+main "$@"

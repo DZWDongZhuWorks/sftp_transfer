@@ -23,6 +23,7 @@ from datetime import datetime
 from monitor.log_monitor import (
     TS_FMT,
     _apply_filters,
+    _SEVERITY,
     _counts_str,
     _detail_str,
     _humanize_age,
@@ -32,6 +33,7 @@ from monitor.log_monitor import (
     collect_logs,
     device_detail_lines,
     group_is_problem,
+    read_log_rows,
     sync_logs,
 )
 
@@ -40,6 +42,13 @@ _STATUS_CYCLE = ["all", "ok", "stale", "problem"]
 _PAIR = {"success": 1, "stale": 2, "incomplete": 2, "partial": 3, "aborted": 3}
 _SYNC_LINE_LIMIT = 20
 _ANSI_ESCAPE = re.compile(r"\x1b\[[0-?]*[ -/]*[@-~]")
+_ENTER_KEYS = (10, 13, curses.KEY_ENTER)
+_SORT_CYCLE = ["嚴重度", "更新時間", "裝置名稱"]
+_MODE_ARROW = {"download": "↓", "upload": "↑"}
+# 平坦模式的欄寬（顯示欄）：方向 船 IPC 元件 最後執行 檔案 成/略/失 距今 摘要
+_FLAT_COLS = (1, 10, 6, 20, 11, 5, 9, 8)
+_FLAT_ALIGN = ("left", "left", "left", "left", "left", "right", "right", "left")
+_FLAT_GUTTER = "    "  # 對齊 _draw 的 depth-0 縮排("  ") + 狀態燈("●") + 空白
 
 
 # --- 顯示寬度（CJK 全形字佔 2 欄）------------------------------------------
@@ -72,6 +81,29 @@ def pad_display(s: str, cols: int, align: str = "left") -> str:
     return fill + fs if align == "right" else fs + fill
 
 
+def slice_display(s: str, off: int, cols: int) -> str:
+    """取 s 從「顯示欄」off 起、寬不超過 cols 欄的片段（水平捲動用）。
+
+    不能用字元索引切片：off 落在全形字中間時該字只剩右半可見，改補一格空白佔位，
+    整列才不會左移一欄。右緣沿用 fit_display 的規則，不會吐出半個全形字。
+    """
+    if cols <= 0:
+        return ""
+    out, w = [], 0
+    for c in s:
+        cw = _char_width(c)
+        if w + cw <= off:      # 完全在可視範圍左側
+            w += cw
+            continue
+        if w < off:            # 全形字被 off 切半 → 以空白補其右半
+            out.append(" ")
+            w += cw
+            continue
+        out.append(c)
+        w += cw
+    return fit_display("".join(out), cols)[0]
+
+
 # ---------------------------------------------------------------------------
 # 純資料 / 狀態（無 curses，可測）
 # ---------------------------------------------------------------------------
@@ -96,6 +128,9 @@ class TuiState:
     sel_key: tuple | None = None
     scroll: int = 0
     now: datetime | None = None
+    flat: bool = False                 # True＝平坦模式（不分群，全船隊一張表）
+    sort_key: str = _SORT_CYCLE[0]      # 見 _SORT_CYCLE
+    sort_desc: bool = True             # 預設 嚴重度↓＝最嚴重在前，分群模式等同現行順序
 
 
 def _badge(s) -> str:
@@ -122,6 +157,76 @@ def _device_line(d, now: datetime | None) -> str:
     age = pad_display(_humanize_age(d.last_seen, now) if now else "—", 9)
     detail = fit_display(_detail_str(d), 60)[0]
     return f"{comp} {last} {files} {counts} {age} {detail}"
+
+
+def _flat_cells(cells) -> str:
+    """依 _FLAT_COLS 逐欄 pad 成固定顯示寬（CJK 安全）。
+
+    表頭與內文共用這一個函式，欄位起點由 _FLAT_COLS 這個單一來源保證，
+    不必兩邊各算一次（同 CSV 檢視用 _CSV_PINNED_W 保證對齊的手法）。
+    """
+    fixed = " ".join(
+        pad_display(c, w, a) for c, w, a in zip(cells, _FLAT_COLS, _FLAT_ALIGN)
+    )
+    return f"{fixed} {cells[len(_FLAT_COLS)]}"  # 最後一欄（摘要）不設寬，由 _put 截斷
+
+
+def _device_line_flat(item, now: datetime | None) -> str:
+    """平坦模式的裝置列：沒有分群結構交代身分，故列本身要帶方向/船/IPC。
+
+    方向必須顯示——同一台裝置的下載與上傳是兩筆 DeviceStatus，少了方向兩列會長得一樣。
+    時間用 %m-%d %H:%M 而非 TS_FMT，省 8 欄留給摘要。
+    """
+    d = item.dev
+    rec = d.latest
+    return _flat_cells([
+        _MODE_ARROW.get(rec.mode, "?"),
+        item.vessel,
+        item.ipc,
+        d.component,
+        rec.started_at.strftime("%m-%d %H:%M") if rec.started_at else "—",
+        "—" if rec.file_count is None else str(rec.file_count),
+        _counts_str(rec),
+        _humanize_age(d.last_seen, now) if now else "—",
+        _detail_str(d),
+    ])
+
+
+def flat_header_line() -> str:
+    """平坦模式的欄名列（含 gutter，與內文同欄起點）。
+
+    方向欄只有 1 欄寬，標籤得用半形寬的字：↕ 與資料的 ↓/↑ 同為東亞歧義字（寬 1），
+    寫成全形的「向」會因為塞不進 1 欄而被 pad_display 整個丟掉。
+    """
+    return _FLAT_GUTTER + _flat_cells(
+        ["↕", "船", "IPC", "元件", "最後執行", "檔案", "成/略/失", "距今", "摘要"]
+    )
+
+
+def sort_value(d, key: str):
+    """單一欄位的排序值（純函式）。
+
+    刻意不含 tiebreak：同鍵值的次序交給穩定排序保留「輸入順序」，也就是資料層
+    build_tree 給的 船/IPC/元件 次序。因此預設（嚴重度↓）是可證明的 no-op——
+    build_tree 已依 (-嚴重度, component) 排過，再穩定地依嚴重度降冪排會得到同一份清單。
+    把 tiebreak 寫進 key 反而會被 reverse 一起翻轉，連預設畫面都會變。
+    """
+    if key == "更新時間":
+        # 從未回報（last_seen=None）視為最舊，沿用 log_monitor 的 `or datetime.min` 慣例
+        return d.last_seen or datetime.min
+    if key == "裝置名稱":
+        # casefold：元件名大小寫混雜（RADAR_UPLOADER vs ecdis），純 ASCII 序會把全大寫全推到最前
+        return d.device_name.casefold()
+    return _SEVERITY.get(d.display_status, 0)  # 未知狀態→0，沿用資料層 .get(x, 0) 慣例
+
+
+def sort_devices(devices: list, key: str, desc: bool) -> list:
+    """依欄位排序裝置（穩定，不就地改動來源）。"""
+    return sorted(devices, key=lambda d: sort_value(d, key), reverse=desc)
+
+
+def sort_label(key: str, desc: bool) -> str:
+    return f"排序：{key}{'↓' if desc else '↑'}"
 
 
 def _device_matches(d, state: TuiState) -> bool:
@@ -187,10 +292,66 @@ def flatten_tree(tree, state: TuiState, now: datetime | None) -> list[Row]:
                 )
                 if ikey not in state.expanded:
                     continue
-                for d in dvs:
+                # 群組內也套使用者排序，o/O 在分群模式才不是死鍵；
+                # 這只是 TUI 呈現，build_tree 給的順序不動（HTML/CLI 不受影響）
+                for d in sort_devices(dvs, state.sort_key, state.sort_desc):
                     dkey = ("D", m.mode, v.name, ip.name, d.component)
                     rows.append(Row("device", 3, dkey, _device_line(d, now), d.display_status, d))
     return rows
+
+
+@dataclass
+class FlatItem:
+    """平坦模式一列的來源：裝置＋它在樹裡的群組名。
+
+    群組名取自樹而非 d.vessel/d.ipc——樹已把 None 正規化成 （未分類）/—，而分群模式的
+    key 也是用樹的名字組出來的。取樹才能保證兩邊 key 完全一致，選取才不會在切換時掉。
+    """
+
+    mode: str
+    vessel: str
+    ipc: str
+    dev: object
+
+
+def tree_devices(tree) -> list[FlatItem]:
+    """把樹走回扁平清單（純函式）。
+
+    輸出順序＝資料層既有順序，正是 sort_devices 穩定排序所依賴的天然 tiebreak。
+    走訪樹而不改 load_tree 的簽章：葉節點就是裝置，重走一次是 O(n)，
+    而且只有樹上才有正規化過的群組名。
+    """
+    return [
+        FlatItem(m.mode, v.name, ip.name, d)
+        for m in tree for v in m.vessels for ip in v.ipcs for d in ip.devices
+    ]
+
+
+def flatten_flat(tree, state: TuiState, now: datetime | None) -> list[Row]:
+    """平坦模式：忽略 方向/船/IPC 分群，全船隊裝置壓成單一表格（純函式）。
+
+    全部 depth=0、kind='device'，key 與分群模式同一組 ("D", mode, vessel, ipc, component)。
+    """
+    items = [it for it in tree_devices(tree) if _device_matches(it.dev, state)]
+    items = sorted(
+        items, key=lambda it: sort_value(it.dev, state.sort_key), reverse=state.sort_desc
+    )
+    return [
+        Row(
+            "device",
+            0,
+            ("D", it.mode, it.vessel, it.ipc, it.dev.component),
+            _device_line_flat(it, now),
+            it.dev.display_status,
+            it.dev,
+        )
+        for it in items
+    ]
+
+
+def visible_rows(tree, state: TuiState, now: datetime | None) -> list[Row]:
+    """依 state.flat 選壓平方式；_main_loop 只呼叫這一個，分支不外流到 curses 層。"""
+    return flatten_flat(tree, state, now) if state.flat else flatten_tree(tree, state, now)
 
 
 def all_group_keys(tree) -> list[tuple]:
@@ -256,6 +417,27 @@ def cycle_status(state: TuiState) -> None:
     state.status = _STATUS_CYCLE[(i + 1) % len(_STATUS_CYCLE)]
 
 
+def toggle_flat(state: TuiState) -> None:
+    """切換 平坦 ↔ 分群。
+
+    離開平坦時先把選取裝置的祖先群組展開：兩邊 key 相同，但分群模式只列出「已展開」的
+    裝置，祖先收合著就會被 clamp_selection 彈回第 0 列——游標無故從畫面中間飛到最上面。
+    """
+    state.flat = not state.flat
+    if not state.flat:
+        reveal(state, state.sel_key)
+    state.scroll = 0
+
+
+def cycle_sort(state: TuiState) -> None:
+    i = _SORT_CYCLE.index(state.sort_key) if state.sort_key in _SORT_CYCLE else 0
+    state.sort_key = _SORT_CYCLE[(i + 1) % len(_SORT_CYCLE)]
+
+
+def toggle_sort_dir(state: TuiState) -> None:
+    state.sort_desc = not state.sort_desc
+
+
 def toggle_problem(state: TuiState) -> None:
     state.only_problem = not state.only_problem
 
@@ -298,6 +480,32 @@ def parent_key(key: tuple) -> tuple | None:
     return None
 
 
+def reveal(state: TuiState, key: tuple | None) -> None:
+    """展開 key 的所有祖先群組，讓它在分群模式必然可見。"""
+    k = parent_key(key) if key else None
+    while k:
+        state.expanded.add(k)
+        k = parent_key(k)
+
+
+def collapse_or_parent(state: TuiState, row: Row | None) -> None:
+    """←/h：先收合自己，否則跳回父群；平坦模式沒有父群故不跳。
+
+    平坦模式若跳父群，sel_key 會被設成不存在的 ("I", …)，clamp_selection 只能彈回
+    第 0 列——游標會無故從畫面中間飛到最上面。
+    """
+    if row is None:
+        return
+    if row.kind != "device" and row.key in state.expanded:
+        state.expanded.discard(row.key)
+        return
+    if state.flat:
+        return
+    pk = parent_key(row.key)
+    if pk:
+        state.sel_key = pk
+
+
 def key_action(ch: int) -> str | None:
     """把原始按鍵碼映射成動作標籤（純函式，可測；curses.KEY_* 為模組常數）。"""
     if ch == ord("q"):
@@ -318,7 +526,7 @@ def key_action(ch: int) -> str | None:
         return "expand"
     if ch in (curses.KEY_LEFT, ord("h")):
         return "collapse"
-    if ch in (10, 13, curses.KEY_ENTER, ord(" ")):
+    if ch in _ENTER_KEYS or ch == ord(" "):
         return "enter"
     if ch == ord("E"):
         return "expand_all"
@@ -330,6 +538,12 @@ def key_action(ch: int) -> str | None:
         return "cycle_mode"
     if ch == ord("s"):
         return "cycle_status"
+    if ch == ord("f"):
+        return "toggle_flat"
+    if ch == ord("o"):  # 小寫循環欄位、大寫切換升降，與 CSV 檢視的 s/S 同慣例
+        return "sort_field"
+    if ch == ord("O"):
+        return "sort_dir"
     if ch == ord("/"):
         return "search"
     if ch == ord("r"):
@@ -337,6 +551,160 @@ def key_action(ch: int) -> str | None:
     if ch == ord("?"):
         return "help"
     return None
+
+
+# --- CSV 原始資料檢視的版面（純函式）--------------------------------------
+_CSV_TS_COLS = 19
+_CSV_LEVEL_COLS = 7
+_CSV_PINNED_W = _CSV_TS_COLS + 1 + _CSV_LEVEL_COLS + 1  # 釘住欄佔用的顯示欄數
+_CSV_HSTEP = 8  # ←/→ 一次水平捲動的顯示欄數
+
+# 排序：時間在這份 log 天生單調遞增（單執行緒 logger），依時間排等於原序，故不列入循環。
+_CSV_SORT_CYCLE = ["原序", "級別", "訊息"]
+# 級別依嚴重度而非字母排（字母序會把 ERROR 排在 WARNING 前面純屬巧合）
+_LEVEL_RANK = {"CRITICAL": 5, "ERROR": 4, "WARNING": 3, "INFO": 2, "DEBUG": 1}
+
+
+@dataclass
+class CsvRow:
+    """CSV 一列的顯示用拆解；ts/level 為釘住欄，message 才隨 hoff 水平捲動。"""
+
+    ts: str
+    level: str
+    message: str
+
+
+def _flatten_cell(s: str) -> str:
+    """欄位可能含換行/定位字元（例如例外 repr），攤平成單行免得打斷 curses 版面。"""
+    return "".join(" " if ch < " " else ch for ch in s)
+
+
+def csv_rows(rows: list[list[str]]) -> list[CsvRow]:
+    """把原始 CSV 列拆成顯示用的 CsvRow。
+
+    device_name / version_info 在同一份 log 的每列都相同（`_CSVFileHandler` 的實例屬性），
+    放標題列就好、不佔格線欄位；格線只留 時間｜級別｜訊息。
+    """
+    out: list[CsvRow] = []
+    for row in rows:
+        ts, _dev, _ver, level, message = (list(row) + [""] * 5)[:5]
+        out.append(
+            CsvRow(_flatten_cell(ts), _flatten_cell(level), _flatten_cell(message))
+        )
+    return out
+
+
+def csv_line(row: CsvRow, hoff: int, width: int) -> str:
+    """組出一列：時間/級別釘住不動，只有訊息欄套用水平位移。
+
+    釘住欄一律 pad 到 _CSV_PINNED_W，訊息因此永遠從同一欄開始——表頭與內文的對齊
+    由這個常數保證，不必兩邊各算一次。
+    """
+    pinned = (
+        f"{pad_display(row.ts, _CSV_TS_COLS)} "
+        f"{pad_display(row.level, _CSV_LEVEL_COLS)} "
+    )
+    msg = slice_display(row.message, hoff, max(0, width - _CSV_PINNED_W))
+    return fit_display(pinned + msg, width)[0]
+
+
+def csv_header_line(hoff: int, width: int) -> str:
+    """凍結表頭。訊息欄標籤刻意不隨 hoff 捲走，改用 ←N 標示已捲掉幾欄。"""
+    label = "訊息" if hoff == 0 else f"訊息 ←{hoff}"
+    return csv_line(CsvRow("時間", "級別", label), 0, width)
+
+
+def csv_sort_rows(rows: list[CsvRow], key: str, desc: bool) -> list[CsvRow]:
+    """依欄位排序（穩定）：同鍵值維持原始時間順序，log 的脈絡才不會被打散。"""
+    if key == "級別":
+        ranked = sorted(rows, key=lambda r: _LEVEL_RANK.get(r.level.strip().upper(), 0),
+                        reverse=desc)
+        return ranked
+    if key == "訊息":
+        return sorted(rows, key=lambda r: r.message, reverse=desc)
+    return list(reversed(rows)) if desc else list(rows)  # 原序；反轉＝檔尾最新在前
+
+
+def csv_sort_label(key: str, desc: bool) -> str:
+    return f"排序：{key}{'↓' if desc else '↑'}"
+
+
+@dataclass
+class CsvView:
+    """CSV 檢視的可變狀態（垂直/水平位移與排序），與繪製分離故可單獨測試。"""
+
+    off: int = 0
+    hoff: int = 0
+    sort_key: str = _CSV_SORT_CYCLE[0]
+    desc: bool = False
+
+
+def csv_key_action(ch: int) -> str | None:
+    """CSV 檢視的按鍵映射（純函式，可測；curses.KEY_* 為模組常數）。"""
+    if ch in (ord("q"), ord("Q"), 27):  # 27=Esc：逐層往上回明細
+        return "close"
+    if ch in (curses.KEY_UP, ord("k")):
+        return "up"
+    if ch in (curses.KEY_DOWN, ord("j")):
+        return "down"
+    if ch == curses.KEY_PPAGE:
+        return "pgup"
+    if ch == curses.KEY_NPAGE:
+        return "pgdn"
+    if ch == ord("g"):
+        return "top"
+    if ch == ord("G"):
+        return "bottom"
+    if ch in (curses.KEY_LEFT, ord("h")):
+        return "left"
+    if ch in (curses.KEY_RIGHT, ord("l")):
+        return "right"
+    if ch in (ord("0"), curses.KEY_HOME):
+        return "hreset"
+    if ch == ord("s"):
+        return "sort_col"
+    if ch == ord("S"):
+        return "sort_dir"
+    return None
+
+
+def csv_apply(view: CsvView, action: str, *, total: int, view_h: int) -> None:
+    """就地套用動作（純狀態轉移）；夾回合法範圍交給繪製前的 clamp_* 統一處理。"""
+    if action == "up":
+        view.off -= 1
+    elif action == "down":
+        view.off += 1
+    elif action == "pgup":
+        view.off -= view_h
+    elif action == "pgdn":
+        view.off += view_h
+    elif action == "top":
+        view.off = 0
+    elif action == "bottom":
+        view.off = total
+    elif action == "left":
+        view.hoff -= _CSV_HSTEP
+    elif action == "right":
+        view.hoff += _CSV_HSTEP
+    elif action == "hreset":
+        view.hoff = 0
+    elif action == "sort_col":
+        i = _CSV_SORT_CYCLE.index(view.sort_key)
+        view.sort_key = _CSV_SORT_CYCLE[(i + 1) % len(_CSV_SORT_CYCLE)]
+        view.off = 0  # 換排序後原本的位置已無意義
+    elif action == "sort_dir":
+        view.desc = not view.desc
+        view.off = 0
+
+
+def clamp_scroll(total: int, view_h: int, off: int) -> int:
+    """垂直位移夾在 [0, total - view_h]，view_h 至少 1 列。"""
+    return max(0, min(off, max(0, total - max(1, view_h))))
+
+
+def clamp_hscroll(max_width: int, view_w: int, hoff: int) -> int:
+    """水平位移夾在 [0, 最寬列顯示寬 - 可視寬]，可視寬至少 1 欄。"""
+    return max(0, min(hoff, max(0, max_width - max(1, view_w))))
 
 
 # ---------------------------------------------------------------------------
@@ -358,8 +726,12 @@ def load_tree(args, now: datetime, sync_handler=None):
 _HELP_LINES = [
     "移動      ↑/↓ 或 k/j、PgUp/PgDn、Home/End",
     "展開收合  Enter/Space 開合群組；→/l 展開、←/h 收合（裝置列 ← 跳父群）",
-    "看明細    在裝置列按 Enter",
-    "全部      E 全部展開、C 全部收合",
+    "看明細    在裝置列按 Enter；明細再按 Enter 看該筆 CSV 原始資料",
+    "CSV檢視   ↑↓/PgUp/PgDn/g/G 捲動、←→ 水平捲動、0 復位、s/S 排序、q/Esc 返回",
+    "檢視      f 切換 平坦/分群（平坦＝全船隊一張表，忽略 方向/船/IPC 分群）",
+    "排序      o 循環欄位（嚴重度 / 更新時間 / 裝置名稱）、O 切換升降冪",
+    "          預設 嚴重度↓＝原本的順序；更新時間↑ 最久未更新在前（找失聯裝置）",
+    "全部      E 全部展開、C 全部收合（僅分群模式看得到效果）",
     "過濾      / 搜尋（Esc 清除）、m 循環方向、s 循環狀態、p 只看異常",
     "其他      r 立即重載、? 說明、q 離開",
 ]
@@ -434,6 +806,20 @@ def _put(win, y, x, text, attr, limit):
     return x + w
 
 
+def body_height(maxy: int, state: TuiState) -> int:
+    """可視資料列數：2 行表頭 + 1 行底部提示，平坦模式再多 1 行凍結欄名。"""
+    return max(1, maxy - (4 if state.flat else 3))
+
+
+def footer_hint(state: TuiState) -> str:
+    """底部提示（純函式）：平坦模式沒有群組，展開收合的提示換成排序。"""
+    if state.flat:
+        return (" ↑↓移動  Enter明細  f分群  o欄位/O升降  /搜尋  m方向  s狀態"
+                "  p異常  r重載  ?說明  q離開")
+    return (" ↑↓移動  Enter開合/明細  ←→收展  E/C全展收  f平坦  o/O排序"
+            "  /搜尋  m方向  s狀態  p異常  r重載  ?說明  q離開")
+
+
 def _draw(stdscr, state: TuiState, rows: list[Row], tree, watch: float) -> None:
     stdscr.erase()
     maxy, maxx = stdscr.getmaxyx()
@@ -452,14 +838,16 @@ def _draw(stdscr, state: TuiState, rows: list[Row], tree, watch: float) -> None:
         filt.append(f"搜尋='{state.query}'")
     if watch:
         filt.append(f"每{int(watch)}s刷新")
-    head2 = " 過濾: " + ("、".join(filt) if filt else "（無）")
+    head2 = (f" 檢視: {'平坦' if state.flat else '分群'}｜{sort_label(state.sort_key, state.sort_desc)}"
+             "  過濾: " + ("、".join(filt) if filt else "（無）"))
     _addstr(stdscr, 0, 0, fit_display(head1, width)[0], curses.A_BOLD)
     _addstr(stdscr, 1, 0, fit_display(head2, width)[0], curses.A_DIM)
-    foot = (" ↑↓移動  Enter開合/明細  ←→收展  E/C全展收  /搜尋  m方向  s狀態"
-            "  p異常  r重載  ?說明  q離開")
-    _addstr(stdscr, maxy - 1, 0, pad_display(foot, width), curses.A_REVERSE)
+    _addstr(stdscr, maxy - 1, 0, pad_display(footer_hint(state), width), curses.A_REVERSE)
 
-    top, height = 2, maxy - 3
+    top, height = 2, body_height(maxy, state)
+    if state.flat and maxy > 3:  # 平坦模式是表格，補一行凍結欄名
+        _addstr(stdscr, 2, 0, fit_display(flat_header_line(), width)[0], curses.A_UNDERLINE)
+        top = 3
     if height < 1:
         stdscr.refresh()
         return
@@ -495,19 +883,119 @@ def _draw(stdscr, state: TuiState, rows: list[Row], tree, watch: float) -> None:
     stdscr.refresh()
 
 
-def _popup(stdscr, lines, title="明細"):
+def _popup(stdscr, lines, title="明細", hint=" 任意鍵關閉 "):
+    """置中彈窗；回傳關閉它的按鍵，讓呼叫端能據此再往下鑽一層。"""
     maxy, maxx = stdscr.getmaxyx()
     body = lines or ["（無明細）"]
-    w = min(maxx - 2, max([disp_width(title) + 6] + [disp_width(x) for x in body]) + 4)
+    # hint 也要參與寬度計算：否則明細短、提示長時提示會被切掉
+    w = min(
+        maxx - 2,
+        max([disp_width(title) + 6, disp_width(hint) + 4]
+            + [disp_width(x) for x in body]) + 4,
+    )
     h = min(maxy - 2, len(body) + 4)
     win = curses.newwin(h, w, max(0, (maxy - h) // 2), max(0, (maxx - w) // 2))
     win.box()
     _addstr(win, 0, 2, f" {title} ", curses.A_BOLD)
     for i, ln in enumerate(body[: h - 4]):
         _addstr(win, 2 + i, 2, fit_display(ln, w - 4)[0])
-    _addstr(win, h - 1, 2, " 任意鍵關閉 ", curses.A_DIM)
+    _addstr(win, h - 1, 2, fit_display(hint, w - 4)[0], curses.A_DIM)
     win.refresh()
-    win.getch()
+    return win.getch()
+
+
+def _level_attr(level: str):
+    """CSV 原始列著色：ERROR 紅、WARNING 黃，沿用主畫面既有色對。"""
+    if not curses.has_colors():
+        return 0
+    if level == "ERROR":
+        return curses.color_pair(3)
+    if level == "WARNING":
+        return curses.color_pair(2)
+    return 0
+
+
+def _csv_viewer(stdscr, rec, watch) -> None:
+    """全畫面檢視該筆 log 的 CSV 原始資料（版型仿 STREAM_manager.py 的 _log_viewer）。
+
+    畫在 stdscr 上而非 newwin：curses.wrapper 只對 stdscr 開 keypad(1)，
+    子視窗收不到 curses.KEY_*，←/→、PgUp/PgDn 會失效。
+    """
+    raw, truncated = read_log_rows(rec.path)
+    source = csv_rows(raw)
+    if not source:
+        source = [CsvRow("—", "", f"（無法讀取或無資料：{rec.path}）")]
+    max_msg_w = max(disp_width(r.message) for r in source)
+    dev_name = raw[0][1] if raw else rec.device_name
+    version = raw[0][2] if raw else ""
+
+    view = CsvView()
+    rows = source
+    stdscr.timeout(-1)  # 模態期間阻塞讀鍵，不被 --watch 的 1 秒輪詢打斷
+    try:
+        while True:
+            maxy, maxx = stdscr.getmaxyx()  # 每幀重讀 → 改視窗大小自動重排
+            width = max(1, maxx - 1)
+            view_h = max(1, maxy - 3)
+            msg_w = max(0, width - _CSV_PINNED_W)
+            view.off = clamp_scroll(len(rows), view_h, view.off)
+            view.hoff = clamp_hscroll(max_msg_w, msg_w, view.hoff)
+
+            stdscr.erase()
+            title = f" {rec.path.name}｜{dev_name}"
+            if version:
+                title += f"｜{version}"
+            title += f"｜共 {len(rows)} 筆"
+            if truncated:
+                title += "（已截斷）"
+            title += f"｜{csv_sort_label(view.sort_key, view.desc)}"
+            _addstr(stdscr, 0, 0, pad_display(title, width),
+                    curses.A_REVERSE | curses.A_BOLD)
+            _addstr(stdscr, 1, 0, csv_header_line(view.hoff, width), curses.A_UNDERLINE)
+            for i in range(view_h):
+                idx = view.off + i
+                if idx >= len(rows):
+                    break
+                row = rows[idx]
+                _addstr(stdscr, 2 + i, 0, csv_line(row, view.hoff, width),
+                        _level_attr(row.level))
+            shown = f"{view.off + 1}-{min(view.off + view_h, len(rows))}/{len(rows)}"
+            foot = (f" ↑↓捲動  ←→水平  PgUp/PgDn翻頁  g/G首末  0復位  s欄位/S升降"
+                    f"  q/Esc返回明細   {shown}")
+            _addstr(stdscr, maxy - 1, 0, pad_display(foot, width), curses.A_REVERSE)
+            stdscr.refresh()
+
+            act = csv_key_action(stdscr.getch())
+            if act == "close":
+                return
+            if act:
+                before = (view.sort_key, view.desc)
+                csv_apply(view, act, total=len(rows), view_h=view_h)
+                if (view.sort_key, view.desc) != before:
+                    rows = csv_sort_rows(source, view.sort_key, view.desc)
+    finally:
+        stdscr.timeout(1000 if watch else -1)  # 還原主迴圈的讀鍵設定
+
+
+def _device_drilldown(stdscr, dev, watch, repaint) -> None:
+    """明細 ↔ CSV 原始資料：明細按 Enter 再往下鑽一層，其他鍵關閉回列表。
+
+    每輪先 repaint()：CSV 檢視是畫滿 stdscr 的，較小的明細彈窗蓋不掉它，
+    不先把主畫面重畫回來，第二次看明細就會疊在 CSV 殘影上。
+
+    只認真正的 Enter（不含 Space）：Space 在主列表是「開合/開明細」，但在彈窗裡
+    更像「關掉」的直覺，不該讓使用者想關卻反而更深入一層。
+    """
+    while True:
+        repaint()
+        ch = _popup(
+            stdscr,
+            device_detail_lines(dev),
+            hint=" Enter 看 CSV 原始資料｜其他鍵關閉 ",
+        )
+        if ch not in _ENTER_KEYS:
+            return
+        _csv_viewer(stdscr, dev.latest, watch)
 
 
 def _prompt_search(stdscr, state: TuiState):
@@ -552,7 +1040,8 @@ def _main_loop(stdscr, args):
         curses.init_pair(2, curses.COLOR_YELLOW, bg)
         curses.init_pair(3, curses.COLOR_RED, bg)
 
-    state = TuiState()
+    # --flat 既有語意就是「不分群的平面表格」，搭配 --tui 直接以平坦模式啟動
+    state = TuiState(flat=bool(getattr(args, "flat", False)))
     watch = args.watch or 0
 
     def reload():
@@ -571,7 +1060,7 @@ def _main_loop(stdscr, args):
     last = time.monotonic()
 
     while True:
-        rows = flatten_tree(tree, state, state.now)
+        rows = visible_rows(tree, state, state.now)
         clamp_selection(rows, state)
         _draw(stdscr, state, rows, tree, watch)
         ch = stdscr.getch()
@@ -588,9 +1077,9 @@ def _main_loop(stdscr, args):
         elif act == "down":
             move_selection(rows, state, 1)
         elif act == "pgdn":
-            move_selection(rows, state, max(1, stdscr.getmaxyx()[0] - 4))
+            move_selection(rows, state, body_height(stdscr.getmaxyx()[0], state))
         elif act == "pgup":
-            move_selection(rows, state, -max(1, stdscr.getmaxyx()[0] - 4))
+            move_selection(rows, state, -body_height(stdscr.getmaxyx()[0], state))
         elif act == "home" and rows:
             state.sel_key = rows[0].key
         elif act == "end" and rows:
@@ -604,21 +1093,25 @@ def _main_loop(stdscr, args):
                 if r.kind != "device":
                     state.expanded.add(r.key)
             elif act == "collapse":
-                if r.kind != "device" and r.key in state.expanded:
-                    state.expanded.discard(r.key)
-                else:
-                    pk = parent_key(r.key)
-                    if pk:
-                        state.sel_key = pk
+                collapse_or_parent(state, r)
             else:  # enter
                 if r.kind == "device":
-                    _popup(stdscr, device_detail_lines(r.ref))
+                    _device_drilldown(
+                        stdscr, r.ref, watch,
+                        repaint=lambda: _draw(stdscr, state, rows, tree, watch),
+                    )
                 else:
                     toggle(state, r.key)
         elif act == "expand_all":
             expand_all(state, tree)
         elif act == "collapse_all":
             collapse_all(state)
+        elif act == "toggle_flat":
+            toggle_flat(state)
+        elif act == "sort_field":
+            cycle_sort(state)
+        elif act == "sort_dir":
+            toggle_sort_dir(state)
         elif act == "only_problem":
             toggle_problem(state)
         elif act == "cycle_mode":

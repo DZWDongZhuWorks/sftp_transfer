@@ -18,6 +18,7 @@ from monitor.log_monitor import (
     group_is_problem,
     parse_device_name,
     parse_log_file,
+    read_log_rows,
     render_cli,
     render_cli_grouped,
     render_html,
@@ -506,3 +507,58 @@ def test_render_html_upload_download_sections(tmp_path):
     content = out.read_text(encoding="utf-8")
     assert "↓ 下載" in content and "↑ 上傳" in content
     assert content.count("mode-sec") >= 2
+
+
+# --- read_log_rows：TUI 檢視原始資料用 -------------------------------------
+def test_read_log_rows_returns_every_row(tmp_path):
+    p = write_log(
+        tmp_path / "D_CLINK_IPC-1_radar_20260727_110000.csv",
+        "CLINK_IPC-1_radar",
+        [
+            (_RECENT, "INFO", "=== SFTP 下載任務開始 ==="),
+            (_RECENT, "ERROR", "檔案 a/x.bin 下載失敗，放棄重試"),
+            (_RECENT, "INFO", "=== 下載任務結束：成功 0，略過 0，失敗 1 ==="),
+        ],
+    )
+    rows, truncated = read_log_rows(p)
+    assert truncated is False
+    assert len(rows) == 3  # INFO 也保留（不像 parse_log_file 只留 ERROR/WARNING）
+    assert all(len(r) == 5 for r in rows)
+    assert rows[1][3] == "ERROR"
+    assert rows[1][4] == "檔案 a/x.bin 下載失敗，放棄重試"
+    assert rows[0][1] == "CLINK_IPC-1_radar"
+
+
+def test_read_log_rows_truncates_at_max_rows(tmp_path):
+    p = write_log(
+        tmp_path / "D_CLINK_IPC-1_radar_20260727_110000.csv",
+        "CLINK_IPC-1_radar",
+        [(_RECENT, "INFO", f"第 {i} 行") for i in range(10)],
+    )
+    rows, truncated = read_log_rows(p, max_rows=4)
+    assert truncated is True and len(rows) == 4
+    assert rows[-1][4] == "第 3 行"
+
+
+def test_read_log_rows_pads_short_rows(tmp_path):
+    # 短列補齊而非略過：檢視原始資料時不該偷偷藏列
+    p = tmp_path / "D_x_20260727_110000.csv"
+    with open(p, "w", encoding="utf-8-sig", newline="") as fh:
+        w = csv.writer(fh)
+        w.writerow(["timestamp", "device_name", "version_info", "level", "message"])
+        w.writerow([_RECENT, "dev"])
+    rows, _ = read_log_rows(p)
+    assert rows == [[_RECENT, "dev", "", "", ""]]
+
+
+def test_read_log_rows_rejects_foreign_and_missing(tmp_path):
+    # 表頭不符 → 空結果
+    alien = tmp_path / "alien.csv"
+    with open(alien, "w", encoding="utf-8", newline="") as fh:
+        csv.writer(fh).writerows([["a", "b"], ["1", "2"]])
+    assert read_log_rows(alien) == ([], False)
+    # 只有表頭的空 log → 空結果但不算截斷
+    empty = write_log(tmp_path / "D_e_20260727_110000.csv", "dev", [])
+    assert read_log_rows(empty) == ([], False)
+    # 缺檔（--watch 重新下載期間檔案可能被換掉）→ 不拋錯
+    assert read_log_rows(tmp_path / "nope.csv") == ([], False)

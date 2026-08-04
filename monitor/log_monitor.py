@@ -39,6 +39,8 @@ if str(PROJECT_DIR) not in sys.path:
 MAIN_SCRIPT = PROJECT_DIR / "main.py"
 DEFAULT_LOG_DIR = PROJECT_DIR / "logs"
 TS_FMT = "%Y-%m-%d %H:%M:%S"
+# 本體 downloader._CSVFileHandler 寫出的欄位順序
+CSV_COLUMNS = ["timestamp", "device_name", "version_info", "level", "message"]
 
 # --- 解析錨點（對應 downloader.py / uploader.py 的訊息字串）------------------
 _RE_START = re.compile(r"SFTP (下載|上傳)任務開始")
@@ -145,7 +147,7 @@ def parse_log_file(path) -> RunRecord | None:
         with open(path, "r", encoding="utf-8-sig", newline="") as fh:
             reader = csv.reader(fh)
             header = next(reader, None)
-            if not header or header[:2] != ["timestamp", "device_name"]:
+            if not header or header[:2] != CSV_COLUMNS[:2]:
                 return None  # 非本工具的 CSV log
             for row in reader:
                 if len(row) < 5:
@@ -215,6 +217,38 @@ def parse_log_file(path) -> RunRecord | None:
         warnings=warnings,
         errors=errors,
     )
+
+
+_ROW_LIMIT = 5000
+
+
+def read_log_rows(path, max_rows: int = _ROW_LIMIT) -> tuple[list[list[str]], bool]:
+    """讀單一 log CSV 的原始列，供 TUI 檢視「那一筆到底寫了什麼」。
+
+    parse_log_file 只留彙整後的純量與 ERROR/WARNING 訊息，原始列全丟；要逐行回看
+    就得依 RunRecord.path 現場重讀。回傳 (rows, truncated)，每列固定補齊成
+    CSV_COLUMNS 的 5 欄。
+
+    讀不到／格式不符／空檔一律回傳空列表而非拋錯，讓 curses 端不必包 try。
+    """
+    rows: list[list[str]] = []
+    truncated = False
+    width = len(CSV_COLUMNS)
+    try:
+        with open(path, "r", encoding="utf-8-sig", newline="") as fh:
+            reader = csv.reader(fh)
+            header = next(reader, None)
+            if not header or header[:2] != CSV_COLUMNS[:2]:
+                return [], False  # 非本工具的 CSV log
+            for row in reader:
+                if len(rows) >= max_rows:
+                    truncated = True
+                    break
+                # 短列補齊而非略過：檢視原始資料時不該偷偷藏列。
+                rows.append((row + [""] * width)[:width])
+    except (OSError, csv.Error, UnicodeError):
+        return [], False
+    return rows, truncated
 
 
 def _parse_ts(value: str) -> datetime | None:

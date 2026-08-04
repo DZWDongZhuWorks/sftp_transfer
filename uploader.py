@@ -13,13 +13,25 @@ from pathlib import Path, PurePosixPath
 
 import paramiko
 
-from downloader import CHUNK_SIZE, MANIFEST_FILENAME, SFTPBase, format_size
+from downloader import CHUNK_SIZE, MANIFEST_FILENAME, PART_SUFFIX, SFTPBase, format_size
 
 UPLOAD_MANIFEST_FILENAME = ".sftp_upload_manifest.json"
 
 # 版本紀錄檔存放在「本地來源目錄」內，走訪來源時必須排除，否則會把自己的 manifest 一起上傳。
 # 同時排除下載端的 manifest，避免同一目錄雙向使用時把對方的紀錄檔也上傳出去。
 _MANIFEST_NAMES = {UPLOAD_MANIFEST_FILENAME, MANIFEST_FILENAME}
+
+
+def _is_transfer_temp(name):
+    """下載端未完成的暫存檔（見 downloader.PART_SUFFIX）——絕不上傳。
+
+    與 _MANIFEST_NAMES 同一個道理:這是本工具自己的中間產物,不是使用者資料。而且多個
+    上傳任務的來源目錄同時也是下載目的地(例如 share/scheduler 既由 scheduler_download
+    下載、又由 scheduler_upload 上傳回 fleet 的 STANDARD 目錄),一旦下載中斷留下半截
+    暫存檔又被上傳出去,污染的是整支船隊的來源。這裡寫死、不依賴各船的 ignore 設定,
+    才不會因為某艘船的設定檔沒跟上而破功。
+    """
+    return name.endswith(PART_SUFFIX)
 
 
 class SFTPUploader(SFTPBase):
@@ -39,7 +51,9 @@ class SFTPUploader(SFTPBase):
         files = []
         if source.is_file():
             filename = source.name
-            if self._is_ignored(filename):
+            if _is_transfer_temp(filename):
+                self.logger.info(f"略過未完成的下載暫存檔: {filename}")
+            elif self._is_ignored(filename):
                 self.logger.info(f"依忽略設定檔略過: {filename}")
             else:
                 files.append((source, filename))
@@ -51,7 +65,7 @@ class SFTPUploader(SFTPBase):
                 full = source / name
                 if full.is_dir():
                     skipped_dirs.append(name)
-                elif name in _MANIFEST_NAMES:
+                elif name in _MANIFEST_NAMES or _is_transfer_temp(name):
                     continue
                 elif self._is_ignored(name):
                     self.logger.info(f"依忽略設定檔略過: {name}")
@@ -72,6 +86,9 @@ class SFTPUploader(SFTPBase):
             rel_path = f"{rel_dir}/{name}" if rel_dir else name
             # 只有根目錄層才會有 manifest 檔；rel_dir 為空字串代表目前正在走訪根目錄。
             if not rel_dir and name in _MANIFEST_NAMES:
+                continue
+            # 暫存檔則可能出現在任何一層(下載是逐檔進行的),每層都要擋。
+            if not full.is_dir() and _is_transfer_temp(name):
                 continue
             if full.is_dir():
                 # 被忽略的資料夾整棵略過、不往下走訪，遠端也不會建立對應資料夾（與 git 行為一致）。

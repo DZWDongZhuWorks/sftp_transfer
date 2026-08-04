@@ -24,6 +24,14 @@ CHUNK_SIZE = 32768
 SOCKET_TIMEOUT = 120
 KEEPALIVE_INTERVAL = 15
 MANIFEST_FILENAME = ".sftp_download_manifest.json"
+# 下載一律先寫進「目的檔名 + 這個後綴」的暫存檔，完成後才 os.replace 換名到目的地。
+# 換名換的是 inode，於是：
+#   1. 目的地在任何時刻都只會是「上一版完整檔案」或「這一版完整檔案」，不會出現半截檔；
+#   2. 正在執行中的 .sh 抓著舊 inode 不放，即使自己被更新也能安全跑完（bash 是邊讀邊
+#      執行、按 byte offset 續讀的，就地覆寫會讓它讀到錯位的內容而語法錯誤 —— 實際發生
+#      過:開機時 update_booster 更新 reboot_launcher.sh，把正在跑的自己改掉而中斷開機）。
+# 暫存檔與目的檔同目錄,確保同一個檔案系統、rename 才具原子性。
+PART_SUFFIX = ".part"
 SFTP_RETRY_EXCEPTIONS = (
     paramiko.SSHException,
     paramiko.SFTPError,
@@ -434,6 +442,7 @@ class SFTPDownloader(SFTPBase):
         local_size = 0
         mode = "wb"
         running_hash = hashlib.sha256()  # 邊下載邊累加，最後（或中斷當下）存進版本紀錄檔
+        known = self._manifest.get(rel_path)
 
         if local_file.exists():
             if not self.resume:
@@ -446,7 +455,6 @@ class SFTPDownloader(SFTPBase):
                     self.logger.info(f"重新下載，另存為: {target_file.name}")
             else:
                 disk_size = local_file.stat().st_size
-                known = self._manifest.get(rel_path)
 
                 if disk_size == remote_size:
                     # 大小相同：用版本紀錄（若有）判斷是否真的未變更；沒有紀錄則姑且視為未變更略過。
@@ -472,31 +480,41 @@ class SFTPDownloader(SFTPBase):
                     target_file = self._next_duplicate_path(local_file)
                     self.logger.info(f"重新下載，另存為: {target_file.name}")
                 else:
-                    # 本地檔案比遠端小：檢查遠端版本是否仍與紀錄一致，並用「本地端雜湊」確認這段尚未
-                    # 下載完的內容有沒有被外部更動過（例如被人手動修改）。這裡刻意只讀本機磁碟跟紀錄檔
-                    # 裡存的雜湊比對，不會為了驗證而重新從遠端讀取已下載的內容，避免已下載比例越高、
-                    # 驗證反而越花時間、越像卡住的問題。
-                    same_remote_version = (
-                        known is not None
-                        and known.get("size") == remote_size
-                        and known.get("mtime") == remote_mtime
-                    )
-                    verified = False
-                    if same_remote_version and known.get("local_bytes") == disk_size and known.get("local_sha256"):
-                        disk_hash = self._hash_local_file(local_file)
-                        if disk_hash.hexdigest() == known["local_sha256"]:
-                            verified = True
-                            running_hash = disk_hash  # 直接沿用，後續新下載的內容繼續累加上去
+                    # 走到這裡 duplicate_mode 必定是 "overwrite"："duplicate" 模式在上面
+                    # 的 elif 分支就已經攔截、一律整份重新下載成新檔案，不會執行到這裡。
+                    # 目的地永遠只會是「某一版的完整檔案」（沒下載完的內容都留在 .part 暫存檔，
+                    # 見 PART_SUFFIX），所以本地比遠端小只代表來源長大了 → 整份重新下載。
+                    self.logger.info(f"偵測到來源檔案已更新，覆蓋舊檔案: {rel_path}")
 
-                    if verified:
-                        self.logger.info(f"本地端內容雜湊比對相符，接續下載: {rel_path}")
-                        local_size = disk_size
-                        mode = "ab"
-                    else:
-                        # 走到這裡 duplicate_mode 必定是 "overwrite"："duplicate" 模式在上面
-                        # 的 elif 分支就已經攔截、一律整份重新下載成新檔案，不會執行到這裡。
-                        reason = "本地檔案內容與紀錄不符（可能已被人為修改）" if same_remote_version else "偵測到來源檔案已更新"
-                        self.logger.info(f"{reason}，覆蓋舊檔案: {rel_path}")
+        # 實際寫入的是暫存檔，成功後才原子換名到 target_file。斷點續傳接續的對象因此也是
+        # 暫存檔而不是目的地；duplicate 模式另存新檔、本來就不接續，所以只有「目的地就是
+        # 原檔名」時才嘗試接續。
+        part_file = target_file.with_name(target_file.name + PART_SUFFIX)
+        if self.resume and target_file == local_file and part_file.exists():
+            part_size = part_file.stat().st_size
+            # 遠端版本要與紀錄一致，且紀錄的長度/雜湊要對得上暫存檔的現況，才敢接著往下寫。
+            # 用「本地端雜湊」確認這段尚未下載完的內容有沒有被外部更動過（例如被人手動修改）。
+            # 這裡刻意只讀本機磁碟跟紀錄檔裡存的雜湊比對，不會為了驗證而重新從遠端讀取已下載
+            # 的內容，避免已下載比例越高、驗證反而越花時間、越像卡住的問題。
+            resumable = (
+                known is not None
+                and known.get("size") == remote_size
+                and known.get("mtime") == remote_mtime
+                and known.get("local_bytes") == part_size
+                and known.get("local_sha256")
+                and part_size < remote_size
+            )
+            if resumable:
+                disk_hash = self._hash_local_file(part_file)
+                if disk_hash.hexdigest() == known["local_sha256"]:
+                    self.logger.info(f"本地端內容雜湊比對相符，接續下載: {rel_path}")
+                    local_size = part_size
+                    running_hash = disk_hash  # 直接沿用，後續新下載的內容繼續累加上去
+                    mode = "ab"
+            if mode == "wb":
+                # 暫存檔對不上紀錄（來源已換版、內容被動過或根本沒有檢查點）→ 不可信，
+                # 整份重新下載；"wb" 開檔即截斷，不必另外刪除。
+                self.logger.info(f"既有暫存檔無法接續，整份重新下載: {rel_path}")
 
         self.logger.info(f"開始下載: {rel_path} ({format_size(remote_size)})")
         last_pct_logged = -1
@@ -509,7 +527,7 @@ class SFTPDownloader(SFTPBase):
         try:
             with self.sftp.open(remote_file, "rb") as remote_f:
                 remote_f.seek(local_size)
-                with open(target_file, mode) as local_f:
+                with open(part_file, mode) as local_f:
                     while True:
                         chunk = remote_f.read(CHUNK_SIZE)
                         if not chunk:
@@ -564,14 +582,19 @@ class SFTPDownloader(SFTPBase):
         else:
             self.logger.info(f"完成下載: {done_name}")
         # 保留來源權限與 mtime:SFTP/paramiko 預設不會搬,需以 remote_stat 自行鏡射
-        # （否則 .sh 等會掉 +x）。失敗只警告不中斷 —— 內容已下載完成,不該因權限/時間視為失敗。
+        # （否則 .sh 等會掉 +x）。趁還是暫存檔時就套用,換名之後目的地第一眼就是對的權限,
+        # 不會有「檔案已經在了但還沒 +x」的空窗。
+        # 失敗只警告不中斷 —— 內容已下載完成,不該因權限/時間視為失敗。
         try:
-            os.chmod(target_file, stat.S_IMODE(remote_stat.st_mode))
+            os.chmod(part_file, stat.S_IMODE(remote_stat.st_mode))
             atime = getattr(remote_stat, "st_atime", None)
-            os.utime(target_file, (atime if atime is not None else remote_stat.st_mtime,
-                                   remote_stat.st_mtime))
+            os.utime(part_file, (atime if atime is not None else remote_stat.st_mtime,
+                                 remote_stat.st_mtime))
         except (OSError, AttributeError, TypeError, ValueError) as e:
             self.logger.warning(f"設定 {done_name} 權限/mtime 失敗(不影響下載內容): {e}")
+        # 原子換名:同一個檔案系統上的 rename,對讀者而言目的地只會是「換名前的舊版完整檔案」
+        # 或「換名後的新版完整檔案」,不存在中間狀態,也不會就地改寫舊檔的 inode。
+        os.replace(part_file, target_file)
         return "downloaded"
 
     def _build_jobs(self):

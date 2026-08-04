@@ -82,6 +82,34 @@ class TestListLocalFiles:
 
         assert sorted(rel for _, rel in files) == ["a.txt"]
 
+    def test_download_part_files_are_never_uploaded(self, uploader_factory, fake_sftp_factory, tmp_path):
+        """下載中斷留下的暫存檔不能被上傳出去。
+
+        share/scheduler 這類目錄既是 scheduler_download 的目的地、又是 scheduler_upload
+        的來源（上傳回 fleet 的 STANDARD），半截的 reboot_launcher.sh.part 一旦被推上去，
+        污染的是整支船隊的來源。這條不依賴各船的 ignore 設定，寫死在程式裡。
+        """
+        _write(tmp_path / "reboot_launcher.sh", b"complete")
+        _write(tmp_path / ("reboot_launcher.sh" + up.PART_SUFFIX), b"half")
+        _write(tmp_path / "sub" / ("deep.sh" + up.PART_SUFFIX), b"half")
+        _write(tmp_path / "sub" / "deep.sh", b"complete")
+        d = uploader_factory(recursive=True)
+        d.sftp = fake_sftp_factory(files={})
+
+        files = d._list_local_files(tmp_path, "/remote")
+
+        assert sorted(rel for _, rel in files) == ["reboot_launcher.sh", "sub/deep.sh"]
+
+    def test_single_file_source_pointing_at_a_part_file_uploads_nothing(
+        self, uploader_factory, fake_sftp_factory, tmp_path
+    ):
+        target = tmp_path / ("x.sh" + up.PART_SUFFIX)
+        _write(target, b"half")
+        d = uploader_factory()
+        d.sftp = fake_sftp_factory(files={})
+
+        assert d._list_local_files(target, "/remote") == []
+
     def test_ignore_rules_skip_matching_files(self, uploader_factory, fake_sftp_factory, tmp_path):
         ignore = tmp_path / "up_ignore.txt"
         ignore.write_text("*.log\n", encoding="utf-8")

@@ -125,6 +125,13 @@ python3 deploy/automation_health_check.py
 - heartbeat 實際 TCP 回應、failover 狀態與角色；
 - 依 IPC 角色預期存在的 tmux sessions。
 
+部署當下若機器剛開機（或有人另開視窗手動 `systemctl --user start nssms-boot`），
+`nssms-boot` 這個 oneshot 可能還停在 `activating/start` —— 那是「這一輪還在跑」而不是
+壞掉（`ExecStartPre` 有 `sleep 20`，之後還有 OTA 與全相位起服務）。巡檢會記成 `WARN`
+並提示等它收工後重跑；只有卡在啟動中超過 15 分鐘才升為 `FAIL`，此時看
+`scheduler/logs/launcher.log` 最後一行。**不要因為這一項就去 disable／重裝 unit**，
+那動到的是全船唯一的開機入口。
+
 wave 目前可空置，因此預設把 wave 腳本缺少或 service 失敗列為 `SKIP`，不影響整體
 健康。需要將 wave 納入正式驗收時，可使用嚴格模式：
 

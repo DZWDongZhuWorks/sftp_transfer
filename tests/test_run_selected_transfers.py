@@ -1,6 +1,5 @@
 # -*- coding: utf-8 -*-
 from pathlib import Path
-from types import SimpleNamespace
 from unittest import mock
 
 import run_selected_transfers as selected
@@ -78,17 +77,32 @@ def test_execute_selected_continues_and_summarizes_failures(tmp_path):
         selected.TransferItem(tmp_path / "b_download_settings.json", "download", "b"),
     ]
     with mock.patch.object(
-        selected.subprocess,
-        "run",
-        side_effect=[SimpleNamespace(returncode=0), SimpleNamespace(returncode=7)],
+        selected,
+        "_run_transfer",
+        side_effect=[(0, (3, 4, 0)), (7, (1, 2, 5))],
     ) as run:
         assert selected.execute_selected(items, locked_mode="upload") == 1
 
     assert run.call_count == 2
-    first_command = run.call_args_list[0].args[0]
-    second_command = run.call_args_list[1].args[0]
-    assert first_command[-4:] == ["--mode", "download", "--config", str(items[0].path)]
-    assert second_command[-4:] == ["--mode", "download", "--config", str(items[1].path)]
+    assert run.call_args_list[0].args[0] == items[0]
+    assert run.call_args_list[1].args[0] == items[1]
+
+
+def test_execute_selected_prints_file_counts_for_each_item(tmp_path, capsys):
+    items = [
+        selected.TransferItem(tmp_path / "a_download_settings.json", "download", "a"),
+        selected.TransferItem(tmp_path / "b_download_settings.json", "download", "b"),
+    ]
+    with mock.patch.object(
+        selected,
+        "_run_transfer",
+        side_effect=[(0, (3, 4, 0)), (7, (1, 2, 5))],
+    ):
+        selected.execute_selected(items, locked_mode="upload")
+
+    output = capsys.readouterr().out
+    assert "[下載] a (成功)｜成功 3，略過 4，失敗 0" in output
+    assert "[下載] b (失敗 rc=7)｜成功 1，略過 2，失敗 5" in output
 
 
 def test_execute_selected_blocks_wrong_direction_before_subprocess(tmp_path):

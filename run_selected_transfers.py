@@ -10,6 +10,7 @@ from __future__ import annotations
 
 import argparse
 import curses
+import re
 import subprocess
 import sys
 import unicodedata
@@ -25,6 +26,7 @@ MAIN_SCRIPT = BASE_DIR / "main.py"
 MODE_LABEL = {"download": "下載", "upload": "上傳"}
 MODE_ORDER = {"download": 0, "upload": 1}
 FILTER_CYCLE = ("all", "download", "upload")
+TRANSFER_SUMMARY_RE = re.compile(r"任務結束(?:（\d+ 組）)?：成功 (\d+)，略過 (\d+)，失敗 (\d+)")
 
 
 @dataclass(frozen=True)
@@ -41,6 +43,43 @@ class SelectionState:
     scroll: int = 0
     mode_filter: str = "all"
     message: str = ""
+
+
+@dataclass(frozen=True)
+class TransferResult:
+    item: TransferItem
+    returncode: int
+    success: int
+    skipped: int
+    failed: int
+
+
+def _run_transfer(item: TransferItem) -> tuple[int, tuple[int, int, int] | None]:
+    """執行單項傳輸、即時轉送輸出，並擷取核心程式印出的檔案統計。"""
+    proc = subprocess.Popen(
+        [
+            sys.executable,
+            str(MAIN_SCRIPT),
+            "--cli",
+            "--mode",
+            item.mode,
+            "--config",
+            str(item.path),
+        ],
+        cwd=str(BASE_DIR),
+        stdout=subprocess.PIPE,
+        stderr=subprocess.STDOUT,
+        text=True,
+        bufsize=1,
+    )
+    counts = None
+    assert proc.stdout is not None
+    for line in proc.stdout:
+        print(line, end="", flush=True)
+        match = TRANSFER_SUMMARY_RE.search(line)
+        if match:
+            counts = tuple(map(int, match.groups()))
+    return proc.wait(), counts
 
 
 def project_from_name(name: str, mode: str) -> str:
@@ -335,38 +374,32 @@ def execute_selected(items: list[TransferItem], locked_mode: str) -> int:
             print(f"  [已阻擋] [{MODE_LABEL[item.mode]}] {item.path.name}", file=sys.stderr)
         return 3
 
-    results: list[tuple[TransferItem, int]] = []
+    results: list[TransferResult] = []
     total = len(items)
     for index, item in enumerate(items, 1):
         print(f"\n===== [{index}/{total}] 開始{MODE_LABEL[item.mode]}：{item.path.name} =====", flush=True)
         try:
-            proc = subprocess.run(
-                [
-                    sys.executable,
-                    str(MAIN_SCRIPT),
-                    "--cli",
-                    "--mode",
-                    item.mode,
-                    "--config",
-                    str(item.path),
-                ],
-                cwd=str(BASE_DIR),
-            )
-            returncode = proc.returncode
+            returncode, counts = _run_transfer(item)
         except KeyboardInterrupt:
             print("\n使用者中止，後續專案不再執行。", file=sys.stderr)
             return 130
-        results.append((item, returncode))
+        # 設定或連線若在核心統計產生前失敗，仍以一筆執行失敗呈現在數字總結中。
+        success, skipped, failed = counts or (0, 0, 1 if returncode else 0)
+        results.append(TransferResult(item, returncode, success, skipped, failed))
         status = "完成" if returncode == 0 else f"失敗 (rc={returncode})"
         print(f"===== [{index}/{total}] {item.path.name} {status} =====", flush=True)
 
     print("\n========== 本次傳輸結果彙總 ==========")
-    for item, returncode in results:
-        status = "成功" if returncode == 0 else f"失敗 rc={returncode}"
-        print(f"  [{'成功' if returncode == 0 else '失敗'}] [{MODE_LABEL[item.mode]}] {item.project} ({status})")
-    failed = sum(returncode != 0 for _, returncode in results)
-    print(f"共 {total} 個專案，成功 {total - failed}，失敗 {failed}")
-    return 0 if failed == 0 else 1
+    for result in results:
+        status = "成功" if result.returncode == 0 else f"失敗 rc={result.returncode}"
+        print(
+            f"  [{'成功' if result.returncode == 0 else '失敗'}] "
+            f"[{MODE_LABEL[result.item.mode]}] {result.item.project} ({status})｜"
+            f"成功 {result.success}，略過 {result.skipped}，失敗 {result.failed}"
+        )
+    failed_projects = sum(result.returncode != 0 for result in results)
+    print(f"共 {total} 個專案，成功 {total - failed_projects}，失敗 {failed_projects}")
+    return 0 if failed_projects == 0 else 1
 
 
 def parse_args(argv: list[str] | None = None):

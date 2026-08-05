@@ -591,29 +591,20 @@ def test_flat_rows_use_tree_group_names(tmp_path):
     assert any(k[2] == "（未分類）" and k[3] == "—" for k in (r.key for r in flat))
 
 
-def test_flat_default_is_global_severity_order(tmp_path):
-    """平坦模式預設＝全域嚴重度遞減，樹的順序當 tiebreak。
-
-    這裡刻意「不是」樹的原順序：樹只在各 IPC 內部依嚴重度排，全域看並非遞減
-    （IPC-1 的 partial→success 之後才接 IPC-2 的 stale）。把 stale 拉到 success
-    之前正是平坦模式存在的理由。
-    """
+def test_flat_default_is_global_vessel_order(tmp_path):
+    """平坦模式預設＝全域船隻名稱遞減，樹的順序當 tiebreak。"""
     tree = _sorted_tree(tmp_path)
     devs = [it.dev for it in tui.tree_devices(tree)]
     flat = tui.flatten_flat(tree, tui.TuiState(flat=True), NOW)
-    assert [r.ref for r in flat] == tui.sort_devices(devs, "嚴重度", True)
-
-    sev = [tui._SEVERITY.get(r.ref.display_status, 0) for r in flat]
-    assert sev == sorted(sev, reverse=True)  # 全域遞減
-    # 同嚴重度維持樹的次序（穩定排序）
-    ok = [r.ref for r in flat if r.ref.display_status == "success"]
-    assert ok == [d for d in devs if d.display_status == "success"]
+    assert [r.ref for r in flat] == tui.sort_devices(devs, "船隻名稱", True)
+    vessels = [r.ref.vessel or "（未分類）" for r in flat]
+    assert vessels == sorted(vessels, key=str.casefold, reverse=True)
 
 
-def test_grouped_default_order_is_unchanged(tmp_path):
-    """分群模式的預設必須是 no-op：使用者沒按 o 之前，畫面與加排序功能前一模一樣。
+def test_grouped_default_keeps_device_order_within_ipc(tmp_path):
+    """預設（船隻名稱↓）不動 IPC 底下的裝置列：那一層仍是 build_tree 的 (-嚴重度, 元件)。
 
-    build_tree 已依 (-嚴重度, component) 排過各 IPC，穩定的嚴重度降冪排序回傳同一份清單。
+    船名對整個 IPC 群組是常數，作用在裝置列上必然是 no-op——它排的是船群那一層。
     """
     tree = _sorted_tree(tmp_path)
     st = tui.TuiState()
@@ -625,10 +616,64 @@ def test_grouped_default_order_is_unchanged(tmp_path):
     assert shown == from_tree
 
 
+def _multi_vessel_tree(tmp_path):
+    """同一方向下三艘船＋一台無法解析船名的，用來驗證船群那一層的排序。"""
+    return _tree(
+        tmp_path,
+        [
+            ("MMM_IPC-1_ecdis", "download", RECENT, 5, 0, 0),
+            ("aaa_IPC-1_ecdis", "download", OLD, 5, 0, 0),     # stale：資料層會排到最前
+            ("ZZZ_IPC-1_ecdis", "download", RECENT, 5, 0, 0),
+            ("RADAR_UPLOADER", "download", RECENT, 1, 0, 0),   # 無 vessel → （未分類）
+        ],
+    )
+
+
+def _vessel_names(tree, st):
+    return [r.ref.name for r in tui.flatten_tree(tree, st, NOW) if r.kind == "vessel"]
+
+
+def test_grouped_vessel_sort_reorders_vessel_groups(tmp_path):
+    """「船隻名稱」在分群模式必須重排船群，否則這個欄位在分群模式是死鍵。"""
+    tree = _multi_vessel_tree(tmp_path)
+    st = tui.TuiState(sort_key="船隻名稱", sort_desc=False)
+    tui.expand_all(st, tree)
+    asc = _vessel_names(tree, st)
+    assert asc == ["aaa", "MMM", "ZZZ", "（未分類）"]  # casefold：aaa 不因小寫墊底
+
+    st.sort_desc = True
+    assert _vessel_names(tree, st) == list(reversed(asc))
+
+
+def test_grouped_vessel_sort_matches_flat_vessel_order(tmp_path):
+    """兩種檢視的船名次序必須一致（含 （未分類） sentinel 的位置）。"""
+    tree = _multi_vessel_tree(tmp_path)
+    for desc in (False, True):
+        st = tui.TuiState(sort_key="船隻名稱", sort_desc=desc)
+        tui.expand_all(st, tree)
+        flat = tui.flatten_flat(tree, tui.TuiState(flat=True, sort_desc=desc), NOW)
+        flat_order = list(dict.fromkeys(r.key[2] for r in flat))
+        assert _vessel_names(tree, st) == flat_order
+
+
+def test_grouped_other_sort_keys_keep_data_layer_vessel_order(tmp_path):
+    """非船名欄位在群組層沒有單一值可比，船群維持 build_tree 的次序（過期在前、未分類墊底）。"""
+    tree = _multi_vessel_tree(tmp_path)
+    from_tree = [v.name for m in tree for v in m.vessels]
+    assert from_tree[0] == "aaa" and from_tree[-1] == "（未分類）"  # 資料層：嚴重度優先
+    for key in ("更新時間", "嚴重度", "裝置名稱"):
+        for desc in (False, True):
+            st = tui.TuiState(sort_key=key, sort_desc=desc)
+            tui.expand_all(st, tree)
+            assert _vessel_names(tree, st) == from_tree
+
+
 def test_sort_value_and_missing_last_seen():
     from datetime import datetime as _dt
-    d = SimpleNamespace(last_seen=None, device_name="ECDIS", display_status="nonsense")
+    d = SimpleNamespace(last_seen=None, device_name="ECDIS", vessel="CLINK",
+                        display_status="nonsense")
     assert tui.sort_value(d, "更新時間") == _dt.min      # 從未回報視為最舊
+    assert tui.sort_value(d, "船隻名稱") == "clink"
     assert tui.sort_value(d, "裝置名稱") == "ecdis"      # casefold，大小寫不影響排序
     assert tui.sort_value(d, "嚴重度") == 0              # 未知狀態當健康
 
@@ -649,6 +694,9 @@ def test_sort_devices_by_each_field(tmp_path):
 
     names = [d.device_name for d in tui.sort_devices(devs, "裝置名稱", False)]
     assert names == sorted(names, key=str.casefold)
+
+    vessels = [d.vessel or "（未分類）" for d in tui.sort_devices(devs, "船隻名稱", False)]
+    assert vessels == sorted(vessels, key=str.casefold)
 
     # 穩定排序：同嚴重度維持輸入（資料層）順序
     same = [d for d in devs if d.display_status == "success"]
@@ -724,12 +772,13 @@ def test_collapse_or_parent_does_not_jump_in_flat(tmp_path):
 
 def test_sort_reducers_and_defaults():
     st = tui.TuiState()
-    assert (st.flat, st.sort_key, st.sort_desc) == (False, "嚴重度", True)
-    assert tui._SORT_CYCLE == ["嚴重度", "更新時間", "裝置名稱"]
+    assert (st.flat, st.sort_key, st.sort_desc) == (False, "船隻名稱", True)
+    assert tui._SORT_CYCLE == ["船隻名稱", "更新時間", "嚴重度", "裝置名稱"]
 
     tui.cycle_sort(st); assert st.sort_key == "更新時間"
+    tui.cycle_sort(st); assert st.sort_key == "嚴重度"
     tui.cycle_sort(st); assert st.sort_key == "裝置名稱"
-    tui.cycle_sort(st); assert st.sort_key == "嚴重度"      # 繞回
+    tui.cycle_sort(st); assert st.sort_key == "船隻名稱"    # 繞回
     st.sort_key = "亂填"
     tui.cycle_sort(st); assert st.sort_key == "更新時間"     # 不在循環內也不炸
 
@@ -834,13 +883,13 @@ def test_key_press_reorders_flat_list(tmp_path):
         return [r.ref.device_name for r in tui.visible_rows(tree, st, NOW)
                 if r.kind == "device"]
 
-    order_sev = press(ord("f"))                 # → 平坦，嚴重度↓
+    order_vessel = press(ord("f"))              # → 平坦，船隻名稱↓
     assert st.flat is True
-    assert len(order_sev) == 4                  # 4 台裝置全部單層列出
+    assert len(order_vessel) == 4               # 4 台裝置全部單層列出
 
     order_time = press(ord("o"))                # → 更新時間↓
     assert st.sort_key == "更新時間"
-    assert order_time != order_sev              # 真的重排了
+    assert order_time != order_vessel           # 真的重排了
     assert order_time[-1] == "CLINK_IPC-2_share"     # OLD＝最舊，降冪排最後
     # ecdis / radar / RADAR_UPLOADER 的時間戳都是 RECENT（平手）→ 穩定排序沿用樹序
     assert set(order_time[:3]) == {
@@ -850,6 +899,16 @@ def test_key_press_reorders_flat_list(tmp_path):
     order_time_asc = press(ord("O"))            # → 更新時間↑
     assert st.sort_desc is False
     assert order_time_asc[0] == "CLINK_IPC-2_share"  # OLD＝最久未更新，升冪排最前
+
+    order_severity = press(ord("o"))            # → 嚴重度↑
+    assert st.sort_key == "嚴重度"
+    severity_by_device = {
+        r.ref.device_name: tui._SEVERITY.get(r.ref.display_status, 0)
+        for r in tui.visible_rows(tree, st, NOW) if r.kind == "device"
+    }
+    assert [severity_by_device[n] for n in order_severity] == sorted(
+        severity_by_device[n] for n in order_severity
+    )
 
     order_name = press(ord("o"))                # → 裝置名稱↑
     assert st.sort_key == "裝置名稱"

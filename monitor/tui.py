@@ -43,7 +43,7 @@ _PAIR = {"success": 1, "stale": 2, "incomplete": 2, "partial": 3, "aborted": 3}
 _SYNC_LINE_LIMIT = 20
 _ANSI_ESCAPE = re.compile(r"\x1b\[[0-?]*[ -/]*[@-~]")
 _ENTER_KEYS = (10, 13, curses.KEY_ENTER)
-_SORT_CYCLE = ["嚴重度", "更新時間", "裝置名稱"]
+_SORT_CYCLE = ["船隻名稱", "更新時間", "嚴重度", "裝置名稱"]
 _MODE_ARROW = {"download": "↓", "upload": "↑"}
 # 平坦模式的欄寬（顯示欄）：方向 船 IPC 元件 最後執行 檔案 成/略/失 距今 摘要
 _FLAT_COLS = (1, 10, 6, 20, 11, 5, 9, 8)
@@ -130,7 +130,7 @@ class TuiState:
     now: datetime | None = None
     flat: bool = False                 # True＝平坦模式（不分群，全船隊一張表）
     sort_key: str = _SORT_CYCLE[0]      # 見 _SORT_CYCLE
-    sort_desc: bool = True             # 預設 嚴重度↓＝最嚴重在前，分群模式等同現行順序
+    sort_desc: bool = True             # 預設由 _SORT_CYCLE 首欄位降冪排序
 
 
 def _badge(s) -> str:
@@ -207,8 +207,7 @@ def sort_value(d, key: str):
     """單一欄位的排序值（純函式）。
 
     刻意不含 tiebreak：同鍵值的次序交給穩定排序保留「輸入順序」，也就是資料層
-    build_tree 給的 船/IPC/元件 次序。因此預設（嚴重度↓）是可證明的 no-op——
-    build_tree 已依 (-嚴重度, component) 排過，再穩定地依嚴重度降冪排會得到同一份清單。
+    build_tree 給的 船/IPC/元件 次序。例如同一船名的裝置會維持原有 IPC/元件次序。
     把 tiebreak 寫進 key 反而會被 reverse 一起翻轉，連預設畫面都會變。
     """
     if key == "更新時間":
@@ -217,12 +216,29 @@ def sort_value(d, key: str):
     if key == "裝置名稱":
         # casefold：元件名大小寫混雜（RADAR_UPLOADER vs ecdis），純 ASCII 序會把全大寫全推到最前
         return d.device_name.casefold()
+    if key == "船隻名稱":
+        return (d.vessel or "（未分類）").casefold()
     return _SEVERITY.get(d.display_status, 0)  # 未知狀態→0，沿用資料層 .get(x, 0) 慣例
 
 
 def sort_devices(devices: list, key: str, desc: bool) -> list:
     """依欄位排序裝置（穩定，不就地改動來源）。"""
     return sorted(devices, key=lambda d: sort_value(d, key), reverse=desc)
+
+
+def sort_vessels(vessels: list, key: str, desc: bool) -> list:
+    """分群模式的船群次序：只有「船隻名稱」欄位會重排，其餘維持資料層順序。
+
+    船名對整個 IPC 群組是常數（樹就是依 船→IPC 分的），套在群組內的裝置列上必然是
+    no-op，所以這個欄位得作用在「船」這一層才有意義。其餘欄位是裝置屬性，群組層沒有
+    單一值可比，維持 build_tree 的 (未分類置底, -嚴重度, 名稱) 次序。
+
+    排序值與 sort_value("船隻名稱") 同為 name.casefold()，兩種檢視的船名次序才一致
+    （含 （未分類） 這個 sentinel：升冪在最後、降冪在最前）。
+    """
+    if key != "船隻名稱":
+        return vessels
+    return sorted(vessels, key=lambda g: g.name.casefold(), reverse=desc)
 
 
 def sort_label(key: str, desc: bool) -> str:
@@ -270,7 +286,7 @@ def flatten_tree(tree, state: TuiState, now: datetime | None) -> list[Row]:
         )
         if mkey not in state.expanded:
             continue
-        for v in m.vessels:
+        for v in sort_vessels(m.vessels, state.sort_key, state.sort_desc):
             v_has = any(
                 _device_matches(d, state) for ip in v.ipcs for d in ip.devices
             )
@@ -729,8 +745,9 @@ _HELP_LINES = [
     "看明細    在裝置列按 Enter；明細再按 Enter 看該筆 CSV 原始資料",
     "CSV檢視   ↑↓/PgUp/PgDn/g/G 捲動、←→ 水平捲動、0 復位、s/S 排序、q/Esc 返回",
     "檢視      f 切換 平坦/分群（平坦＝全船隊一張表，忽略 方向/船/IPC 分群）",
-    "排序      o 循環欄位（嚴重度 / 更新時間 / 裝置名稱）、O 切換升降冪",
-    "          預設 嚴重度↓＝原本的順序；更新時間↑ 最久未更新在前（找失聯裝置）",
+    "排序      o 循環欄位（船隻名稱 / 更新時間 / 嚴重度 / 裝置名稱）、O 切換升降冪",
+    "          預設 船隻名稱↓（分群模式下這欄排的是船群，其餘欄位排裝置列）",
+    "          更新時間↑ 最久未更新在前（找失聯裝置）",
     "全部      E 全部展開、C 全部收合（僅分群模式看得到效果）",
     "過濾      / 搜尋（Esc 清除）、m 循環方向、s 循環狀態、p 只看異常",
     "其他      r 立即重載、? 說明、q 離開",

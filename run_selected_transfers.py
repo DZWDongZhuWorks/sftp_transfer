@@ -5,11 +5,14 @@
 預設同時列出 ``*_download_settings.json`` 與
 ``*_upload_settings.json``；真正傳輸時仍沿用 main.py 的 CLI 流程。
 方向採雙向守門：CLINK 發佈端只可上傳，其餘部署端只可下載。
+設定檔可用 ``trans_type: telemetry`` 宣告自己是船到岸的資料回傳流，
+不受上述方向鎖管制（見 ``read_trans_type``）。
 """
 from __future__ import annotations
 
 import argparse
 import curses
+import json
 import re
 import subprocess
 import sys
@@ -28,12 +31,20 @@ MODE_ORDER = {"download": 0, "upload": 1}
 FILTER_CYCLE = ("all", "download", "upload")
 TRANSFER_SUMMARY_RE = re.compile(r"任務結束(?:（\d+ 組）)?：成功 (\d+)，略過 (\d+)，失敗 (\d+)")
 
+# 流類別：deploy＝程式／設定發佈流（岸→船），telemetry＝資料回傳流（船→岸）。
+DEPLOY = "deploy"
+TELEMETRY = "telemetry"
+# OTA 發佈樹的根。上傳到這些路徑底下的內容會被船隻拉走，是「舊程式回灌」的唯一途徑。
+PUBLISH_ROOTS = ("/fleet/wanhai_nssms_deploy/STANDARD", "/fleet/wanhai_nssms_deploy/UNIQUE")
+
 
 @dataclass(frozen=True)
 class TransferItem:
     path: Path
     mode: str
     project: str
+    # 預設值不可省略：既有呼叫端與測試以位置參數建構 TransferItem。
+    trans_type: str = DEPLOY
 
 
 @dataclass
@@ -87,11 +98,58 @@ def project_from_name(name: str, mode: str) -> str:
     return name[: -len(suffix)] if name.endswith(suffix) else name
 
 
+def _targets_publish_tree(remote_path) -> bool:
+    """remote_path（字串或字串陣列）是否有任何一條落在 OTA 發佈樹底下。
+
+    比對未展開佔位符的原始字串即可：PUBLISH_ROOTS 的前綴都在任何 {} 之前。
+    """
+    paths = remote_path if isinstance(remote_path, list) else [remote_path]
+    return any(
+        isinstance(p, str) and p.startswith(PUBLISH_ROOTS)
+        for p in paths
+    )
+
+
+def read_trans_type(path: Path, mode: str) -> str:
+    """讀出設定檔宣告的流類別；任何不確定的情況一律回 DEPLOY（fail-closed）。
+
+    刻意不用 settings.load_settings()：它會做佔位符解析，在沒有 vessel_basic_info.json
+    的機器上會對含 {vsl_name} 的設定檔拋 PlaceholderError，讓整個選單開不起來。
+    這裡只要兩個欄位的字面值，直接讀原始 JSON 即可，也不會碰到連線憑證。
+
+    標籤只能讓守門更嚴、不能更鬆：宣告 telemetry 的上傳若指向 OTA 發佈樹，
+    視為標錯而降回 deploy——設定檔名彼此相似，複製貼上標錯的代價不該是打開回灌的門。
+
+    下載側刻意不做等價驗證：上傳誤放行會污染發佈樹、影響整個船隊且不可回復；
+    下載誤放行只影響本機工作區，git 可還原。要在下載側做等價檢查得逐檔跑
+    git check-ignore，成本與收益不成比例。這是權衡後的取捨，不是漏掉。
+    """
+    try:
+        with open(path, "r", encoding="utf-8") as f:
+            data = json.load(f)
+        declared = data.get("trans_type")
+    except (OSError, json.JSONDecodeError, AttributeError):
+        return DEPLOY
+    if declared != TELEMETRY:
+        return DEPLOY
+    if mode == "upload" and _targets_publish_tree(data.get("remote_path", "")):
+        return DEPLOY
+    return TELEMETRY
+
+
 def scan_setting_files(config_dir: Path, mode: str = "all") -> list[TransferItem]:
-    """依 run_all_* 的命名規則掃描設定檔，不讀取其中的連線密碼。"""
+    """依 run_all_* 的命名規則掃描設定檔。
+
+    只讀取 trans_type 與 remote_path 兩個欄位判斷流類別，不觸碰其中的連線憑證。
+    """
     modes = ("download", "upload") if mode == "all" else (mode,)
     items = [
-        TransferItem(path, item_mode, project_from_name(path.name, item_mode))
+        TransferItem(
+            path,
+            item_mode,
+            project_from_name(path.name, item_mode),
+            read_trans_type(path, item_mode),
+        )
         for item_mode in modes
         for path in config_dir.glob(f"*_{item_mode}_settings.json")
         if path.is_file()
@@ -112,11 +170,14 @@ def locked_mode_for_role(dev_machine: bool) -> str:
 
 def policy_message(locked_mode: str) -> str:
     if locked_mode == "download":
-        return "CLINK 發佈端禁止下載，只允許上傳。"
-    return "部署端禁止上傳，只允許下載，避免舊程式回灌 OTA。"
+        return "CLINK 發佈端禁止下載，只允許上傳。（回傳類專案不受此限）"
+    return "部署端禁止上傳，只允許下載，避免舊程式回灌 OTA。（回傳類專案不受此限）"
 
 
 def is_selectable(item: TransferItem, locked_mode: str) -> bool:
+    """回傳流兩個方向都碰不到方向鎖要保護的東西（開發工作區、OTA 發佈樹），故不受管制。"""
+    if item.trans_type == TELEMETRY:
+        return True
     return item.mode != locked_mode
 
 
@@ -260,7 +321,9 @@ def _draw(
         checked = item.path in state.selected
         mark = "[-]" if locked else ("[x]" if checked else "[ ]")
         mode = f"[{MODE_LABEL[item.mode]}]"
-        line = f" {mark} {mode:<4} {item.project:<30} {item.path.name}"
+        # 標出回傳類，讓操作者看得出某筆為何在鎖定方向仍可勾選；空白版與 [回傳] 顯示等寬。
+        tag = "[回傳]" if item.trans_type == TELEMETRY else "      "
+        line = f" {mark} {mode} {tag} {item.project:<30} {item.path.name}"
         selected_row = row_index == state.index
         attr = curses.A_REVERSE if selected_row else 0
         if locked and not selected_row:
@@ -426,8 +489,11 @@ def main(argv: list[str] | None = None) -> int:
     if args.list:
         print(f"規則：{policy_message(locked_mode)}")
         for item in items:
-            status = "locked" if item.mode == locked_mode else "enabled"
-            print(f"{item.mode:<8} {status:<7} {item.project:<30} {item.path.name}")
+            status = "enabled" if is_selectable(item, locked_mode) else "locked"
+            print(
+                f"{item.mode:<8} {status:<7} {item.trans_type:<9} "
+                f"{item.project:<30} {item.path.name}"
+            )
         return 0
     if not MAIN_SCRIPT.is_file():
         print(f"錯誤：找不到傳輸入口 {MAIN_SCRIPT}", file=sys.stderr)

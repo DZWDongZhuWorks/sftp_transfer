@@ -131,6 +131,7 @@ cp example_settings.json settings.json
 | 欄位（settings.json） | 對應 CLI 參數 | 範例值 | 用途 |
 |---|---|---|---|
 | `mode` | `--mode` | `"download"` 或 `"upload"` | 傳輸方向：`download`（**預設**，遠端→本地）或 `upload`（本地→遠端）。upload 模式下 `local_path` 為來源、`remote_path` 為目的地，詳見下方【上傳模式（local → remote）】 |
+| `trans_type` | 無（不影響傳輸行為） | `"deploy"` 或 `"telemetry"` | 流類別，與 `mode` 正交，僅供 `run_selected_transfers.py` 的方向守門判斷，`main.py` 不讀取。`deploy`（**預設**）＝程式／設定發佈流（岸→船），受方向鎖管制；`telemetry`＝資料回傳流（船→岸），兩端都可選。**只能讓守門更嚴、不能更鬆**：欄位缺漏／值拼錯／檔案讀不到一律當 `deploy`；宣告 `telemetry` 的 upload 若 `remote_path` 指向 `STANDARD/` 或 `UNIQUE/` 發佈樹，視為標錯而降回 `deploy`。詳見下方【上傳模式】的「為什麼回傳類要豁免」 |
 | `host` | `--host` | `"192.168.6.79"` | SFTP 伺服器位址或網域名稱（必填） |
 | `port` | `--port` | `22` | SFTP 連接埠，未填預設為 `22` |
 | `device_name` | `--device-name` | `"edge-101"` | 裝置/使用者識別名稱，會標示在 Log 內容與檔名中，方便日後彙整分辨來源（必填，建議每台裝置給唯一名稱） |
@@ -193,6 +194,18 @@ GUI：啟動後於右上角「模式」切換到「上傳」，來源/目的地�
 - `m` 切換顯示方向、`a` 全選目前畫面、`x` 清除、`r` 重掃 config、`q` 不執行直接離開。
 - 在 CLINK 發佈端，下載項目會維持鎖定，只允許上傳，避免覆蓋尚未發佈的開發修改。
 - 在其餘部署端（包含船舶資訊缺失或無法辨識角色時），上傳項目會維持鎖定，只允許下載，避免舊程式反向回灌 OTA。
+- 標為 `"trans_type": "telemetry"` 的專案不受上述方向鎖管制，兩端都選得到，列表上會標示 `[回傳]`。
+- `--list` 可在不啟動選單的情況下列出掃描結果，逐列顯示方向、鎖定狀態與流類別。
+
+#### 為什麼回傳類要豁免
+
+方向鎖保護的其實是兩個具體的爆炸半徑：**在 CLINK 上下載會蓋掉未提交的開發修改**（所有下載設定皆為 `duplicate_mode: overwrite` 且指向開發工作區），以及**在船上上傳會把舊程式回灌 OTA**（寫進 `STANDARD/`、`UNIQUE/` 發佈樹後會被其他船拉走）。「方向」只是這兩個半徑的代理判準，不是本質。
+
+船到岸的資料回傳流（如 `device_monitor_report`）兩個方向都碰不到這兩個半徑——上傳的目的地在發佈樹之外、沒有任何船會從那裡拉東西；下載的目的地是被 gitignore 的資料目錄、蓋不到原始碼。它們不是「方向相反的例外」，而是根本不在守門的射程內，因此以 `trans_type` 宣告後直接豁免，而不是把方向鎖反過來。
+
+這個宣告**只能讓守門更嚴、不能更鬆**：欄位缺漏、值拼錯、JSON 壞掉一律當 `deploy`（fail-closed）；宣告 `telemetry` 的上傳若 `remote_path` 指向發佈樹，視為標錯而降回 `deploy`。所以把發佈類設定檔誤標成 `telemetry` 不會打開回灌的門。
+
+> **範圍**：這道守門只作用於 `run_selected_transfers.py` 這條互動路徑。`main.py` 不讀 `trans_type`，直接以 `--config` 呼叫 `main.py`（或 `run_all_*`、`script/run_*.sh`）不受此限。它防的是手滑選錯，不是 ACL。
 
 > **命名慣例**：`config/` 內的設定檔請以 `*_download_settings.json`（下載）或 `*_upload_settings.json`（上傳）結尾，兩支 `run_all_*` 腳本各自只會挑選對應方向的設定檔，彼此不會誤觸。
 

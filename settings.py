@@ -22,6 +22,9 @@ class PlaceholderError(ValueError):
 
 SETTINGS_TEMPLATE = {
     "mode": "download",
+    # 流類別，與 mode（方向）正交，僅供 run_selected_transfers 的守門判斷，main.py 不讀取。
+    # deploy＝程式／設定發佈流（岸→船），受方向鎖管制；telemetry＝資料回傳流（船→岸），不受管制。
+    "trans_type": "deploy",
     "host": "",
     "port": 22,
     "device_name": "",

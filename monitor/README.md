@@ -77,9 +77,17 @@ python monitor/log_monitor.py --log-dir fleet_logs --tui
 # 搭配即時監視（每 60 秒重抓遠端 log 再刷新，保留展開/選取狀態）
 python monitor/log_monitor.py --sync-config config/log_monitor_sync.json \
     --log-dir fleet_logs --tui --watch 60
+# 邊看 TUI 邊產出 HTML 報告（首輪與每次重載都覆寫同一份）
+python monitor/log_monitor.py --log-dir fleet_logs --tui --html
 ```
 
 同步期間由 TUI 安全顯示 `main.py` 最近 20 行輸出；完整紀錄仍寫入原本的 CSV log。
+
+`--tui` 可以與 `--html` 併用：**首輪分析結束後寫一次，之後每次重載（`r` 手動、`--watch`
+自動）都跟著覆寫同一份**，等同 `--watch --html` 的儀表板行為。寫出的檔名會顯示在畫面
+第二行（`HTML→log_monitor.html`），寫入失敗只會顯示 `HTML 失敗：<例外>`，不會中斷 TUI。
+報告內容是**完整快照**（只套 CLI 參數的過濾）；TUI 內的 `/`、`m`、`s`、`p` 純屬畫面過濾，
+不影響報告。
 
 **非互動式終端機（cron／管線／`| grep`）會自動退回靜態分群輸出**，不會卡住或崩潰。
 
@@ -177,7 +185,7 @@ python monitor/log_monitor.py \
 | `--log-dir PATH` | 要分析的本地 log 目錄（預設 `logs`）。遞迴掃描 `*.csv`，涵蓋巢狀結構。 |
 | `--mode {download,upload,all}` | 只看某方向（預設 `all`）。 |
 | `--stale-hours N` | 逾期告警門檻（小時，預設 72）。 |
-| `--html [PATH]` | 另存 HTML 報告；不接路徑則**覆寫** `<log-dir>/log_monitor.html`（固定檔名，`--watch` 為原地刷新、不堆檔）。需保留歷史快照時改接明確路徑。 |
+| `--html [PATH]` | 另存 HTML 報告；不接路徑則**覆寫** `<log-dir>/log_monitor.html`（固定檔名，`--watch`／`--tui` 每次刷新皆原地覆寫、不堆檔）。需保留歷史快照時改接明確路徑。 |
 | `--sync-config PATH` | 分析前先用此 download 設定檔觸發本體下載遠端 log。 |
 | `--watch SECONDS` | 每 N 秒清畫面刷新（搭配 `--sync-config` 才會重新下載）。 |
 | `--vessel NAME` | 只顯示指定船名。 |

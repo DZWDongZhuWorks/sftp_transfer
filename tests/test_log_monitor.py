@@ -23,6 +23,7 @@ from monitor.log_monitor import (
     render_cli_grouped,
     render_html,
     sync_logs,
+    write_html_report,
 )
 
 
@@ -271,6 +272,19 @@ def test_render_html_writes_file(tmp_path):
     assert "CLINK_IPC-1_ecdis" in content
     assert "chip s-success" in content
     assert "<!DOCTYPE html>" in content
+
+
+def test_write_html_report_paths(tmp_path):
+    """靜態、--watch 與 TUI 共用這個產出點，三種 html_path 語意都要對。"""
+    devices, now = _sample_devices(tmp_path)
+    assert write_html_report(devices, now, tmp_path, 24, None) is None  # 沒下 --html
+    assert not list(tmp_path.glob("*.html"))
+
+    auto = write_html_report(devices, now, tmp_path, 24, "__auto__")   # 旗標式 --html
+    assert auto == tmp_path / "log_monitor.html" and auto.exists()
+
+    explicit = write_html_report(devices, now, tmp_path, 24, str(tmp_path / "x" / "r.html"))
+    assert explicit == tmp_path / "x" / "r.html" and explicit.exists()
 
 
 def test_render_empty(tmp_path):

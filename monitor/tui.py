@@ -35,6 +35,7 @@ from monitor.log_monitor import (
     group_is_problem,
     read_log_rows,
     sync_logs,
+    write_html_report,
 )
 
 _MODE_CYCLE = ["", "download", "upload"]
@@ -131,6 +132,7 @@ class TuiState:
     flat: bool = False                 # True＝平坦模式（不分群，全船隊一張表）
     sort_key: str = _SORT_CYCLE[0]      # 見 _SORT_CYCLE
     sort_desc: bool = True             # 預設由 _SORT_CYCLE 首欄位降冪排序
+    html_note: str = ""                # --html 每輪寫出的結果，顯示在第二行（""＝未啟用）
 
 
 def _badge(s) -> str:
@@ -739,6 +741,29 @@ def load_tree(args, now: datetime, sync_handler=None):
     return build_tree(devices)
 
 
+def write_html_snapshot(args, tree, now: datetime) -> str:
+    """`--tui --html`：每輪分析後覆寫同一份報告，回傳要顯示在第二行的字（""＝沒下 --html）。
+
+    TUI 會略過 log_monitor._run_once，HTML 因此得在共用的重載點自己寫一次，否則
+    `--tui --html` 會靜默失敗。實際產出交給資料層的 write_html_report，與靜態、
+    --watch 走同一份路徑與內容邏輯；這裡只多做 curses 層需要的兩件事：吞掉例外、湊訊息。
+
+    裝置清單從樹走回來＝已套過 --vessel/--ipc/--component/--status，與靜態輸出相同；
+    TUI 內的互動過濾（/、m、s、p）純屬畫面，不影響報告，報告永遠是同一份完整快照。
+    """
+    try:
+        target = write_html_report(
+            [it.dev for it in tree_devices(tree)],
+            now,
+            args.log_dir,
+            args.stale_hours,
+            getattr(args, "html", None),
+        )
+    except Exception as exc:  # 報告只是副產物，寫不出來不該讓整個 TUI 當掉
+        return f"HTML 失敗：{type(exc).__name__}"
+    return "" if target is None else f"HTML→{target.name}"
+
+
 _HELP_LINES = [
     "移動      ↑/↓ 或 k/j、PgUp/PgDn、Home/End",
     "展開收合  Enter/Space 開合群組；→/l 展開、←/h 收合（裝置列 ← 跳父群）",
@@ -856,7 +881,8 @@ def _draw(stdscr, state: TuiState, rows: list[Row], tree, watch: float) -> None:
     if watch:
         filt.append(f"每{int(watch)}s刷新")
     head2 = (f" 檢視: {'平坦' if state.flat else '分群'}｜{sort_label(state.sort_key, state.sort_desc)}"
-             "  過濾: " + ("、".join(filt) if filt else "（無）"))
+             + (f"｜{state.html_note}" if state.html_note else "")
+             + "  過濾: " + ("、".join(filt) if filt else "（無）"))
     _addstr(stdscr, 0, 0, fit_display(head1, width)[0], curses.A_BOLD)
     _addstr(stdscr, 1, 0, fit_display(head2, width)[0], curses.A_DIM)
     _addstr(stdscr, maxy - 1, 0, pad_display(footer_hint(state), width), curses.A_REVERSE)
@@ -1070,6 +1096,9 @@ def _main_loop(stdscr, args):
         )
         seed_expanded(tree, state)
         state.now = now
+        # reload 是唯一的重載點：首輪啟動、r 手動重載、--watch 自動刷新都經過這裡，
+        # 掛在這上面 --html 才三種情況全涵蓋，與 --watch 儀表板的行為一致。
+        state.html_note = write_html_snapshot(args, tree, now)
         return tree
 
     tree = reload()

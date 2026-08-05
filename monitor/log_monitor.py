@@ -1048,7 +1048,9 @@ def build_parser() -> argparse.ArgumentParser:
         nargs="?",
         const="__auto__",
         default=None,
-        help="另存 HTML 報告；可接路徑，不接則覆寫 <log-dir>/log_monitor.html",
+        metavar="PATH",
+        help="另存 HTML 報告；不接路徑則覆寫 <log-dir>/log_monitor.html；"
+             "watch/TUI 每次刷新時同步覆寫",
     )
     p.add_argument("--sync-config", default=None, help="分析前先用此 download 設定檔觸發本體下載遠端 log")
     p.add_argument("--watch", type=float, default=None, help="每 N 秒刷新（搭配 --sync-config 才會重新下載）")
@@ -1099,6 +1101,28 @@ def _apply_filters(devices, vessel=None, ipc=None, component=None, status="all")
     return devices
 
 
+def write_html_report(devices: list, now: datetime, log_dir,
+                      stale_hours: float, html_path) -> Path | None:
+    """依 `--html` 設定寫出目前快照，供靜態、`--watch` 與 TUI 共用。
+
+    TUI 不走 _run_once，卻必須寫到同一個地方，所以產出點集中在這裡；兩邊各算一次路徑
+    遲早會漂移（例如只有一邊套用 --log-dir）。html_path=None 代表沒下 --html，什麼都不做。
+    """
+    if html_path is None:
+        return None
+    # __auto__＝旗標式的 --html：固定檔名、覆寫同一份，--watch/TUI 就是原地刷新的儀表板，
+    # 不會堆積檔案。需保留歷史快照時，改用 --html <明確路徑>。
+    target = Path(log_dir) / "log_monitor.html" if html_path == "__auto__" else Path(html_path)
+    render_html(
+        devices,
+        target,
+        generated_at=now,
+        log_dir=str(log_dir),
+        stale_hours=stale_hours,
+    )
+    return target
+
+
 def _run_once(args, use_color: bool) -> tuple[str, list[DeviceStatus]]:
     if args.sync_config:
         sync_logs(args.sync_config)
@@ -1116,21 +1140,9 @@ def _run_once(args, use_color: bool) -> tuple[str, list[DeviceStatus]]:
             build_tree(devices), now=now, use_color=use_color, expand=expand
         )
 
-    if args.html is not None:
-        if args.html == "__auto__":
-            # 固定檔名、覆寫同一份：--watch 就是原地刷新的儀表板，不會堆積檔案。
-            # 需保留歷史快照時，改用 --html <明確路徑>。
-            html_path = Path(args.log_dir) / "log_monitor.html"
-        else:
-            html_path = Path(args.html)
-        render_html(
-            devices,
-            html_path,
-            generated_at=now,
-            log_dir=str(args.log_dir),
-            stale_hours=args.stale_hours,
-        )
-        out += f"\n\nHTML 報告已寫出：{html_path}"
+    target = write_html_report(devices, now, args.log_dir, args.stale_hours, args.html)
+    if target is not None:
+        out += f"\n\nHTML 報告已寫出：{target}"
     return out, devices
 
 

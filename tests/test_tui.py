@@ -59,6 +59,46 @@ def test_load_tree_quiets_sync_output(tmp_path):
     sync.assert_called_once_with("sync.json", quiet=True)
 
 
+def _html_args(tmp_path, html):
+    return SimpleNamespace(
+        sync_config=None, log_dir=tmp_path, mode="all", stale_hours=24,
+        vessel=None, ipc=None, component=None, status="all", html=html,
+    )
+
+
+def test_write_html_snapshot_disabled_without_flag(tmp_path):
+    tree = _sorted_tree(tmp_path)
+    assert tui.write_html_snapshot(_html_args(tmp_path, None), tree, NOW) == ""
+    assert not list(tmp_path.glob("*.html"))
+
+
+def test_write_html_snapshot_auto_path_and_content(tmp_path):
+    """--tui --html（不帶路徑）要寫到 <log-dir>/log_monitor.html，與靜態輸出同一份。"""
+    tree = _sorted_tree(tmp_path)
+    note = tui.write_html_snapshot(_html_args(tmp_path, "__auto__"), tree, NOW)
+    out = tmp_path / "log_monitor.html"
+    assert note == "HTML→log_monitor.html"
+    text = out.read_text(encoding="utf-8")
+    # 樹上每台裝置都要進報告（含無法解析船名者），過濾語意與靜態輸出一致
+    for dev in ("ecdis", "radar", "share", "RADAR_UPLOADER"):
+        assert dev in text
+
+
+def test_write_html_snapshot_explicit_path(tmp_path):
+    tree = _sorted_tree(tmp_path)
+    target = tmp_path / "sub" / "report.html"  # render_html 會自己建目錄
+    note = tui.write_html_snapshot(_html_args(tmp_path, str(target)), tree, NOW)
+    assert note == "HTML→report.html" and target.exists()
+
+
+def test_write_html_snapshot_survives_write_error(tmp_path):
+    """報告只是副產物：寫不出來要回報訊息，不能讓整個 TUI 當掉。"""
+    tree = _sorted_tree(tmp_path)
+    args = _html_args(tmp_path, "__auto__")
+    with mock.patch.object(tui, "write_html_report", side_effect=PermissionError("ro")):
+        assert tui.write_html_snapshot(args, tree, NOW) == "HTML 失敗：PermissionError"
+
+
 def test_sync_progress_keeps_recent_lines_clean():
     # 高度足夠顯示滿 _SYNC_LINE_LIMIT 行
     class FakeScreen:

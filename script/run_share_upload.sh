@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# 更新 radar
+# 上傳 share（alarm/board/flag/controller → STANDARD/share/，各自依 basename 展開）
 set -euo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
@@ -9,12 +9,9 @@ BASE_DIR="$(dirname "$SCRIPT_DIR")"
 # 無論從哪個目錄或排程 (cron) 執行都能正確解析。
 cd "$BASE_DIR"
 
-# 開發機 (CLINK) 守門：見 _dev_guard.sh。radar 下載會 overwrite 覆蓋開發端 git repo，
-# 在 CLINK 上一律略過，避免覆蓋未提交的修改。
-source "$SCRIPT_DIR/_dev_guard.sh"
-dev_guard "$BASE_DIR"
-
-config="$SCRIPT_DIR/../config/radar_download_settings.json"
+# 注意：上傳「刻意不套用」_dev_guard.sh 的 CLINK 守門。CLINK 是 STANDARD 的發佈源頭，
+# 發佈動作正是要從這台往上傳；守門只用於下載（避免 STANDARD 覆蓋開發端未提交的修改）。
+config="$SCRIPT_DIR/../config/IPC1_share_upload_settings.json"
 
 if [[ ! -f "$config" ]]; then
     echo "找不到設定檔: $config" >&2
@@ -30,4 +27,4 @@ if [[ ! -x "$VENV_PY" ]]; then
     exit 1
 fi
 
-"$VENV_PY" "$BASE_DIR/main.py" --cli --config "$config"
+"$VENV_PY" "$BASE_DIR/main.py" --cli --mode upload --config "$config"

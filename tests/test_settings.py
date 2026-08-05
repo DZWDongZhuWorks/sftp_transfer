@@ -55,6 +55,35 @@ class TestResolvePlaceholders:
         result = settings_module.resolve_placeholders({"device_name": "{vsl_name}_{ipc}_SFTP_DOWNLOADER"})
         assert result["device_name"] == "WH289_IPC-1_SFTP_DOWNLOADER"
 
+    def test_takeover_does_not_change_the_ipc_placeholder(self, tmp_path, monkeypatch):
+        """接管中的機器,{ipc} 仍必須解析成原本的 IPC-x。
+
+        這是「接管旗標用獨立欄位、不改寫 ipc」的全部理由所在。{ipc} 出現在 19 個
+        settings 檔(device_name ×19、log_remote_dir ×9,以及
+        device_monitor_report_upload_settings.json 的 remote_path ×1)。若接管時把 ipc 寫成
+        "IPC-2-EMER",該船的報表會上傳到 device_monitor_reports/{vsl}/IPC-2-EMER/ ——
+        岸端的歷史斷成兩個目錄,而且是在最需要分辨誰是誰的時候。
+
+        settings.py 本身不需要為此改動;這條測試把該性質釘住,免得日後有人「順手簡化」
+        成把 emer 塞回 ipc 欄位。
+        """
+        self._write_vessel_info(
+            tmp_path, monkeypatch,
+            content='{"vsl_name": "WH289", "ipc": "IPC-2", "failover": true,'
+                    ' "failover_since": 1785000000}',
+        )
+        result = settings_module.resolve_placeholders({
+            "remote_path": "/fleet/wanhai_nssms_deploy/device_monitor_reports/{vsl_name}/{ipc}",
+            "device_name": "{vsl_name}_{ipc}_scheduler",
+            "log_remote_dir": "/fleet/deploy/{vsl_name}/{ipc}/sftp_logs",
+        })
+        assert result["remote_path"] == (
+            "/fleet/wanhai_nssms_deploy/device_monitor_reports/WH289/IPC-2")
+        assert result["device_name"] == "WH289_IPC-2_scheduler"
+        assert result["log_remote_dir"] == "/fleet/deploy/WH289/IPC-2/sftp_logs"
+        for value in result.values():
+            assert "EMER" not in value.upper()
+
     def test_non_string_values_left_untouched(self, tmp_path, monkeypatch):
         self._write_vessel_info(tmp_path, monkeypatch)
         result = settings_module.resolve_placeholders(

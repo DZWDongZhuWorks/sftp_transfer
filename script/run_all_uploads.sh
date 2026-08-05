@@ -1,12 +1,12 @@
 #!/usr/bin/env bash
-# 手動執行：遍歷 config/ 內所有「下載」設定檔（*_download_settings.json）並依序執行 SFTP 下載。
+# 手動執行：遍歷 config/ 內所有「上傳」設定檔（*_upload_settings.json）並依序執行 SFTP 上傳。
 #
-# 供使用者手動一次跑完全部下載用；自動排程（timer / reboot_launcher）不使用本腳本，
-# 而是各自呼叫對應的單一 run_*.sh。實際遍歷與結果彙總由 run_all_downloads.py 負責。
+# 供使用者手動一次跑完全部上傳用；自動排程（timer / reboot_launcher）不使用本腳本，
+# 而是各自呼叫對應的單一 run_*.sh。實際遍歷與結果彙總由 run_all_uploads.py 負責。
 #
 # 用法：
-#   script/run_all_downloads.sh                     # 跑 ./config 內全部下載設定
-#   script/run_all_downloads.sh --config-dir other  # 指定其他設定檔資料夾
+#   script/run_all_uploads.sh                     # 跑 ./config 內全部上傳設定
+#   script/run_all_uploads.sh --config-dir other  # 指定其他設定檔資料夾
 set -euo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
@@ -16,11 +16,11 @@ BASE_DIR="$(dirname "$SCRIPT_DIR")"
 # 無論從哪個目錄或排程 (cron) 執行都能正確解析（子行程會繼承此 CWD）。
 cd "$BASE_DIR"
 
-# 開發機 (CLINK) 守門由 driver run_all_downloads.py 的 is_dev_machine() 負責，
-# 直接 `python run_all_downloads.py` 也擋得到，故不在本包裝腳本重複實作。
-DRIVER="$BASE_DIR/run_all_downloads.py"
+# 注意：上傳「刻意不套用」_dev_guard.sh 的 CLINK 守門。CLINK 是 STANDARD 的發佈源頭，
+# 發佈動作正是要從這台往上傳；守門只用於下載（避免 STANDARD 覆蓋開發端未提交的修改）。
+DRIVER="$BASE_DIR/run_all_uploads.py"
 if [[ ! -f "$DRIVER" ]]; then
-    echo "找不到彙總下載腳本: $DRIVER" >&2
+    echo "找不到彙總上傳腳本: $DRIVER" >&2
     exit 1
 fi
 

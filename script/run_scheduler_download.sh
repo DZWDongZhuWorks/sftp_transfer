@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# 更新 radar
+# 更新 scheduler
 set -euo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
@@ -9,12 +9,12 @@ BASE_DIR="$(dirname "$SCRIPT_DIR")"
 # 無論從哪個目錄或排程 (cron) 執行都能正確解析。
 cd "$BASE_DIR"
 
-# 開發機 (CLINK) 守門：見 _dev_guard.sh。radar 下載會 overwrite 覆蓋開發端 git repo，
-# 在 CLINK 上一律略過，避免覆蓋未提交的修改。
+# 開發機 (CLINK) 守門：見 _dev_guard.sh。scheduler 下載會 overwrite 覆蓋本地
+# share/scheduler，在 CLINK 上一律略過，避免覆蓋未提交的修改。
 source "$SCRIPT_DIR/_dev_guard.sh"
 dev_guard "$BASE_DIR"
 
-config="$SCRIPT_DIR/../config/radar_download_settings.json"
+config="$SCRIPT_DIR/../config/scheduler_download_settings.json"
 
 if [[ ! -f "$config" ]]; then
     echo "找不到設定檔: $config" >&2

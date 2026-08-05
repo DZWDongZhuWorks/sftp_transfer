@@ -2,6 +2,8 @@
 
 import hashlib
 import logging
+import os
+import stat
 from pathlib import Path
 from unittest.mock import MagicMock, patch
 
@@ -32,6 +34,18 @@ class TestFormatSize:
     def test_gigabyte_and_beyond_stays_gb(self):
         # 超過 GB 仍以 GB 為單位顯示（不會再往上換算 TB）。
         assert dl.format_size(1024 ** 4) == "1024.0GB"
+
+
+# ---------------------------------------------------------------------------
+# format_exception
+# ---------------------------------------------------------------------------
+
+class TestFormatException:
+    def test_includes_type_and_repr_for_empty_message_exception(self):
+        assert dl.format_exception(TimeoutError()) == "TimeoutError: TimeoutError()"
+
+    def test_includes_type_and_message(self):
+        assert dl.format_exception(OSError("connection reset")) == "OSError: OSError('connection reset')"
 
 
 # ---------------------------------------------------------------------------
@@ -66,6 +80,9 @@ class TestRetryLimitReached:
 # ---------------------------------------------------------------------------
 
 class TestConnect:
+    def test_socket_timeout_is_tuned_for_slow_wan_links(self):
+        assert dl.SOCKET_TIMEOUT == 120
+
     @patch("downloader.paramiko.SSHClient")
     def test_password_auth_connects_and_configures_timeouts(self, mock_ssh_client_cls, downloader_factory):
         mock_client = MagicMock()
@@ -85,6 +102,39 @@ class TestConnect:
         mock_transport.set_keepalive.assert_called_once_with(dl.KEEPALIVE_INTERVAL)
         assert d.client is mock_client
         assert d.sftp is mock_sftp
+
+    @patch("downloader.paramiko.SSHClient")
+    def test_closes_previous_connection_before_reconnecting(self, mock_ssh_client_cls, downloader_factory):
+        old_sftp = MagicMock()
+        old_client = MagicMock()
+        new_client = MagicMock()
+        new_sftp = MagicMock()
+        new_client.open_sftp.return_value = new_sftp
+        mock_ssh_client_cls.return_value = new_client
+
+        d = downloader_factory(password="secret")
+        d.sftp = old_sftp
+        d.client = old_client
+        d._connect()
+
+        old_sftp.close.assert_called_once()
+        old_client.close.assert_called_once()
+        assert d.sftp is new_sftp
+        assert d.client is new_client
+
+    @patch("downloader.paramiko.SSHClient")
+    def test_failed_new_connection_is_closed(self, mock_ssh_client_cls, downloader_factory):
+        new_client = MagicMock()
+        new_client.connect.side_effect = OSError("refused")
+        mock_ssh_client_cls.return_value = new_client
+
+        d = downloader_factory(password="secret")
+        with pytest.raises(OSError):
+            d._connect()
+
+        new_client.close.assert_called_once()
+        assert d.sftp is None
+        assert d.client is None
 
     @patch("downloader.paramiko.SSHClient")
     def test_key_file_auth_used_instead_of_password(self, mock_ssh_client_cls, downloader_factory):
@@ -132,6 +182,12 @@ class TestConnectWithRetry:
         d._connect = MagicMock(side_effect=[OSError("refused"), OSError("refused"), None])
         d._connect_with_retry()
         assert d._connect.call_count == 3
+
+    def test_retries_after_sftp_protocol_error(self, downloader_factory):
+        d = downloader_factory(retry_count=2, wait_for_network=False)
+        d._connect = MagicMock(side_effect=[paramiko.SFTPError("Garbage packet received"), None])
+        d._connect_with_retry()
+        assert d._connect.call_count == 2
 
     def test_raises_after_exceeding_retry_limit(self, downloader_factory):
         d = downloader_factory(retry_count=2, wait_for_network=False)
@@ -199,13 +255,23 @@ class TestClose:
 
     def test_close_swallows_exceptions_from_sftp_and_client(self, downloader_factory):
         d = downloader_factory()
-        d.sftp = MagicMock()
-        d.sftp.close.side_effect = Exception("already closed")
-        d.client = MagicMock()
-        d.client.close.side_effect = Exception("already closed")
+        sftp = MagicMock()
+        sftp.close.side_effect = Exception("already closed")
+        client = MagicMock()
+        client.close.side_effect = Exception("already closed")
+        d.sftp = sftp
+        d.client = client
         d._close()  # 不應向外拋出
-        d.sftp.close.assert_called_once()
-        d.client.close.assert_called_once()
+        sftp.close.assert_called_once()
+        client.close.assert_called_once()
+
+    def test_close_clears_stale_connection_references(self, downloader_factory):
+        d = downloader_factory()
+        d.sftp = MagicMock()
+        d.client = MagicMock()
+        d._close()
+        assert d.sftp is None
+        assert d.client is None
 
 
 # ---------------------------------------------------------------------------
@@ -482,6 +548,17 @@ class TestDownloadOneFileFreshDownload:
         assert (tmp_path / "sub" / "b.txt").read_bytes() == b"nested"
 
 
+class TestDownloadPreservesModeAndMtime:
+    def test_downloaded_file_mirrors_remote_mode_and_mtime(self, downloader_factory, fake_sftp_factory, tmp_path):
+        d = downloader_factory()
+        # FakeSFTPAttr 對一般檔案回 st_mode=S_IFREG|0o644、st_atime=st_mtime。
+        d.sftp = fake_sftp_factory(files={"/remote/x.sh": b"#!/bin/sh\n"}, mtimes={"/remote/x.sh": 1234567})
+        d._download_one_file("/remote/x.sh", "x.sh", tmp_path)
+        st = os.stat(tmp_path / "x.sh")
+        assert stat.S_IMODE(st.st_mode) == 0o644     # 權限鏡射自來源(而非本地 umask 預設)
+        assert int(st.st_mtime) == 1234567           # mtime 保留
+
+
 class TestDownloadOneFileResumeDisabled:
     def test_resume_disabled_overwrite_mode_replaces_in_place(self, downloader_factory, fake_sftp_factory, tmp_path):
         (tmp_path / "f.json").write_bytes(b"OLD")
@@ -575,7 +652,8 @@ class TestDownloadOneFileLocalSmallerDuplicateMode:
 class TestDownloadOneFileLocalSmallerOverwriteMode:
     def test_verified_same_version_resumes_via_append(self, downloader_factory, fake_sftp_factory, tmp_path):
         full_content = b"AAAAABBBBBCCCCCDDDDDEEEEE"
-        (tmp_path / "f.bin").write_bytes(full_content[:10])
+        # 沒下載完的內容留在暫存檔，目的地此時還不存在（見 downloader.PART_SUFFIX）
+        (tmp_path / ("f.bin" + dl.PART_SUFFIX)).write_bytes(full_content[:10])
         d = downloader_factory(duplicate_mode="overwrite")
         d._manifest = {
             "f.bin": {
@@ -590,10 +668,11 @@ class TestDownloadOneFileLocalSmallerOverwriteMode:
         assert result == "downloaded"
         assert (tmp_path / "f.bin").read_bytes() == full_content
         assert not (tmp_path / "f_copy.bin").exists()
+        assert not (tmp_path / ("f.bin" + dl.PART_SUFFIX)).exists(), "完成後暫存檔應已換名到目的地"
 
     def test_hash_mismatch_tampered_local_file_falls_back_to_full_redownload(self, downloader_factory, fake_sftp_factory, tmp_path):
         full_content = b"ORIGINAL-CONTENT-DATA"
-        (tmp_path / "f.bin").write_bytes(b"TAMPERED12")  # 與紀錄檔中的雜湊對不上
+        (tmp_path / ("f.bin" + dl.PART_SUFFIX)).write_bytes(b"TAMPERED12")  # 與紀錄檔中的雜湊對不上
         d = downloader_factory(duplicate_mode="overwrite")
         d._manifest = {
             "f.bin": {
@@ -611,7 +690,7 @@ class TestDownloadOneFileLocalSmallerOverwriteMode:
     def test_remote_version_changed_falls_back_to_full_redownload(self, downloader_factory, fake_sftp_factory, tmp_path):
         """就算本地雜湊本身沒問題，只要遠端版本（size/mtime）跟紀錄不符，就不能信任接續。"""
         old_full = b"OLD-VERSION-CONTENT"
-        (tmp_path / "f.bin").write_bytes(old_full[:5])
+        (tmp_path / ("f.bin" + dl.PART_SUFFIX)).write_bytes(old_full[:5])
         d = downloader_factory(duplicate_mode="overwrite")
         d._manifest = {
             "f.bin": {
@@ -639,7 +718,7 @@ class TestDownloadOneFileLocalSmallerOverwriteMode:
     def test_resume_only_reads_remaining_bytes_not_already_downloaded_portion(self, downloader_factory, fake_sftp_factory, tmp_path):
         """效能保證：驗證接續下載時不會重新從遠端讀取已下載的部分（只讀本機雜湊）。"""
         full_content = b"A" * 6000 + b"B" * 4000
-        (tmp_path / "f.bin").write_bytes(full_content[:6000])
+        (tmp_path / ("f.bin" + dl.PART_SUFFIX)).write_bytes(full_content[:6000])
         d = downloader_factory(duplicate_mode="overwrite")
         d._manifest = {
             "f.bin": {
@@ -714,8 +793,10 @@ class TestDownloadOneFileCheckpointing:
 
         manifest = d._load_manifest(tmp_path)
         assert manifest["f.bin"]["local_bytes"] == dl.CHUNK_SIZE  # 只成功寫入了第一個 chunk
-        partial_on_disk = (tmp_path / "f.bin").read_bytes()
+        partial_on_disk = (tmp_path / ("f.bin" + dl.PART_SUFFIX)).read_bytes()
         assert len(partial_on_disk) == dl.CHUNK_SIZE
+        # 半截內容只存在於暫存檔；目的地在下載完成前不該出現
+        assert not (tmp_path / "f.bin").exists()
 
     def test_progress_logged_and_increases_monotonically(self, downloader_factory, fake_sftp_factory, tmp_path, caplog):
         content = b"Z" * (dl.CHUNK_SIZE * 5)
@@ -724,9 +805,88 @@ class TestDownloadOneFileCheckpointing:
         with caplog.at_level(logging.INFO):
             d._download_one_file("/remote/f.bin", "f.bin", tmp_path)
         pct_lines = [r.message for r in caplog.records if "進度" in r.message]
-        percents = [int(line.split(":")[-1].strip().rstrip("%")) for line in pct_lines]
+        # 進度訊息格式為「... 進度: NN%」或「... 進度: NN% (速率/s)」，取百分號前的數字。
+        percents = [int(line.split("進度:")[-1].split("%")[0].strip()) for line in pct_lines]
         assert percents == sorted(percents)
         assert percents[-1] == 100
+
+
+class TestDownloadNeverWritesDestinationInPlace:
+    """目的地只能被「原子換名」替換，不可以就地改寫。
+
+    這組是回歸測試,對應實際事故:開機時 update_booster 更新 scheduler,把正在執行中的
+    reboot_launcher.sh 就地覆寫,bash 按 byte offset 續讀而讀到錯位內容,
+    `line 547: syntax error near unexpected token '('` → 啟動器中斷 → 整台機器開機後
+    一個 tmux session 都沒有。換名換的是 inode,執行中的行程抓著舊 inode 就不受影響。
+    """
+
+    def test_update_replaces_inode_so_old_readers_keep_the_old_content(
+        self, downloader_factory, fake_sftp_factory, tmp_path
+    ):
+        script = tmp_path / "reboot_launcher.sh"
+        script.write_bytes(b"#!/bin/bash\nold version\n")
+        old_inode = script.stat().st_ino
+        d = downloader_factory()
+        d._manifest = {}
+        new_body = b"#!/bin/bash\nnew version, quite a bit longer than the old one\n"
+        d.sftp = fake_sftp_factory(
+            files={"/remote/reboot_launcher.sh": new_body},
+            mtimes={"/remote/reboot_launcher.sh": 4242},
+        )
+        # 模擬「這支腳本正在被 bash 執行」——執行中的行程持有的是舊 inode 的檔案描述子
+        with open(script, "rb") as running:
+            result = d._download_one_file(
+                "/remote/reboot_launcher.sh", "reboot_launcher.sh", tmp_path
+            )
+            assert result == "downloaded"
+            # 舊 fd 仍讀得到完整的舊內容,不會讀到新舊混雜的位元組
+            assert running.read() == b"#!/bin/bash\nold version\n"
+
+        assert script.read_bytes() == new_body          # 新版本已就位
+        assert script.stat().st_ino != old_inode        # 換的是 inode,不是就地覆寫
+
+    def test_interrupted_update_leaves_previous_version_intact(
+        self, downloader_factory, fake_sftp_factory, tmp_path
+    ):
+        old_body = b"#!/bin/bash\nold but complete\n"
+        script = tmp_path / "start_ecdis.sh"
+        script.write_bytes(old_body)
+        d = downloader_factory()
+        d._manifest = {}
+        sftp = fake_sftp_factory(
+            files={"/remote/start_ecdis.sh": b"N" * (dl.CHUNK_SIZE * 3)},
+            mtimes={"/remote/start_ecdis.sh": 55},
+        )
+        original_open = sftp.open
+
+        def flaky_open(path, mode="rb"):
+            fake_file = original_open(path, mode)
+            original_read = fake_file.read
+
+            def flaky_read(n=-1):
+                chunk = original_read(n)
+                raise OSError("simulated dropped connection")
+
+            fake_file.read = flaky_read
+            return fake_file
+
+        sftp.open = flaky_open
+        d.sftp = sftp
+
+        with pytest.raises(OSError):
+            d._download_one_file("/remote/start_ecdis.sh", "start_ecdis.sh", tmp_path)
+
+        # 斷線當下目的地仍是上一版的完整內容,不會變成半截的壞腳本
+        assert script.read_bytes() == old_body
+
+    def test_successful_download_leaves_no_part_file_behind(
+        self, downloader_factory, fake_sftp_factory, tmp_path
+    ):
+        d = downloader_factory()
+        d.sftp = fake_sftp_factory(files={"/remote/x.sh": b"#!/bin/sh\n"}, mtimes={"/remote/x.sh": 7})
+        d._download_one_file("/remote/x.sh", "x.sh", tmp_path)
+        assert (tmp_path / "x.sh").read_bytes() == b"#!/bin/sh\n"
+        assert not (tmp_path / ("x.sh" + dl.PART_SUFFIX)).exists()
 
 
 # ---------------------------------------------------------------------------
@@ -758,10 +918,12 @@ class TestEnsureRemoteDir:
         d = downloader_factory(remote_log_dir="/fleet/WH289/IPC-1/sftp_logs", log_file=str(log_file))
         d.logger.addHandler(logging.NullHandler())
         d._connect_with_retry = MagicMock()
-        d.sftp = fake_sftp_factory(files={})
+        sftp = fake_sftp_factory(files={})
+        d.sftp = sftp
         d._upload_log_file()
-        assert "/fleet/WH289/IPC-1/sftp_logs" in d.sftp.dirs
-        assert "/fleet/WH289/IPC-1/sftp_logs/run.csv" in d.sftp.files
+        assert "/fleet/WH289/IPC-1/sftp_logs" in sftp.dirs
+        assert "/fleet/WH289/IPC-1/sftp_logs/run.csv" in sftp.files
+        assert d.sftp is None
 
 
 class TestUploadLogFile:
@@ -771,9 +933,11 @@ class TestUploadLogFile:
         d = downloader_factory(remote_log_dir="/data/logs", log_file=str(log_file))
         d.logger.addHandler(logging.NullHandler())
         d._connect_with_retry = MagicMock()
-        d.sftp = fake_sftp_factory(files={})
+        sftp = fake_sftp_factory(files={})
+        d.sftp = sftp
         d._upload_log_file()
-        assert "/data/logs/run.csv" in d.sftp.files
+        assert "/data/logs/run.csv" in sftp.files
+        assert d.sftp is None
 
     def test_upload_failure_is_caught_and_does_not_propagate(self, downloader_factory, tmp_path):
         log_file = tmp_path / "run.csv"
@@ -839,11 +1003,14 @@ class TestRun:
         assert result is False
         d._connect_with_retry.assert_called_once()
 
-    def test_remote_path_not_found_returns_false(self, downloader_factory, fake_sftp_factory):
+    def test_remote_path_not_found_skips_with_warning(self, downloader_factory, fake_sftp_factory, caplog):
         d = self._prepare(downloader_factory, fake_sftp_factory, files={})
         d.remote_path = "/remote/missing"
-        result = d.run()
-        assert result is False
+        with caplog.at_level(logging.WARNING):
+            result = d.run()
+        # 來源路徑不存在時記警告並略過該來源（見 commit 8251f01），不再視為整個任務失敗。
+        assert result is True
+        assert any("/remote/missing" in r.message for r in caplog.records)
 
     def test_remote_path_list_merges_all_sources_into_local_path(self, downloader_factory, fake_sftp_factory, tmp_path):
         d = self._prepare(
@@ -855,6 +1022,51 @@ class TestRun:
         assert d.run() is True
         assert (tmp_path / "a.txt").read_bytes() == b"A"
         assert (tmp_path / "config.json").read_bytes() == b"{}"
+
+    def test_paired_remote_local_lists_map_each_source_to_its_own_local(
+        self, downloader_factory, fake_sftp_factory, tmp_path
+    ):
+        # local 為等長陣列 → 逐一配對 remote[i]→local[i]（多專案各自落在自己的目錄，
+        # 如 STANDARD/share/alarm_controller → share/alarm_controller），不再攤平合併。
+        d = self._prepare(
+            downloader_factory, fake_sftp_factory,
+            files={"/remote/alarm/x.py": b"alarm", "/remote/board/y.py": b"board"},
+            mtimes={"/remote/alarm/x.py": 1, "/remote/board/y.py": 2},
+            remote_path=["/remote/alarm", "/remote/board"],
+            local_path=[str(tmp_path / "alarm_controller"), str(tmp_path / "board_controller")],
+        )
+        assert d.run() is True
+        assert (tmp_path / "alarm_controller" / "x.py").read_bytes() == b"alarm"
+        assert (tmp_path / "board_controller" / "y.py").read_bytes() == b"board"
+        # 不會攤平到共同的 local 根目錄。
+        assert not (tmp_path / "x.py").exists()
+
+    def test_mismatched_pairing_returns_false(self, downloader_factory, fake_sftp_factory, tmp_path, caplog):
+        d = self._prepare(
+            downloader_factory, fake_sftp_factory, files={},
+            remote_path=["/remote/alarm", "/remote/board"],
+            local_path=[str(tmp_path / "only_one")],
+        )
+        with caplog.at_level(logging.ERROR):
+            assert d.run() is False
+        assert any("配對數量不符" in r.message for r in caplog.records)
+
+    def test_trailing_slash_local_parent_fans_out_by_basename(
+        self, downloader_factory, fake_sftp_factory, tmp_path
+    ):
+        # local 帶尾斜線 → 視為共同父目錄，各 remote 來源展開到 父目錄/來源basename。
+        d = self._prepare(
+            downloader_factory, fake_sftp_factory,
+            files={"/remote/alarm_controller/x.py": b"alarm", "/remote/board_controller/y.py": b"board"},
+            mtimes={"/remote/alarm_controller/x.py": 1, "/remote/board_controller/y.py": 2},
+            remote_path=["/remote/alarm_controller", "/remote/board_controller"],
+            local_path=str(tmp_path) + "/",
+        )
+        assert d.run() is True
+        assert (tmp_path / "alarm_controller" / "x.py").read_bytes() == b"alarm"
+        assert (tmp_path / "board_controller" / "y.py").read_bytes() == b"board"
+        # 不會攤平到共同父目錄根。
+        assert not (tmp_path / "x.py").exists()
 
     def test_remote_path_list_duplicate_rel_path_last_source_wins(self, downloader_factory, fake_sftp_factory, tmp_path, caplog):
         d = self._prepare(
@@ -868,15 +1080,17 @@ class TestRun:
         assert (tmp_path / "config.json").read_bytes() == b"unique"
         assert any("以後面的來源為準" in r.message for r in caplog.records)
 
-    def test_remote_path_list_missing_source_returns_false_and_names_it(self, downloader_factory, fake_sftp_factory, caplog):
+    def test_remote_path_list_missing_source_skips_with_warning_and_names_it(self, downloader_factory, fake_sftp_factory, tmp_path, caplog):
         d = self._prepare(
             downloader_factory, fake_sftp_factory,
             files={"/standard/proj/a.txt": b"A"},
             remote_path=["/standard/proj", "/unique/missing"],
         )
-        with caplog.at_level(logging.ERROR):
-            assert d.run() is False
+        with caplog.at_level(logging.WARNING):
+            assert d.run() is True
+        # 缺少的來源被略過並在 Log 指明，存在的來源照常下載（見 commit 8251f01）。
         assert any("/unique/missing" in r.message for r in caplog.records)
+        assert (tmp_path / "a.txt").read_bytes() == b"A"
 
     def test_listing_error_retries_then_succeeds(self, downloader_factory, fake_sftp_factory):
         d = downloader_factory(wait_for_network=False, retry_count=3)
@@ -902,6 +1116,24 @@ class TestRun:
         d._list_remote_files = flaky_list
         result = d.run()
         assert result is True
+
+    def test_sftp_error_while_listing_retries_then_succeeds(self, downloader_factory, fake_sftp_factory):
+        d = downloader_factory(wait_for_network=False, retry_count=2)
+        good_sftp = fake_sftp_factory(files={"/remote/a.txt": b"A"}, mtimes={"/remote/a.txt": 1})
+        d._connect_with_retry = MagicMock(side_effect=lambda: setattr(d, "sftp", good_sftp))
+        d._close = MagicMock()
+        original_list = d._list_remote_files
+        state = {"failed_once": False}
+
+        def flaky_list(remote_root, local_root):
+            if not state["failed_once"]:
+                state["failed_once"] = True
+                raise paramiko.SFTPError("Garbage packet received")
+            return original_list(remote_root, local_root)
+
+        d._list_remote_files = MagicMock(side_effect=flaky_list)
+        assert d.run() is True
+        assert d._connect_with_retry.call_count == 2
 
     def test_listing_error_exceeds_retry_limit_returns_false(self, downloader_factory):
         d = downloader_factory(wait_for_network=False, retry_count=1)
@@ -949,6 +1181,27 @@ class TestRun:
         result = d.run()
         assert result is True
         assert d._connect_with_retry.call_count >= 2  # 初次連線 + 下載失敗後重連
+
+    def test_sftp_error_during_download_reconnects_and_succeeds(self, downloader_factory, fake_sftp_factory):
+        d = self._prepare(
+            downloader_factory,
+            fake_sftp_factory,
+            files={"/remote/a.txt": b"A"},
+            mtimes={"/remote/a.txt": 1},
+            retry_count=2,
+        )
+        original_download = d._download_one_file
+        state = {"failed_once": False}
+
+        def flaky_download(remote_file, rel_path, local_root):
+            if not state["failed_once"]:
+                state["failed_once"] = True
+                raise paramiko.SFTPError("Garbage packet received")
+            return original_download(remote_file, rel_path, local_root)
+
+        d._download_one_file = MagicMock(side_effect=flaky_download)
+        assert d.run() is True
+        assert d._connect_with_retry.call_count >= 2
 
     def test_connection_error_exceeds_retry_limit_marks_file_failed_but_continues(self, downloader_factory, fake_sftp_factory):
         d = self._prepare(
@@ -1030,6 +1283,17 @@ class TestRun:
         d._upload_log_file = MagicMock()
         d.run()
         d._upload_log_file.assert_not_called()
+
+    def test_upload_log_called_even_when_task_aborts(self, downloader_factory):
+        # 任務中途中止（此處以連線階段拋出未預期例外模擬）時，log 仍必須上傳，
+        # 否則最需要遠端紀錄的失敗情境反而沒有 log。此為 SFTPBase.run 以 finally 保證的行為。
+        d = downloader_factory(wait_for_network=False, upload_log=True, remote_log_dir="/logs")
+        d._connect_with_retry = MagicMock(side_effect=RuntimeError("boom"))
+        d._close = MagicMock()
+        d._upload_log_file = MagicMock()
+        result = d.run()
+        assert result is False
+        d._upload_log_file.assert_called_once()
 
 
 # ---------------------------------------------------------------------------

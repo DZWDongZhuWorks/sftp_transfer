@@ -21,6 +21,10 @@ class PlaceholderError(ValueError):
     """設定檔中的佔位符無法解析（vessel 資訊檔不存在、壞掉或缺少對應 key）。"""
 
 SETTINGS_TEMPLATE = {
+    "mode": "download",
+    # 流類別，與 mode（方向）正交，僅供 run_selected_transfers 的守門判斷，main.py 不讀取。
+    # deploy＝程式／設定發佈流（岸→船），受方向鎖管制；telemetry＝資料回傳流（船→岸），不受管制。
+    "trans_type": "deploy",
     "host": "",
     "port": 22,
     "device_name": "",

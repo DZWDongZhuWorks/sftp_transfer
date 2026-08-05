@@ -1,4 +1,8 @@
-"""SFTP 下載核心邏輯：連線、斷線重連、斷點續傳、Log 紀錄與回傳。"""
+"""SFTP 傳輸核心邏輯：連線、斷線重連、斷點續傳、Log 紀錄與回傳。
+
+`SFTPBase` 收攏方向無關的共用邏輯（連線/重試/網路偵測/關閉/ignore/manifest/遠端建目錄/Log 上傳），
+`SFTPDownloader`（下載，remote→local）與 `uploader.SFTPUploader`（上傳，local→remote）皆繼承之。
+"""
 
 import csv
 import hashlib
@@ -10,16 +14,30 @@ import socket
 import stat
 import time
 from datetime import datetime
-from pathlib import Path
+from pathlib import Path, PurePosixPath
 
 import paramiko
 
 from gitignore import GitIgnoreSpec
 
 CHUNK_SIZE = 32768
-SOCKET_TIMEOUT = 30
+SOCKET_TIMEOUT = 120
 KEEPALIVE_INTERVAL = 15
 MANIFEST_FILENAME = ".sftp_download_manifest.json"
+# 下載一律先寫進「目的檔名 + 這個後綴」的暫存檔，完成後才 os.replace 換名到目的地。
+# 換名換的是 inode，於是：
+#   1. 目的地在任何時刻都只會是「上一版完整檔案」或「這一版完整檔案」，不會出現半截檔；
+#   2. 正在執行中的 .sh 抓著舊 inode 不放，即使自己被更新也能安全跑完（bash 是邊讀邊
+#      執行、按 byte offset 續讀的，就地覆寫會讓它讀到錯位的內容而語法錯誤 —— 實際發生
+#      過:開機時 update_booster 更新 reboot_launcher.sh，把正在跑的自己改掉而中斷開機）。
+# 暫存檔與目的檔同目錄,確保同一個檔案系統、rename 才具原子性。
+PART_SUFFIX = ".part"
+SFTP_RETRY_EXCEPTIONS = (
+    paramiko.SSHException,
+    paramiko.SFTPError,
+    OSError,
+    EOFError,
+)
 
 _FILENAME_UNSAFE = re.compile(r'[<>:"/\\|?*]')
 
@@ -30,6 +48,11 @@ def format_size(num_bytes):
         if size < 1024 or unit == "GB":
             return f"{size:.1f}{unit}"
         size /= 1024
+
+
+def format_exception(error):
+    """保留例外類型與 repr；即使 socket.timeout 沒有訊息，Log 仍可辨識原因。"""
+    return f"{type(error).__name__}: {error!r}"
 
 
 class _CSVFileHandler(logging.Handler):
@@ -63,15 +86,17 @@ class _CSVFileHandler(logging.Handler):
         super().close()
 
 
-def create_logger(log_dir, device_name, version_info="", log_callback=None):
+def create_logger(log_dir, device_name, version_info="", log_callback=None, mode="download"):
     """device_name 用於標示這份 Log 屬於哪一台設備/使用者（多台 edge device 共用同一 SFTP 帳號時仍可分辨）。
-    version_info 為選填的上傳版號資訊，會一併記錄在 Log 中，不影響任何下載邏輯。"""
+    version_info 為選填的上傳版號資訊，會一併記錄在 Log 中，不影響任何傳輸邏輯。
+    mode 決定檔名前綴：download → D_、upload → U_，以便一眼分辨傳輸方向。"""
     log_dir = Path(log_dir)
     log_dir.mkdir(parents=True, exist_ok=True)
     safe_device_name = _FILENAME_UNSAFE.sub("_", device_name).strip() or "unknown"
-    log_file = log_dir / f"sftp_download_{safe_device_name}_{datetime.now().strftime('%Y%m%d_%H%M%S')}.csv"
+    prefix = "U_" if mode == "upload" else "D_"
+    log_file = log_dir / f"{prefix}{safe_device_name}_{datetime.now().strftime('%Y%m%d_%H%M%S')}.csv"
 
-    logger = logging.getLogger(f"sftp_downloader.{id(log_file)}")
+    logger = logging.getLogger(f"sftp_transfer.{id(log_file)}")
     logger.setLevel(logging.INFO)
     logger.handlers.clear()
     logger.propagate = False
@@ -100,7 +125,15 @@ def create_logger(log_dir, device_name, version_info="", log_callback=None):
     return logger, log_file
 
 
-class SFTPDownloader:
+class SFTPBase:
+    """下載與上傳共用的基底：連線、斷線重連、網路偵測、ignore 規則、版本紀錄檔（manifest）、
+    本地端內容雜湊、遠端建目錄與 Log 上傳等方向無關的邏輯。
+
+    子類別以 `manifest_filename` 類別屬性指定各自的版本紀錄檔名，避免同一目錄同時被下載與上傳
+    使用時互相覆蓋。"""
+
+    manifest_filename = MANIFEST_FILENAME
+
     def __init__(
         self,
         host,
@@ -127,17 +160,18 @@ class SFTPDownloader:
         self.host = host
         self.port = port
         self.username = username
-        # 單一字串或路徑陣列皆可：陣列時各來源路徑的內容會合併下載到同一個 local_path，
-        # 適合把「標準路徑 + 各船專屬路徑」合併成一個完整專案。
+        # 下載時為來源、上傳時為目的地。下載可傳入單一字串或路徑陣列（陣列時各來源合併到同一個
+        # local_path，適合把「標準路徑 + 各船專屬路徑」合併成一個完整專案）；上傳僅使用單一目的地路徑。
         self.remote_path = remote_path
+        # 下載時為儲存目的地、上傳時為來源。
         self.local_path = local_path
         self.password = password
         self.key_file = key_file
         self.auto_reconnect = auto_reconnect
         self.resume = resume
         self.wait_for_network = wait_for_network
-        self.recursive = recursive  # True：下載所有子資料夾（多層）；False：只下載該路徑下的檔案（單層）
-        self.ignore_file = ignore_file  # 下載忽略設定檔路徑（格式同 .gitignore），None 或檔案不存在代表無需忽略
+        self.recursive = recursive  # True：處理所有子資料夾（多層）；False：只處理該路徑下的檔案（單層）
+        self.ignore_file = ignore_file  # 忽略設定檔路徑（格式同 .gitignore），None 或檔案不存在代表無需忽略
         self.retry_count = retry_count  # None 或 <= 0 代表無限次重試
         self.retry_delay = retry_delay
         self.upload_log = upload_log
@@ -159,6 +193,9 @@ class SFTPDownloader:
 
     def _connect(self):
         self.logger.info(f"正在連線至 {self.host}:{self.port} ...")
+        # 每次建立新連線前先清掉舊的 SFTP channel / SSH transport，避免斷線
+        # 重連時殘留半開連線，累積占用本機與伺服器端資源。
+        self._close()
         client = paramiko.SSHClient()
         client.load_system_host_keys()
         client.set_missing_host_key_policy(paramiko.AutoAddPolicy())
@@ -167,13 +204,23 @@ class SFTPDownloader:
             connect_kwargs["key_filename"] = self.key_file
         else:
             connect_kwargs["password"] = self.password
-        client.connect(**connect_kwargs)
+        try:
+            client.connect(**connect_kwargs)
+            sftp = client.open_sftp()
+            # 若無此逾時設定，連線在傳輸中途「無聲斷線」（如網路線拔掉、Wi-Fi 斷線）時，
+            # 讀寫呼叫會永遠卡住不會丟出例外，導致斷線重連機制永遠不會被觸發。
+            sftp.get_channel().settimeout(SOCKET_TIMEOUT)
+            client.get_transport().set_keepalive(KEEPALIVE_INTERVAL)
+        except Exception:
+            # 連線或 SFTP subsystem 初始化到一半失敗時，client 尚未掛到
+            # self.client，需在此主動關閉，否則 _close() 無法清掉。
+            try:
+                client.close()
+            except Exception:
+                pass
+            raise
         self.client = client
-        self.sftp = client.open_sftp()
-        # 若無此逾時設定，連線在傳輸中途「無聲斷線」（如網路線拔掉、Wi-Fi 斷線）時，
-        # 讀寫呼叫會永遠卡住不會丟出例外，導致斷線重連機制永遠不會被觸發。
-        self.sftp.get_channel().settimeout(SOCKET_TIMEOUT)
-        client.get_transport().set_keepalive(KEEPALIVE_INTERVAL)
+        self.sftp = sftp
         self.logger.info("連線成功")
 
     def _connect_with_retry(self):
@@ -185,9 +232,9 @@ class SFTPDownloader:
             except paramiko.AuthenticationException:
                 self.logger.error("連線失敗：帳號或密碼錯誤")
                 raise
-            except (paramiko.SSHException, OSError) as e:
+            except SFTP_RETRY_EXCEPTIONS as e:
                 attempts += 1
-                self.logger.warning(f"連線失敗（第 {attempts} 次）：{e}")
+                self.logger.warning(f"連線失敗（第 {attempts} 次）：{format_exception(e)}")
                 if not self.auto_reconnect or self._retry_limit_reached(attempts):
                     self.logger.error("已達重試上限，放棄連線")
                     raise
@@ -212,27 +259,31 @@ class SFTPDownloader:
                 self.sftp.close()
         except Exception:
             pass
+        finally:
+            self.sftp = None
         try:
             if self.client:
                 self.client.close()
         except Exception:
             pass
+        finally:
+            self.client = None
 
     def _load_ignore_spec(self):
-        """讀取「下載忽略設定檔」（格式同 .gitignore）。未設定或檔案不存在代表無需忽略；
+        """讀取「忽略設定檔」（格式同 .gitignore）。未設定或檔案不存在代表無需忽略；
         格式錯誤的規則逐行略過並記錄警告，其餘正確的規則仍照常生效。"""
         if not self.ignore_file:
             return None
         path = Path(self.ignore_file)
         if not path.exists():
-            self.logger.info(f"下載忽略設定檔不存在，不忽略任何檔案: {path}")
+            self.logger.info(f"忽略設定檔不存在，不忽略任何檔案: {path}")
             return None
         try:
             # utf-8-sig：Windows 記事本以 UTF-8 存檔時常會加上 BOM，若不去除，
             # BOM 會黏在第一行規則前面，導致第一條規則永遠比對不到。
             lines = path.read_text(encoding="utf-8-sig").splitlines()
         except (OSError, UnicodeDecodeError) as e:
-            self.logger.warning(f"下載忽略設定檔讀取失敗，不忽略任何檔案: {e}")
+            self.logger.warning(f"忽略設定檔讀取失敗，不忽略任何檔案: {e}")
             return None
         valid_lines = []
         for lineno, line in enumerate(lines, 1):
@@ -240,13 +291,93 @@ class SFTPDownloader:
                 GitIgnoreSpec.from_lines([line])
                 valid_lines.append(line)
             except ValueError:
-                self.logger.warning(f"下載忽略設定檔第 {lineno} 行格式錯誤，已略過此規則: {line!r}")
-        self.logger.info(f"已載入下載忽略設定檔: {path}")
+                self.logger.warning(f"忽略設定檔第 {lineno} 行格式錯誤，已略過此規則: {line!r}")
+        self.logger.info(f"已載入忽略設定檔: {path}")
         return GitIgnoreSpec.from_lines(valid_lines)
 
     def _is_ignored(self, rel_path):
-        """rel_path 為相對於下載根目錄的路徑；資料夾請加上結尾的 /（gitignore 的資料夾規則才會匹配）。"""
+        """rel_path 為相對於傳輸根目錄的路徑；資料夾請加上結尾的 /（gitignore 的資料夾規則才會匹配）。"""
         return self._ignore_spec is not None and self._ignore_spec.match_file(rel_path)
+
+    def _manifest_path(self, local_root):
+        return local_root / self.manifest_filename
+
+    def _load_manifest(self, local_root):
+        path = self._manifest_path(local_root)
+        if not path.exists():
+            return {}
+        try:
+            with open(path, encoding="utf-8") as f:
+                return json.load(f)
+        except (json.JSONDecodeError, OSError) as e:
+            self.logger.warning(f"版本紀錄檔讀取失敗，將視為未追蹤過任何檔案: {e}")
+            return {}
+
+    def _save_manifest(self, local_root):
+        try:
+            with open(self._manifest_path(local_root), "w", encoding="utf-8") as f:
+                json.dump(self._manifest, f, ensure_ascii=False, indent=2)
+        except OSError as e:
+            self.logger.warning(f"版本紀錄檔寫入失敗: {e}")
+
+    def _hash_local_file(self, local_file):
+        """計算本地端檔案目前內容的 SHA-256（只讀本機磁碟，不牽涉網路），
+        回傳 hashlib 雜湊物件，方便驗證後可直接沿用繼續累加後續新傳輸的內容。"""
+        local_hash = hashlib.sha256()
+        with open(local_file, "rb") as local_f:
+            while True:
+                chunk = local_f.read(CHUNK_SIZE)
+                if not chunk:
+                    break
+                local_hash.update(chunk)
+        return local_hash
+
+    def _ensure_remote_dir(self, remote_dir):
+        """從根目錄逐層確認/建立遠端目錄（等同 mkdir -p），已存在的層級略過。
+
+        佔位符展開後的每船/每機目錄（如 /fleet/.../WH289/IPC-1/sftp_logs）
+        伺服器上通常尚未存在，直接 put 會失敗。"""
+        parts = [p for p in remote_dir.split("/") if p]
+        current = "/" if remote_dir.startswith("/") else ""
+        for part in parts:
+            current = current.rstrip("/") + "/" + part if current else part
+            try:
+                self.sftp.stat(current)
+            except FileNotFoundError:
+                self.sftp.mkdir(current)
+
+    def _upload_log_file(self):
+        try:
+            self.logger.info("正在上傳 Log 檔至 SFTP...")
+            for handler in self.logger.handlers:
+                handler.flush()
+            self._connect_with_retry()
+            self._ensure_remote_dir(self.remote_log_dir)
+            remote_name = self.remote_log_dir.rstrip("/") + "/" + Path(self.log_file).name
+            self.sftp.put(str(self.log_file), remote_name)
+            self.logger.info(f"Log 上傳完成: {remote_name}")
+        except Exception as e:
+            self.logger.error(f"Log 上傳失敗: {format_exception(e)}")
+        finally:
+            self._close()
+
+    def run(self):
+        """統一進入點：呼叫子類別的 _run() 執行實際傳輸。
+
+        無論傳輸成功、失敗或中途中止（帳密錯誤、達重試上限、未預期例外），
+        最後都會在 upload_log 開啟時把 log 上傳回 remote，確保「最需要遠端紀錄的失敗情境」
+        也留得下 log。log 上傳本身的錯誤已在 _upload_log_file 內部吞掉，不影響回傳值。"""
+        try:
+            return self._run()
+        finally:
+            if self.upload_log:
+                self._upload_log_file()
+
+
+class SFTPDownloader(SFTPBase):
+    """SFTP 下載（remote → local）：遞迴走訪遠端目錄、斷點續傳、忽略規則與版本紀錄。"""
+
+    manifest_filename = MANIFEST_FILENAME
 
     def _list_remote_files(self, remote_root, local_root):
         files = []
@@ -292,27 +423,6 @@ class SFTPDownloader:
             else:
                 files.append((remote_path, rel_path))
 
-    def _manifest_path(self, local_root):
-        return local_root / MANIFEST_FILENAME
-
-    def _load_manifest(self, local_root):
-        path = self._manifest_path(local_root)
-        if not path.exists():
-            return {}
-        try:
-            with open(path, encoding="utf-8") as f:
-                return json.load(f)
-        except (json.JSONDecodeError, OSError) as e:
-            self.logger.warning(f"版本紀錄檔讀取失敗，將視為未追蹤過任何檔案: {e}")
-            return {}
-
-    def _save_manifest(self, local_root):
-        try:
-            with open(self._manifest_path(local_root), "w", encoding="utf-8") as f:
-                json.dump(self._manifest, f, ensure_ascii=False, indent=2)
-        except OSError as e:
-            self.logger.warning(f"版本紀錄檔寫入失敗: {e}")
-
     def _next_duplicate_path(self, local_file):
         candidate = local_file.with_name(f"{local_file.stem}_{self.duplicate_suffix}{local_file.suffix}")
         n = 1
@@ -320,18 +430,6 @@ class SFTPDownloader:
             candidate = local_file.with_name(f"{local_file.stem}_{self.duplicate_suffix}{n}{local_file.suffix}")
             n += 1
         return candidate
-
-    def _hash_local_file(self, local_file):
-        """計算本地端檔案目前內容的 SHA-256（只讀本機磁碟，不牽涉網路），
-        回傳 hashlib 雜湊物件，方便驗證後可直接沿用繼續累加後續新下載的內容。"""
-        local_hash = hashlib.sha256()
-        with open(local_file, "rb") as local_f:
-            while True:
-                chunk = local_f.read(CHUNK_SIZE)
-                if not chunk:
-                    break
-                local_hash.update(chunk)
-        return local_hash
 
     def _download_one_file(self, remote_file, rel_path, local_root):
         local_file = local_root / Path(*rel_path.split("/"))
@@ -344,6 +442,7 @@ class SFTPDownloader:
         local_size = 0
         mode = "wb"
         running_hash = hashlib.sha256()  # 邊下載邊累加，最後（或中斷當下）存進版本紀錄檔
+        known = self._manifest.get(rel_path)
 
         if local_file.exists():
             if not self.resume:
@@ -356,7 +455,6 @@ class SFTPDownloader:
                     self.logger.info(f"重新下載，另存為: {target_file.name}")
             else:
                 disk_size = local_file.stat().st_size
-                known = self._manifest.get(rel_path)
 
                 if disk_size == remote_size:
                     # 大小相同：用版本紀錄（若有）判斷是否真的未變更；沒有紀錄則姑且視為未變更略過。
@@ -382,40 +480,54 @@ class SFTPDownloader:
                     target_file = self._next_duplicate_path(local_file)
                     self.logger.info(f"重新下載，另存為: {target_file.name}")
                 else:
-                    # 本地檔案比遠端小：檢查遠端版本是否仍與紀錄一致，並用「本地端雜湊」確認這段尚未
-                    # 下載完的內容有沒有被外部更動過（例如被人手動修改）。這裡刻意只讀本機磁碟跟紀錄檔
-                    # 裡存的雜湊比對，不會為了驗證而重新從遠端讀取已下載的內容，避免已下載比例越高、
-                    # 驗證反而越花時間、越像卡住的問題。
-                    same_remote_version = (
-                        known is not None
-                        and known.get("size") == remote_size
-                        and known.get("mtime") == remote_mtime
-                    )
-                    verified = False
-                    if same_remote_version and known.get("local_bytes") == disk_size and known.get("local_sha256"):
-                        disk_hash = self._hash_local_file(local_file)
-                        if disk_hash.hexdigest() == known["local_sha256"]:
-                            verified = True
-                            running_hash = disk_hash  # 直接沿用，後續新下載的內容繼續累加上去
+                    # 走到這裡 duplicate_mode 必定是 "overwrite"："duplicate" 模式在上面
+                    # 的 elif 分支就已經攔截、一律整份重新下載成新檔案，不會執行到這裡。
+                    # 目的地永遠只會是「某一版的完整檔案」（沒下載完的內容都留在 .part 暫存檔，
+                    # 見 PART_SUFFIX），所以本地比遠端小只代表來源長大了 → 整份重新下載。
+                    self.logger.info(f"偵測到來源檔案已更新，覆蓋舊檔案: {rel_path}")
 
-                    if verified:
-                        self.logger.info(f"本地端內容雜湊比對相符，接續下載: {rel_path}")
-                        local_size = disk_size
-                        mode = "ab"
-                    else:
-                        # 走到這裡 duplicate_mode 必定是 "overwrite"："duplicate" 模式在上面
-                        # 的 elif 分支就已經攔截、一律整份重新下載成新檔案，不會執行到這裡。
-                        reason = "本地檔案內容與紀錄不符（可能已被人為修改）" if same_remote_version else "偵測到來源檔案已更新"
-                        self.logger.info(f"{reason}，覆蓋舊檔案: {rel_path}")
+        # 實際寫入的是暫存檔，成功後才原子換名到 target_file。斷點續傳接續的對象因此也是
+        # 暫存檔而不是目的地；duplicate 模式另存新檔、本來就不接續，所以只有「目的地就是
+        # 原檔名」時才嘗試接續。
+        part_file = target_file.with_name(target_file.name + PART_SUFFIX)
+        if self.resume and target_file == local_file and part_file.exists():
+            part_size = part_file.stat().st_size
+            # 遠端版本要與紀錄一致，且紀錄的長度/雜湊要對得上暫存檔的現況，才敢接著往下寫。
+            # 用「本地端雜湊」確認這段尚未下載完的內容有沒有被外部更動過（例如被人手動修改）。
+            # 這裡刻意只讀本機磁碟跟紀錄檔裡存的雜湊比對，不會為了驗證而重新從遠端讀取已下載
+            # 的內容，避免已下載比例越高、驗證反而越花時間、越像卡住的問題。
+            resumable = (
+                known is not None
+                and known.get("size") == remote_size
+                and known.get("mtime") == remote_mtime
+                and known.get("local_bytes") == part_size
+                and known.get("local_sha256")
+                and part_size < remote_size
+            )
+            if resumable:
+                disk_hash = self._hash_local_file(part_file)
+                if disk_hash.hexdigest() == known["local_sha256"]:
+                    self.logger.info(f"本地端內容雜湊比對相符，接續下載: {rel_path}")
+                    local_size = part_size
+                    running_hash = disk_hash  # 直接沿用，後續新下載的內容繼續累加上去
+                    mode = "ab"
+            if mode == "wb":
+                # 暫存檔對不上紀錄（來源已換版、內容被動過或根本沒有檢查點）→ 不可信，
+                # 整份重新下載；"wb" 開檔即截斷，不必另外刪除。
+                self.logger.info(f"既有暫存檔無法接續，整份重新下載: {rel_path}")
 
         self.logger.info(f"開始下載: {rel_path} ({format_size(remote_size)})")
         last_pct_logged = -1
         last_checkpoint_pct = -1
         transferred = local_size
+        start_time = time.time()
+        # 記住上次印進度的時間與位元組數，用差值算「這段期間的即時速率」，比整體平均更能反映當下網速。
+        last_log_time = start_time
+        last_log_bytes = transferred
         try:
             with self.sftp.open(remote_file, "rb") as remote_f:
                 remote_f.seek(local_size)
-                with open(target_file, mode) as local_f:
+                with open(part_file, mode) as local_f:
                     while True:
                         chunk = remote_f.read(CHUNK_SIZE)
                         if not chunk:
@@ -426,7 +538,16 @@ class SFTPDownloader:
                         if remote_size > 0:
                             pct = int(transferred / remote_size * 100)
                             if pct > last_pct_logged:
-                                self.logger.info(f"  {rel_path} 進度: {pct}%")
+                                now = time.time()
+                                elapsed = now - last_log_time
+                                # elapsed 可能為 0（連續 chunk 太快），此時略過速率不印，避免除以零。
+                                if elapsed > 0:
+                                    speed = (transferred - last_log_bytes) / elapsed
+                                    self.logger.info(f"  {rel_path} 進度: {pct}% ({format_size(speed)}/s)")
+                                else:
+                                    self.logger.info(f"  {rel_path} 進度: {pct}%")
+                                last_log_time = now
+                                last_log_bytes = transferred
                                 last_pct_logged = pct
                             # 每跨過 10% 進度就存一次檢查點，而不是每個 chunk 都寫檔，
                             # 避免大檔案下載時頻繁寫入版本紀錄檔造成不必要的效能負擔。
@@ -452,43 +573,62 @@ class SFTPDownloader:
                 }
                 self._save_manifest(local_root)
 
-        self.logger.info(f"完成下載: {target_file.name if target_file != local_file else rel_path}")
+        total_elapsed = time.time() - start_time
+        downloaded_bytes = transferred - local_size  # 本次實際下載的位元組（不含斷點續傳前已存在的部分）
+        done_name = target_file.name if target_file != local_file else rel_path
+        if total_elapsed > 0 and downloaded_bytes > 0:
+            avg_speed = downloaded_bytes / total_elapsed
+            self.logger.info(f"完成下載: {done_name}（平均 {format_size(avg_speed)}/s）")
+        else:
+            self.logger.info(f"完成下載: {done_name}")
+        # 保留來源權限與 mtime:SFTP/paramiko 預設不會搬,需以 remote_stat 自行鏡射
+        # （否則 .sh 等會掉 +x）。趁還是暫存檔時就套用,換名之後目的地第一眼就是對的權限,
+        # 不會有「檔案已經在了但還沒 +x」的空窗。
+        # 失敗只警告不中斷 —— 內容已下載完成,不該因權限/時間視為失敗。
+        try:
+            os.chmod(part_file, stat.S_IMODE(remote_stat.st_mode))
+            atime = getattr(remote_stat, "st_atime", None)
+            os.utime(part_file, (atime if atime is not None else remote_stat.st_mtime,
+                                 remote_stat.st_mtime))
+        except (OSError, AttributeError, TypeError, ValueError) as e:
+            self.logger.warning(f"設定 {done_name} 權限/mtime 失敗(不影響下載內容): {e}")
+        # 原子換名:同一個檔案系統上的 rename,對讀者而言目的地只會是「換名前的舊版完整檔案」
+        # 或「換名後的新版完整檔案」,不存在中間狀態,也不會就地改寫舊檔的 inode。
+        os.replace(part_file, target_file)
         return "downloaded"
 
-    def _ensure_remote_dir(self, remote_dir):
-        """從根目錄逐層確認/建立遠端目錄（等同 mkdir -p），已存在的層級略過。
-        佔位符展開後的每船/每機 Log 目錄（如 /fleet/.../WH289/IPC-1/sftp_logs）
-        伺服器上通常尚未存在，直接 put 會失敗。"""
-        parts = [p for p in remote_dir.split("/") if p]
-        current = "/" if remote_dir.startswith("/") else ""
-        for part in parts:
-            current = current.rstrip("/") + "/" + part if current else part
-            try:
-                self.sftp.stat(current)
-            except FileNotFoundError:
-                self.sftp.mkdir(current)
+    def _build_jobs(self):
+        """把 remote_path / local_path 正規化成一組 (job_sources, local_root) 工作。
 
-    def _upload_log_file(self):
-        try:
-            self.logger.info("正在上傳 Log 檔至 SFTP...")
-            for handler in self.logger.handlers:
-                handler.flush()
-            self._connect_with_retry()
-            self._ensure_remote_dir(self.remote_log_dir)
-            remote_name = self.remote_log_dir.rstrip("/") + "/" + Path(self.log_file).name
-            self.sftp.put(str(self.log_file), remote_name)
-            self.logger.info(f"Log 上傳完成: {remote_name}")
-        except Exception as e:
-            self.logger.error(f"Log 上傳失敗: {e}")
-        finally:
-            self._close()
+        remote_path 為來源、local_path 為目的地，三種形狀：
+          local 陣列        → 與 remote 來源「逐一配對」remote[i]→local[i]（長度須相同）。
+          local 單一帶尾斜線 → 視為「共同父目錄」，各 remote 來源展開到 父目錄/來源basename
+                               （多專案各自落在自己的目錄，如 STANDARD/share/alarm_controller
+                                → share/alarm_controller）。
+          local 單一無尾斜線 → 所有 remote 來源「合併」到同一個 local（STANDARD + 各船 UNIQUE
+                               疊加成完整專案，相同相對路徑以後面的來源為準）。
+        回傳 None 代表配對數量不符（已記錄錯誤）。"""
+        remote_paths = self.remote_path if isinstance(self.remote_path, list) else [self.remote_path]
+        local = self.local_path
+        if isinstance(local, list):
+            if len(local) != len(remote_paths):
+                self.logger.error(
+                    f"下載路徑配對數量不符：remote {len(remote_paths)} 個、local {len(local)} 個"
+                )
+                return None
+            return [([remote_paths[i]], Path(local[i])) for i in range(len(remote_paths))]
+        if isinstance(local, str) and local.endswith("/") and local.rstrip("/"):
+            parent = Path(local)
+            return [([r], parent / PurePosixPath(r.rstrip("/")).name) for r in remote_paths]
+        return [(remote_paths, Path(local))]
 
-    def run(self):
+    def _run(self):
         self.logger.info("=== SFTP 下載任務開始 ===")
-        local_root = Path(self.local_path)
-        local_root.mkdir(parents=True, exist_ok=True)
-        self._manifest = self._load_manifest(local_root) if self.resume else {}
+        jobs = self._build_jobs()
+        if jobs is None:
+            return False
         self._ignore_spec = self._load_ignore_spec()
+        multi_job = len(jobs) > 1  # 配對或依 basename 展開時皆為多組獨立工作
 
         downloaded, skipped, failed = 0, 0, []
         try:
@@ -496,85 +636,100 @@ class SFTPDownloader:
                 self._wait_for_network()
             self._connect_with_retry()
 
-            remote_paths = self.remote_path if isinstance(self.remote_path, list) else [self.remote_path]
-            file_list = None
-            list_attempts = 0
-            while file_list is None:
-                current_root = None
-                try:
-                    file_list = []
-                    for current_root in remote_paths:
-                        file_list.extend(self._list_remote_files(current_root, local_root))
-                except FileNotFoundError:
-                    self.logger.error(f"遠端路徑不存在: {current_root}")
-                    return False
-                except (paramiko.SSHException, OSError, EOFError) as e:
-                    file_list = None
-                    list_attempts += 1
-                    self.logger.warning(f"列出遠端檔案清單發生錯誤（第 {list_attempts} 次）: {e}")
-                    if not self.auto_reconnect or self._retry_limit_reached(list_attempts):
-                        self.logger.error("已達重試上限，任務中止")
-                        return False
-                    self._connect_with_retry()
+            for job_sources, local_root in jobs:
+                local_root.mkdir(parents=True, exist_ok=True)
+                # 配對模式各目的地各自維護版本紀錄檔；合併模式共用單一 local 的紀錄檔。
+                self._manifest = self._load_manifest(local_root) if self.resume else {}
 
-            # 多個來源路徑合併時，若不同來源含有相同的相對路徑，後面的來源會覆蓋前面的
-            # （版本紀錄也以後者為準），僅保留最後一筆並記錄警告。
-            deduped = {}
-            for remote_file, rel_path in file_list:
-                if rel_path in deduped and deduped[rel_path] != remote_file:
-                    self.logger.warning(f"多個來源路徑都含有 {rel_path}，以後面的來源為準: {remote_file}")
-                deduped[rel_path] = remote_file
-            file_list = [(remote_file, rel_path) for rel_path, remote_file in deduped.items()]
-
-            if len(remote_paths) > 1:
-                self.logger.info(f"共 {len(remote_paths)} 個來源路徑，合併後發現 {len(file_list)} 個檔案")
-            else:
-                self.logger.info(f"共發現 {len(file_list)} 個檔案")
-
-            for remote_file, rel_path in file_list:
-                attempts = 0
-                while True:
+                file_list = None
+                list_attempts = 0
+                while file_list is None:
+                    current_root = None
                     try:
-                        result = self._download_one_file(remote_file, rel_path, local_root)
-                        if result == "skipped":
-                            skipped += 1
-                        else:
-                            downloaded += 1
-                        break
-                    except PermissionError as e:
-                        self.logger.error(f"寫入失敗（權限不足）: {rel_path}: {e}")
-                        failed.append(rel_path)
-                        break
-                    except FileNotFoundError as e:
-                        self.logger.error(f"檔案不存在: {rel_path}: {e}")
-                        failed.append(rel_path)
-                        break
-                    except (paramiko.SSHException, OSError, EOFError) as e:
-                        attempts += 1
-                        self.logger.warning(f"下載 {rel_path} 發生錯誤（第 {attempts} 次）: {e}")
-                        if not self.auto_reconnect or self._retry_limit_reached(attempts):
-                            self.logger.error(f"檔案 {rel_path} 下載失敗，放棄重試")
-                            failed.append(rel_path)
-                            break
+                        file_list = []
+                        for current_root in job_sources:
+                            try:
+                                file_list.extend(self._list_remote_files(current_root, local_root))
+                            except FileNotFoundError:
+                                # 單一來源路徑不存在（常見於各船專屬路徑並非每船都有）時，只記警告並略過此來源，
+                                # 其餘存在的來源照常下載。FileNotFoundError 為 OSError 子類，需在此個別攔截，
+                                # 才不會被外層的網路錯誤分支當成連線問題而觸發重連。
+                                self.logger.warning(f"遠端路徑不存在，略過此來源: {current_root}")
+                    except SFTP_RETRY_EXCEPTIONS as e:
+                        file_list = None
+                        list_attempts += 1
+                        self.logger.warning(
+                            f"列出遠端檔案清單發生錯誤（第 {list_attempts} 次）: {format_exception(e)}"
+                        )
+                        if not self.auto_reconnect or self._retry_limit_reached(list_attempts):
+                            self.logger.error("已達重試上限，任務中止")
+                            return False
+                        self._connect_with_retry()
+
+                # 同一 job 內多來源合併時，若不同來源含有相同的相對路徑，後面的來源會覆蓋前面的
+                # （版本紀錄也以後者為準），僅保留最後一筆並記錄警告。
+                deduped = {}
+                for remote_file, rel_path in file_list:
+                    if rel_path in deduped and deduped[rel_path] != remote_file:
+                        self.logger.warning(f"多個來源路徑都含有 {rel_path}，以後面的來源為準: {remote_file}")
+                    deduped[rel_path] = remote_file
+                file_list = [(remote_file, rel_path) for rel_path, remote_file in deduped.items()]
+
+                if multi_job:
+                    self.logger.info(f"{job_sources[0]} → {local_root}，發現 {len(file_list)} 個檔案")
+                elif len(job_sources) > 1:
+                    self.logger.info(f"共 {len(job_sources)} 個來源路徑，合併後發現 {len(file_list)} 個檔案")
+                else:
+                    self.logger.info(f"共發現 {len(file_list)} 個檔案")
+
+                for remote_file, rel_path in file_list:
+                    attempts = 0
+                    while True:
                         try:
-                            self._connect_with_retry()
-                        except Exception:
+                            result = self._download_one_file(remote_file, rel_path, local_root)
+                            if result == "skipped":
+                                skipped += 1
+                            else:
+                                downloaded += 1
+                            break
+                        except PermissionError as e:
+                            self.logger.error(f"寫入失敗（權限不足）: {rel_path}: {e}")
                             failed.append(rel_path)
                             break
+                        except FileNotFoundError as e:
+                            self.logger.error(f"檔案不存在: {rel_path}: {e}")
+                            failed.append(rel_path)
+                            break
+                        except SFTP_RETRY_EXCEPTIONS as e:
+                            attempts += 1
+                            self.logger.warning(
+                                f"下載 {rel_path} 發生錯誤（第 {attempts} 次）: {format_exception(e)}"
+                            )
+                            if not self.auto_reconnect or self._retry_limit_reached(attempts):
+                                self.logger.error(f"檔案 {rel_path} 下載失敗，放棄重試")
+                                failed.append(rel_path)
+                                break
+                            try:
+                                self._connect_with_retry()
+                            except Exception:
+                                failed.append(rel_path)
+                                break
         except paramiko.AuthenticationException:
             self.logger.error("=== 任務中止：帳號或密碼錯誤 ===")
             return False
         except Exception as e:
-            self.logger.error(f"=== 任務中止：{e} ===")
+            self.logger.error(f"=== 任務中止：{format_exception(e)} ===")
             return False
         finally:
             self._close()
 
-        self.logger.info(f"=== 下載任務結束：成功 {downloaded}，略過 {skipped}，失敗 {len(failed)} ===")
+        if multi_job:
+            self.logger.info(
+                f"=== 下載任務結束（{len(jobs)} 組）：成功 {downloaded}，略過 {skipped}，失敗 {len(failed)} ==="
+            )
+        else:
+            self.logger.info(f"=== 下載任務結束：成功 {downloaded}，略過 {skipped}，失敗 {len(failed)} ===")
         if failed:
             self.logger.info("失敗清單：" + ", ".join(failed))
-
-        if self.upload_log:
-            self._upload_log_file()
 
         return len(failed) == 0

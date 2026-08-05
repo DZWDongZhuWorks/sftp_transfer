@@ -10,6 +10,7 @@ import pytest
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
 import downloader as downloader_module  # noqa: E402
+import uploader as uploader_module  # noqa: E402
 
 
 @pytest.fixture(autouse=True)
@@ -21,7 +22,7 @@ def no_real_sleep(monkeypatch):
 @pytest.fixture
 def logger():
     """一般 logging.Logger，交給 pytest 內建的 caplog fixture 擷取訊息斷言用。"""
-    lg = logging.getLogger("sftp_download_test")
+    lg = logging.getLogger("sftp_transfer_test")
     lg.setLevel(logging.DEBUG)
     lg.propagate = True
     lg.handlers.clear()
@@ -31,32 +32,62 @@ def logger():
 class FakeSFTPAttr:
     """模擬 paramiko.SFTPAttributes。"""
 
-    def __init__(self, filename, is_dir, size=0, mtime=0):
+    def __init__(self, filename, is_dir, size=0, mtime=0, atime=None):
         self.filename = filename
-        self.st_mode = stat_module.S_IFDIR if is_dir else stat_module.S_IFREG
+        # 含權限位元(不只格式位元),讓 stat.S_IMODE 取得到真實權限(對應保留權限功能)。
+        self.st_mode = (stat_module.S_IFDIR | 0o755) if is_dir else (stat_module.S_IFREG | 0o644)
         self.st_size = size
         self.st_mtime = mtime
+        self.st_atime = atime if atime is not None else mtime
 
 
 class FakeSFTPFile:
-    """模擬 paramiko 開啟遠端檔案回傳的可讀/可 seek 物件。"""
+    """模擬 paramiko 開啟遠端檔案回傳的檔案物件，支援讀取（下載）與寫入（上傳）。
 
-    def __init__(self, data):
-        self.data = data
-        self.pos = 0
+    寫入模式（"w"/"a"）會即時把緩衝內容寫回 client.files，讓上傳過程中的斷點續傳測試
+    可以觀察到「已上傳到一半」的遠端狀態。"""
+
+    def __init__(self, client, path, mode="rb"):
+        self.client = client
+        self.path = path
+        self.mode = mode
+        if "a" in mode:
+            self.buffer = bytearray(client.files.get(path, b""))
+            self.pos = len(self.buffer)
+        elif "w" in mode:
+            self.buffer = bytearray()
+            client.files[path] = b""  # 開檔即截斷，對應覆蓋上傳
+            self.pos = 0
+        else:
+            self.buffer = bytearray(client.files.get(path, b""))
+            self.pos = 0
 
     def seek(self, pos):
         self.pos = pos
 
     def read(self, n=-1):
-        chunk = self.data[self.pos:] if n is None or n < 0 else self.data[self.pos:self.pos + n]
+        data = bytes(self.buffer)
+        chunk = data[self.pos:] if n is None or n < 0 else data[self.pos:self.pos + n]
         self.pos += len(chunk)
         return chunk
+
+    def write(self, data):
+        self.buffer[self.pos:self.pos + len(data)] = data
+        self.pos += len(data)
+        self._flush_to_client()
+
+    def flush(self):
+        self._flush_to_client()
+
+    def _flush_to_client(self):
+        if "w" in self.mode or "a" in self.mode:
+            self.client.files[self.path] = bytes(self.buffer)
 
     def __enter__(self):
         return self
 
     def __exit__(self, exc_type, exc, tb):
+        self._flush_to_client()
         return False
 
 
@@ -70,6 +101,8 @@ class FakeSFTPClient:
         self.put_calls = []
         self.dirs = set()
         self.mkdir_calls = []
+        self.chmod_calls = []   # 記錄 (path, mode),供保留權限相關測試檢查
+        self.utime_calls = []   # 記錄 (path, (atime, mtime))
 
     def stat(self, path):
         path = path.rstrip("/")
@@ -102,13 +135,19 @@ class FakeSFTPClient:
         return results
 
     def open(self, path, mode="rb"):
-        return FakeSFTPFile(self.files[path.rstrip("/")])
+        return FakeSFTPFile(self, path.rstrip("/"), mode)
 
     def put(self, local_path, remote_path):
         with open(local_path, "rb") as f:
             data = f.read()
         self.files[remote_path] = data
         self.put_calls.append((local_path, remote_path))
+
+    def chmod(self, path, mode):
+        self.chmod_calls.append((path.rstrip("/"), mode))
+
+    def utime(self, path, times):
+        self.utime_calls.append((path.rstrip("/"), times))
 
 
 @pytest.fixture
@@ -137,4 +176,26 @@ def make_downloader(tmp_path, logger, **overrides):
 def downloader_factory(tmp_path, logger):
     def _make(**overrides):
         return make_downloader(tmp_path, logger, **overrides)
+    return _make
+
+
+def make_uploader(tmp_path, logger, **overrides):
+    """建立一個不會真的連線的 SFTPUploader，供測試直接操作內部方法。
+    預設以 tmp_path 為本地來源、/remote 為遠端目的地。"""
+    kwargs = dict(
+        host="host.example.com",
+        port=22,
+        username="user",
+        remote_path="/remote",
+        local_path=str(tmp_path),
+        logger=logger,
+    )
+    kwargs.update(overrides)
+    return uploader_module.SFTPUploader(**kwargs)
+
+
+@pytest.fixture
+def uploader_factory(tmp_path, logger):
+    def _make(**overrides):
+        return make_uploader(tmp_path, logger, **overrides)
     return _make

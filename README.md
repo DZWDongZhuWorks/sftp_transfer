@@ -2,15 +2,21 @@
 
 **語言選擇：Python**（跨平台支援 Windows/Linux 最成熟，`paramiko` 套件內建 SFTP 客戶端，`tkinter` 為 Python 內建 GUI 套件不需額外安裝，CLI 用標準庫 `argparse` 即可，最符合「同時支援 CLI 與 GUI、跨平台」的需求）。
 
+本工具同時支援**下載（remote → local，預設）**與**上傳（local → remote）**兩種方向，透過 `mode` 設定或 `--mode` 參數切換；上傳與下載共用同一套連線、斷線重連、斷點續傳、忽略規則與版本紀錄機制（詳見下方【上傳模式（local → remote）】）。
+
 檔案結構：
-- `main.py`：進入點。不帶參數 → 開啟 GUI；帶參數 → CLI 模式。
-- `downloader.py`：下載核心邏輯（連線、斷線重連、斷點續傳、Log）。
-- `gitignore.py`：「下載忽略設定檔」的 gitignore 規則比對（純 Python 標準庫實作，不需安裝額外套件）。
-- `gui.py`：圖形化介面。
+- `main.py`：進入點。不帶參數 → 開啟 GUI；帶參數 → CLI 模式。以 `--mode {download,upload}` 決定方向。
+- `downloader.py`：傳輸核心邏輯。`SFTPBase` 收攏連線/斷線重連/網路偵測/忽略規則/版本紀錄等方向無關邏輯；`SFTPDownloader` 為下載實作。
+- `uploader.py`：上傳核心邏輯（`SFTPUploader`，繼承 `SFTPBase`），與下載對稱：遞迴走訪本地目錄、斷點續傳、忽略規則與版本紀錄。
+- `gitignore.py`：「忽略設定檔」的 gitignore 規則比對（純 Python 標準庫實作，不需安裝額外套件）。
+- `gui.py`：圖形化介面（右上角可切換「下載／上傳」模式）。
 - `settings.py`：設定檔（`settings.json`）讀取/開啟工具，CLI 與 GUI 共用。
-- `example_settings.json`：設定檔範本，複製改名為 `settings.json` 後填入實際值即可使用。
-- `example_download_ignore.txt`：「下載忽略設定檔」範本，複製改名為 `download_ignore.txt` 後依需求增刪規則即可使用。
-- `tests/`：pytest 單元測試（`downloader.py`／`gitignore.py`／`settings.py`／`main.py`），詳見下方【開發：執行單元測試】。
+- `example_settings.json`：下載設定檔範本，複製改名為 `settings.json` 後填入實際值即可使用。
+- `example_upload_settings.json`：上傳設定檔範本（`mode` 為 `upload`）。
+- `run_all_downloads.py` / `run_all_uploads.py`：分別遍歷 `config/` 內 `*_download_settings.json` / `*_upload_settings.json` 並依序執行。
+- `run_selected_transfers.py`（或 `script/run_selected_transfers.sh`）：以 curses 掃描上述兩類設定檔，讓操作者勾選本次真正要執行的下載／上傳專案。
+- `example_download_ignore.txt`：「忽略設定檔」範本，複製改名後依需求增刪規則即可使用。
+- `tests/`：pytest 單元測試（`downloader.py`／`uploader.py`／`gitignore.py`／`settings.py`／`main.py`），詳見下方【開發：執行單元測試】。
 
 ---
 
@@ -124,6 +130,8 @@ cp example_settings.json settings.json
 
 | 欄位（settings.json） | 對應 CLI 參數 | 範例值 | 用途 |
 |---|---|---|---|
+| `mode` | `--mode` | `"download"` 或 `"upload"` | 傳輸方向：`download`（**預設**，遠端→本地）或 `upload`（本地→遠端）。upload 模式下 `local_path` 為來源、`remote_path` 為目的地，詳見下方【上傳模式（local → remote）】 |
+| `trans_type` | 無（不影響傳輸行為） | `"deploy"` 或 `"telemetry"` | 流類別，與 `mode` 正交，僅供 `run_selected_transfers.py` 的方向守門判斷，`main.py` 不讀取。`deploy`（**預設**）＝程式／設定發佈流（岸→船），受方向鎖管制；`telemetry`＝資料回傳流（船→岸），兩端都可選。**只能讓守門更嚴、不能更鬆**：欄位缺漏／值拼錯／檔案讀不到一律當 `deploy`；宣告 `telemetry` 的 upload 若 `remote_path` 指向 `STANDARD/` 或 `UNIQUE/` 發佈樹，視為標錯而降回 `deploy`。詳見下方【上傳模式】的「為什麼回傳類要豁免」 |
 | `host` | `--host` | `"192.168.6.79"` | SFTP 伺服器位址或網域名稱（必填） |
 | `port` | `--port` | `22` | SFTP 連接埠，未填預設為 `22` |
 | `device_name` | `--device-name` | `"edge-101"` | 裝置/使用者識別名稱，會標示在 Log 內容與檔名中，方便日後彙整分辨來源（必填，建議每台裝置給唯一名稱） |
@@ -145,6 +153,61 @@ cp example_settings.json settings.json
 | `log_dir` | `--log-dir` | `""` 或 `"C:\\logs"` | 本機儲存 Log 檔（`.csv`）的資料夾，留空字串則使用預設的 `logs/` 資料夾 |
 | `duplicate_mode` | `--duplicate-mode` | `"overwrite"` 或 `"duplicate"` | 偵測到來源檔案已被更新時的處理方式：`overwrite`（**預設**，直接覆蓋舊檔案）或 `duplicate`（另存新檔、保留舊檔）；詳見下方【來源檔案更新時的版本處理】 |
 | `duplicate_suffix` | `--duplicate-suffix` | `"copy"` | `duplicate_mode` 為 `duplicate` 時，另存新檔用的檔名後綴，未填預設 `"copy"` |
+
+---
+
+## 【上傳模式（local → remote）】
+
+除了預設的下載，本工具也支援把本地端檔案/資料夾上傳到 SFTP 遠端。上傳與下載共用**同一套**連線、斷線重連、網路偵測、忽略規則、斷點續傳與版本紀錄機制；差別只在方向相反：
+
+- **`local_path` 為上傳來源**（單一檔案或整個資料夾），**`remote_path` 為遠端目的地**（單一路徑；上傳不支援多來源合併，若填路徑陣列只取第一個並記錄警告）。
+- `recursive`、`ignore_file`、`resume`、`duplicate_mode`、`duplicate_suffix`、`retry_*`、`auto_reconnect`、`wait_for_network` 等設定的意義與下載完全相同。
+- **遠端同名檔案處理**沿用 `duplicate_mode`：`overwrite`（**預設**，直接覆蓋遠端舊檔）或 `duplicate`（在遠端以 `_copy` 後綴另存新檔、保留舊檔）。
+- **跳過未變更**：以本地檔案的 size/mtime 搭配版本紀錄判斷，遠端已存在且未變更的檔案會略過不重傳。
+- **斷點續傳**：遠端檔案若比本地小且版本紀錄相符，會驗證本地前綴內容雜湊後從遠端已上傳的位置接續上傳（與下載對稱，驗證只讀本機磁碟、不回讀遠端內容）。
+- **版本紀錄檔**：上傳使用 `.sftp_upload_manifest.json`（存放在本地來源目錄），與下載的 `.sftp_download_manifest.json` 分開，同一目錄雙向使用不會互相覆蓋；走訪來源上傳時會自動排除這兩個 manifest 檔本身。
+
+### 使用方式
+
+CLI（排程最常用）：
+```bash
+# 直接以參數上傳
+python main.py --cli --mode upload --host 192.168.6.79 --username myuser \
+    --device-name edge-101 --local-path /home/user/to_upload --remote-path /data/upload_target
+
+# 或把 "mode": "upload" 寫進設定檔，之後只需帶 --config
+python main.py --cli --config config/sftp_upload_settings.json
+```
+
+設定檔：複製 `example_upload_settings.json` 作為範本（其中 `mode` 已設為 `upload`），依實際值填入後另存到 `config/` 內、檔名以 `_upload_settings.json` 結尾。
+
+GUI：啟動後於右上角「模式」切換到「上傳」，來源/目的地欄位標籤會自動對調（本地端來源路徑、SFTP 目的地路徑），按「開始上傳」即可。
+
+排程整批執行（船上更新）：
+- `python run_all_uploads.py`（或 `script/run_all_uploads.sh`）：只挑選 `config/` 內 `*_upload_settings.json` 依序上傳。
+- `python run_all_downloads.py`（或 `script/run_all_downloads.sh`）：只挑選 `*_download_settings.json` 依序下載。
+- `script/run_sftp_upload.sh`：單一上傳設定檔的範例腳本（指向 `config/sftp_upload_settings.json`）。
+
+人工挑選本次傳輸：
+- `script/run_selected_transfers.sh`：同時掃描下載／上傳設定，初始不預選；以 `Space` 勾選、`Enter` 確認執行。
+- `script/run_selected_transfers.sh --mode download` 或 `--mode upload`：只顯示單一方向。
+- `m` 切換顯示方向、`a` 全選目前畫面、`x` 清除、`r` 重掃 config、`q` 不執行直接離開。
+- 在 CLINK 發佈端，下載項目會維持鎖定，只允許上傳，避免覆蓋尚未發佈的開發修改。
+- 在其餘部署端（包含船舶資訊缺失或無法辨識角色時），上傳項目會維持鎖定，只允許下載，避免舊程式反向回灌 OTA。
+- 標為 `"trans_type": "telemetry"` 的專案不受上述方向鎖管制，兩端都選得到，列表上會標示 `[回傳]`。
+- `--list` 可在不啟動選單的情況下列出掃描結果，逐列顯示方向、鎖定狀態與流類別。
+
+#### 為什麼回傳類要豁免
+
+方向鎖保護的其實是兩個具體的爆炸半徑：**在 CLINK 上下載會蓋掉未提交的開發修改**（所有下載設定皆為 `duplicate_mode: overwrite` 且指向開發工作區），以及**在船上上傳會把舊程式回灌 OTA**（寫進 `STANDARD/`、`UNIQUE/` 發佈樹後會被其他船拉走）。「方向」只是這兩個半徑的代理判準，不是本質。
+
+船到岸的資料回傳流（如 `device_monitor_report`）兩個方向都碰不到這兩個半徑——上傳的目的地在發佈樹之外、沒有任何船會從那裡拉東西；下載的目的地是被 gitignore 的資料目錄、蓋不到原始碼。它們不是「方向相反的例外」，而是根本不在守門的射程內，因此以 `trans_type` 宣告後直接豁免，而不是把方向鎖反過來。
+
+這個宣告**只能讓守門更嚴、不能更鬆**：欄位缺漏、值拼錯、JSON 壞掉一律當 `deploy`（fail-closed）；宣告 `telemetry` 的上傳若 `remote_path` 指向發佈樹，視為標錯而降回 `deploy`。所以把發佈類設定檔誤標成 `telemetry` 不會打開回灌的門。
+
+> **範圍**：這道守門只作用於 `run_selected_transfers.py` 這條互動路徑。`main.py` 不讀 `trans_type`，直接以 `--config` 呼叫 `main.py`（或 `run_all_*`、`script/run_*.sh`）不受此限。它防的是手滑選錯，不是 ACL。
+
+> **命名慣例**：`config/` 內的設定檔請以 `*_download_settings.json`（下載）或 `*_upload_settings.json`（上傳）結尾，兩支 `run_all_*` 腳本各自只會挑選對應方向的設定檔，彼此不會誤觸。
 
 ---
 
@@ -283,7 +346,7 @@ cp example_settings.json settings.json
 
 ## 【開發：執行單元測試】
 
-本工具附有 `tests/` 資料夾內的 pytest 單元測試（涵蓋 `downloader.py`、`settings.py`、`main.py`），所有網路/檔案 I/O 都經過 Mock，不會真的連線到 SFTP 伺服器，可安心在任何環境執行。這份章節只有要修改程式碼或想確認改動沒有破壞既有行為時才需要，一般下載工具的日常使用不需要理會。
+本工具附有 `tests/` 資料夾內的 pytest 單元測試（涵蓋 `downloader.py`、`uploader.py`、`settings.py`、`main.py`），所有網路/檔案 I/O 都經過 Mock，不會真的連線到 SFTP 伺服器，可安心在任何環境執行。這份章節只有要修改程式碼或想確認改動沒有破壞既有行為時才需要，一般日常使用不需要理會。
 
 1. 安裝測試相依套件（僅需一次）：
    ```
@@ -295,13 +358,12 @@ cp example_settings.json settings.json
    ```
 3. 執行測試並在終端機顯示覆蓋率報告（含未覆蓋的行號）：
    ```
-   python -m pytest --cov=downloader --cov=gitignore --cov=settings --cov=main --cov-report=term-missing
+   python -m pytest --cov=downloader --cov=uploader --cov=gitignore --cov=settings --cov=main --cov-report=term-missing
    ```
 4. 若想要更方便瀏覽的 HTML 覆蓋率報告：
    ```
-   python -m pytest --cov=downloader --cov=gitignore --cov=settings --cov=main --cov-report=html
+   python -m pytest --cov=downloader --cov=uploader --cov=gitignore --cov=settings --cov=main --cov-report=html
    ```
    產生的報告在 `htmlcov/index.html`，用瀏覽器開啟即可依檔案、行數檢視覆蓋狀況。
 
 只想跑單一檔案或單一測試時，可以用 `python -m pytest tests/test_downloader.py`，或加上 `-k 關鍵字` 只跑名稱符合的測試（例如 `python -m pytest -k duplicate_mode`）。
-

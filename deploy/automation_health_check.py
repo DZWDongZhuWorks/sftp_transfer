@@ -22,6 +22,7 @@ import json
 import os
 import pwd
 import shlex
+import shutil
 import socket
 import stat
 import subprocess
@@ -699,6 +700,22 @@ def load_expected_tmux() -> dict[str, set[str]]:
 def check_tmux(role: str) -> None:
     heading("tmux 工作負載")
     expected_tmux = load_expected_tmux()
+    # 「沒有 tmux 這個指令」與「有 tmux 但沒有 session」是兩種完全不同的故障,原本都落進
+    # 下面那個 WARN（run() 把 FileNotFoundError 收成 rc=127），於是報告只寫
+    # 「No such file or directory: 'tmux'」—— 讀起來像是某個路徑設定錯了。
+    #
+    # 缺指令記 FAIL 而不是 WARN 是刻意的:它是確定性的全面失效（每一支 start_*.sh 都會
+    # exit 2，而啟動器每 30 分鐘重試、永遠補不起來）。WARN 在 --fail-on-warn 下只是
+    # exit 2 DEGRADED，很容易被讀成「服務還在起」。
+    if shutil.which("tmux") is None:
+        record(
+            "tmux",
+            "tmux 指令",
+            "FAIL",
+            "系統未安裝 tmux —— 所有 session 型專案都起不來；"
+            "以 sftp_transfer/deploy/install_tmux_offline.sh 離線補齊",
+        )
+        return
     proc = run(["tmux", "list-sessions", "-F", "#{session_name}"])
     if proc.returncode != 0:
         record(

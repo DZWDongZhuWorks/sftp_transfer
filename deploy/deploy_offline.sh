@@ -67,6 +67,8 @@
 #   * venv 與系統 site-packages 隔離。
 #   * 安裝前以 MANIFEST.txt 校驗 wheel sha256（可用 --skip-verify 跳過）。
 #   * 安裝後在 venv 內驗證關鍵套件可正常匯入。
+#   * 全程輸出（stdout + stderr）逐字寫進 logs/deploy_offline_<時間>.log，與兩支巡檢器
+#     的 Markdown 報告放在同一個 logs/。報告記結果，這一份記過程；船上回報問題寄它。
 #   * tmux 同樣離線補齊：隨附 debs/ 內的 .deb 以 dpkg -i 安裝（見
 #     install_tmux_offline.sh），全程不連網。無 sudo 密碼可輸入時退回 ~/.local。
 # ---------------------------------------------------------------------------
@@ -109,6 +111,50 @@ ok()    { printf "%s[ OK ]%s %s\n"  "$G" "$N" "$*"; }
 warn()  { printf "%s[WARN]%s %s\n"  "$Y" "$N" "$*"; }
 err()   { printf "%s[FAIL]%s %s\n"  "$R" "$N" "$*" >&2; }
 
+# --- 完整終端記錄（logs/deploy_offline_<時間>.log）--------------------------
+# 兩支巡檢器各自會寫 Markdown 報告，但那兩份是「部署完成後的狀態」；部署當下的過程
+# ——哪個安裝器 exit 幾、操作者選了 Y 還是 n、pip 卡在哪個 wheel、sudo 有沒有輸入
+# ——原本只存在於終端機，關掉視窗就沒了。船上排錯時能寄回岸上的只有檔案，所以這一份
+# 逐字記錄跟兩份報告一樣落在 logs/。
+#
+# 做法：把 stdout 與 stderr 一起接到 tee，一份原樣進終端機（保留顏色），一份經 sed
+# 去掉 ANSI 逃脫碼後進檔案（讓 log 能 grep、能貼進工單）。合流 stderr 是刻意的：
+# err() 寫 stderr，分兩份存會讓「哪一步失敗」失去時間順序。
+#
+# 兩個已知的取捨：
+#   * 子程序（install_*.sh / health_check.py）的 stdout 從此是 pipe 而非 tty，它們的
+#     `[ -t 1 ]` / isatty() 會關掉自己的顏色，螢幕上因此變單色。可接受：那些判斷全都
+#     只影響顏色，真正會改變行為的分支看的是 `[ -t 0 ]`（stdin），而 stdin 不動 ——
+#     所以 ask_yn 的提問與 sudo 密碼輸入都不受影響。本腳本自己的顏色也不受影響：上面
+#     那段 `[ -t 1 ]` 在 main() 之前就算完了，那時 fd 1 還是終端機。
+#   * 原始 fd 先存進 3/4，離開前由 EXIT trap 還原並等 tee 收工。少了這一步，最後幾行
+#     會晚於 shell 提示符才印出來，也可能來不及寫進檔案。
+TRANSCRIPT=""            # 記錄檔路徑；空字串＝這次沒留成記錄（stage_summary 會讀）
+TRANSCRIPT_TEE_PID=""
+start_transcript() {
+  local dir="${PROJECT_DIR}/logs"
+  local path="${dir}/deploy_offline_$(date '+%Y%m%d_%H%M%S').log"
+  # 寫不進去不是中止部署的理由（唯讀掛載、權限不對都可能）——少一份記錄而已。
+  # 兩處的 2>/dev/null 都寫在失敗的重導向**之前**：重導向錯誤是由 shell 自己印的，
+  # 寫在後面就來不及擋（`: >>path 2>/dev/null` 會漏出一行 Permission denied）。
+  if ! mkdir -p "$dir" 2>/dev/null || ! : 2>/dev/null >>"$path"; then
+    warn "無法寫入 ${dir}，本次不留完整終端記錄。"
+    return 0
+  fi
+  TRANSCRIPT="$path"
+  exec 3>&1 4>&2
+  exec > >(tee >(sed -u 's/\x1b\[[0-9;?]*[a-zA-Z]//g' >>"$TRANSCRIPT")) 2>&1
+  TRANSCRIPT_TEE_PID=$!   # bash >= 5.1 會把程序替換的 PID 放進 $!；舊版取不到就少了等待
+  trap stop_transcript EXIT
+}
+
+stop_transcript() {
+  [ -n "$TRANSCRIPT_TEE_PID" ] || return 0
+  exec 1>&3 2>&4          # 先放掉寫入端，tee 才看得到 EOF
+  wait "$TRANSCRIPT_TEE_PID" 2>/dev/null || true
+  TRANSCRIPT_TEE_PID=""
+}
+
 # --help 只印檔頭那一段（第 2 行到第一個非註解行為止）。原本是 grep '^#' "$0"，
 # 會把全檔 170 多行 column-0 實作註解一起倒出來 —— 這支腳本的實作註解特別多、特別長，
 # 於是 --help 反而是最難讀的那份說明。
@@ -141,6 +187,10 @@ ask_yn() {  # $1=提示（須含 [Y/n] 或 [y/N]） $2=預設 Y|N → rc 0=同�
     read -r -p "$1" ans || ans=""
   fi
   [ -n "$ans" ] || ans="$2"
+  # 把實際採用的答案印出來，否則終端記錄裡會是一串沒有答案的問題：提示本身走 stderr、
+  # 已隨 2>&1 進 log，但操作者敲的字只由終端機回顯，不經 fd 1/2。非互動時這一行也
+  # 順便說明採用了哪個預設。
+  printf "       （採用：%s）\n" "$ans"
   case "$ans" in Y|y) return 0 ;; *) return 1 ;; esac
 }
 
@@ -190,6 +240,9 @@ banner_and_preflight() {
   echo "==========================================================="
   echo " sftp_transfer 離線部署 (offline deploy — 專屬 venv)"
   echo "==========================================================="
+  # 開頭就報路徑（不只在總結）：--check-only 與各種 err + exit 1 都到不了 stage_summary，
+  # 而那些正是最需要「記錄在哪」的情況。這一行本身也會進記錄，等於檔案自帶檔名。
+  [ -n "$TRANSCRIPT" ] && info "完整終端記錄：$TRANSCRIPT"
 
   # --- 前置檢查 --------------------------------------------------------------
   if ! command -v "$PYTHON_BIN" >/dev/null 2>&1; then
@@ -1226,6 +1279,13 @@ stage_summary() {
   echo ""
   echo "如需單獨再跑一次自動化存活巡檢："
   echo "  \"$PYTHON_BIN\" \"$AUTOMATION_CHECKER\""
+  # 印在總結最後：船上要回報問題時，這是唯一需要寄回岸上的檔案（兩份 Markdown 報告
+  # 只有結果，這一份有過程）。
+  if [ -n "$TRANSCRIPT" ]; then
+    echo ""
+    echo "本次部署的完整終端記錄（含以上全部輸出）："
+    echo "  $TRANSCRIPT"
+  fi
   echo "==========================================================="
 }
 
@@ -1238,6 +1298,7 @@ stage_summary() {
 # 看的是文字位置，所以搬動段落時文字順序必須跟著執行順序。
 main() {
   parse_args "$@"
+  start_transcript                   # 刻意在 parse_args 之後：--help 與參數錯誤不留檔
   banner_and_preflight
 
   # ---- 階段 A：一次性人工設定（所有需要輸入的東西都在這一段）----

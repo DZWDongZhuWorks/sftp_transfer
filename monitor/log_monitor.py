@@ -50,7 +50,11 @@ _RE_SUMMARY = re.compile(
 )
 _RE_ABORT = re.compile(r"任務中止：(.+?)\s*={0,3}\s*$")
 _RE_FAILED_LIST = re.compile(r"失敗清單：(.+)")
-_RE_DEVICE = re.compile(r"^(?P<vsl>[A-Za-z0-9]+)_(?P<ipc>IPC-\d+)_(?P<comp>.+)$")
+# vsl 必須容許底線：少數船隻用英文船名而非船號（如 WH_PORT_KELANG_EXPRESS），
+# 而 device_name 本身就是用 _ 串接欄位。非貪婪是刻意的——vsl 是第一個欄位，
+# 邊界要取第一個 _IPC-N_；comp 是自由格式（.+），本身就可能含 IPC-N，
+# 貪婪會從尾端回溯而切錯欄位。船名不含 -，所以第一個 _IPC-N_ 必為真邊界。
+_RE_DEVICE = re.compile(r"^(?P<vsl>[A-Za-z0-9_]+?)_(?P<ipc>IPC-\d+)_(?P<comp>.+)$")
 
 # 狀態嚴重度（數字越大越該優先呈現）
 _SEVERITY = {"aborted": 4, "incomplete": 3, "partial": 3, "stale": 2, "success": 0}

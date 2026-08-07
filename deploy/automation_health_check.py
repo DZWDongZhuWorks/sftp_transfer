@@ -22,6 +22,7 @@ import json
 import os
 import pwd
 import shlex
+import shutil
 import socket
 import stat
 import subprocess
@@ -59,6 +60,12 @@ REPORT_DIR = PROJECT_DIR / "logs"
 # 接管持續超過這麼久就從 INFO 升為 WARN。真實接管撐過一天代表 ipc1 一直沒修好，
 # 該有人知道；為了測試而手動建立、事後忘了清除的殘留狀態檔也會從這裡浮出來。
 TAKEOVER_WARN_HOURS = 24
+
+# nssms-boot 還在跑中（activating/start）撐超過這麼久，就不再當作「還沒收工」而是真的
+# 卡住。為什麼這條線得由巡檢器自己畫：nssms-boot 是 Type=oneshot，而 systemd 對 oneshot
+# 的 TimeoutStartSec 預設是 infinity —— 它自己永遠不會喊卡。ExecStartPre 的 sleep 20 加上
+# reboot_launcher 的 OTA（SFTP 拉碼）與全相位起服務，船上慢網也該在十幾分鐘內收工。
+BOOT_ACTIVATING_FAIL_SECONDS = 900
 
 CORE_SERVICES = ("nssms-boot.service", "nssms-heartbeat.service")
 TIMERS = (
@@ -134,6 +141,30 @@ def _takeover_age_hours(since) -> float | None:
         age = (datetime.now().timestamp() - float(since)) / 3600
     except (TypeError, ValueError):
         return None
+    return age if age >= 0 else None
+
+
+def _monotonic_age_seconds(value: str) -> float | None:
+    """systemd 的 *TimestampMonotonic（開機以來的微秒）→ 距今幾秒。
+
+    刻意用 monotonic 而不是人類可讀的 *Timestamp：後者長成
+    "Tue 2026-08-05 10:00:00 CST"，格式隨 locale 與時區浮動，船上機器兩者都不保證，
+    解析失敗就等於量不到時間。monotonic 對上 /proc/uptime 只是兩個數字相減。
+
+    量不到（欄位空白、單位從未離開 inactive、讀不到 uptime）一律回傳 None，
+    讓呼叫端自己決定要怎麼降級 —— 這支程式絕不因為量不到時間就拋例外。
+    """
+    try:
+        started = float(value) / 1_000_000
+    except (TypeError, ValueError):
+        return None
+    if started <= 0:
+        return None
+    try:
+        uptime = float(Path("/proc/uptime").read_text(encoding="utf-8").split()[0])
+    except (OSError, ValueError, IndexError):
+        return None
+    age = uptime - started
     return age if age >= 0 else None
 
 
@@ -347,6 +378,7 @@ def check_core_services() -> None:
         "Result",
         "ExecMainStatus",
         "FragmentPath",
+        "InactiveExitTimestampMonotonic",
     )
     boot_ok = (
         boot.get("LoadState") == "loaded"
@@ -356,16 +388,41 @@ def check_core_services() -> None:
         and boot.get("Result") == "success"
         and boot.get("ExecMainStatus") in {"", "0"}
     )
-    record(
-        "units",
-        "nssms-boot.service",
-        "PASS" if boot_ok else "FAIL",
-        (
-            f"{boot.get('ActiveState')}/{boot.get('SubState')}, "
-            f"enabled={boot.get('UnitFileState')}, result={boot.get('Result')}, "
-            f"exit={boot.get('ExecMainStatus') or 'n/a'}"
-        ),
+    boot_detail = (
+        f"{boot.get('ActiveState')}/{boot.get('SubState')}, "
+        f"enabled={boot.get('UnitFileState')}, result={boot.get('Result')}, "
+        f"exit={boot.get('ExecMainStatus') or 'n/a'}"
     )
+    boot_status = "PASS" if boot_ok else "FAIL"
+    if not boot_ok:
+        # 「這一輪還在跑」不等於「壞了」。activating/start + result=success 是 oneshot
+        # 正在執行中的正常樣貌,而 nssms-boot 的跑中時間本來就長:ExecStartPre 的
+        # sleep 20 之後還有 reboot_launcher 的 OTA 與全相位起服務。
+        #
+        # 為什麼一定要跟 FAIL 分開:deploy_offline 若在機器剛開機、或有人另開視窗手動
+        # `systemctl --user start nssms-boot` 的當下跑到這裡,就會撞見這個中間狀態。
+        # 報成 FAIL 的話,船上工程師會以為開機入口壞了而去 disable/重裝 unit ——
+        # 動到的正是全船唯一的開機入口,比原本那個「等一下就好」的狀況嚴重得多。
+        age = _monotonic_age_seconds(boot.get("InactiveExitTimestampMonotonic", ""))
+        starting = (
+            boot.get("LoadState") == "loaded"
+            and boot.get("UnitFileState") == "enabled"
+            and boot.get("ActiveState") == "activating"
+            and boot.get("Result") in {"", "success"}
+        )
+        if starting and (age is None or age <= BOOT_ACTIVATING_FAIL_SECONDS):
+            boot_status = "WARN"
+            elapsed = f"已 {int(age)} 秒" if age is not None else "起始時間量不到"
+            boot_detail += (
+                f"；仍在啟動中（{elapsed}）,不是失敗。等它收工後重跑本巡檢,"
+                "應為 active/exited"
+            )
+        elif starting:
+            boot_detail += (
+                f"；卡在啟動中已 {int(age)} 秒（超過 {BOOT_ACTIVATING_FAIL_SECONDS} 秒）,"
+                f"看 {SCHEDULER_DIR / 'logs' / 'launcher.log'} 最後一行卡在哪"
+            )
+    record("units", "nssms-boot.service", boot_status, boot_detail)
 
     heartbeat = systemctl_show(
         "nssms-heartbeat.service",
@@ -699,6 +756,22 @@ def load_expected_tmux() -> dict[str, set[str]]:
 def check_tmux(role: str) -> None:
     heading("tmux 工作負載")
     expected_tmux = load_expected_tmux()
+    # 「沒有 tmux 這個指令」與「有 tmux 但沒有 session」是兩種完全不同的故障,原本都落進
+    # 下面那個 WARN（run() 把 FileNotFoundError 收成 rc=127），於是報告只寫
+    # 「No such file or directory: 'tmux'」—— 讀起來像是某個路徑設定錯了。
+    #
+    # 缺指令記 FAIL 而不是 WARN 是刻意的:它是確定性的全面失效（每一支 start_*.sh 都會
+    # exit 2，而啟動器每 30 分鐘重試、永遠補不起來）。WARN 在 --fail-on-warn 下只是
+    # exit 2 DEGRADED，很容易被讀成「服務還在起」。
+    if shutil.which("tmux") is None:
+        record(
+            "tmux",
+            "tmux 指令",
+            "FAIL",
+            "系統未安裝 tmux —— 所有 session 型專案都起不來；"
+            "以 sftp_transfer/deploy/install_tmux_offline.sh 離線補齊",
+        )
+        return
     proc = run(["tmux", "list-sessions", "-F", "#{session_name}"])
     if proc.returncode != 0:
         record(

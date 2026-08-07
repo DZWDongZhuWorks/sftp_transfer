@@ -25,7 +25,11 @@
 #         6) sudoers 白名單         → reboot / teamviewer 需要(這一步要輸入一次密碼)
 #         7) install_services.sh    → 4 支常駐服務:heartbeat(雙向心跳/接管)、
 #                                     alarm-controller / board-server / button(綁實體 IPC-1)
-#      8) 詢問「之後要不要立即執行完整啟動流程」——**只問，執行在階段 C**
+#      8) install_tmux_offline.sh → 以隨附的 debs/ 離線補齊 tmux(需密碼)。
+#         **必須排在 9) 之前**:9) 的提示要據此警告「缺 tmux 時 session 型專案全起不來」。
+#         scheduler 的每一支 start_*.sh 都靠 tmux new-session,啟動器也靠 tmux has-session
+#         對帳 —— 少了它,啟動流程會一項一項 exit 2,而船上又沒有網路可以 apt install。
+#      9) 詢問「之後要不要立即執行完整啟動流程」——**只問，執行在階段 C**
 #      這一段結束後會印「以下不再需要任何輸入」,操作者可以離開終端機。
 #
 # 實作對應:上面這份大綱就是檔尾 main() 的內容,一行一個 stage_* 函式。改流程請同時改
@@ -63,6 +67,8 @@
 #   * venv 與系統 site-packages 隔離。
 #   * 安裝前以 MANIFEST.txt 校驗 wheel sha256（可用 --skip-verify 跳過）。
 #   * 安裝後在 venv 內驗證關鍵套件可正常匯入。
+#   * tmux 同樣離線補齊：隨附 debs/ 內的 .deb 以 dpkg -i 安裝（見
+#     install_tmux_offline.sh），全程不連網。無 sudo 密碼可輸入時退回 ~/.local。
 # ---------------------------------------------------------------------------
 set -euo pipefail
 
@@ -88,6 +94,9 @@ RUN_HEALTH=1
 RUN_LAUNCH=1
 # 一旦宣告「以下不再需要任何輸入」就設為 1；此後任何提示都是程式錯誤（見 ask_yn）。
 NO_MORE_INPUT=0
+# tmux 的補齊結果。在 file scope 先給值（比照 MIGRATE_STATUS）：stage_launch_decision
+# 與 stage_summary 都會讀它，而 set -u 下讀到未定義變數會直接中止部署。
+TMUX_STATUS="未執行"
 
 # --- 顏色輸出 --------------------------------------------------------------
 if [ -t 1 ]; then
@@ -768,6 +777,84 @@ stage_scheduler_units() {
   fi
 }
 
+# --- tmux 離線補齊（deploy/install_tmux_offline.sh + debs/） ----------------
+# scheduler 的整個開機服務模型建立在 tmux 之上:每一支 reboot_script/start_*.sh 都以
+# `tmux new-session` 啟動,reboot_launcher.sh 以 `tmux has-session` 做差異對帳。少了它,
+# 啟動流程會一項一項 exit 2,而啟動器對個別失敗是「記錄並繼續」—— 於是總結看起來只是
+# 「有項目失敗」,要交叉三份 log 才會發現原因是缺一個指令。船上又沒有對外網路,
+# `apt install tmux` 不成立,所以這件事在船上原本**無法自救**。
+#
+# 語意與上面兩段的群組設定同一類:一次性、需要密碼、由專用安裝器負責、失敗只警告。
+# 差別是它有免 root 的後備路徑(解到 ~/.local),所以非互動終端機下也還能補齊。
+#
+# **必須排在 stage_launch_decision 之前**:那一題的提示要據 TMUX_STATUS 警告操作者
+# 「現在按 Y 立刻啟動,session 型專案會全部起不來」。
+#
+# 冪等:tmux 已可用時安裝器自己會判斷並安靜跳過（rc=0），這裡不問任何問題。
+# 離開碼見 install_tmux_offline.sh 檔頭:0 就緒 / 3 免 root 裝好 / 4 離線包不完整 /
+# 5 (--check-only) 待安裝 / 1 失敗。
+stage_tmux() {
+  TMUX_INSTALLER="${SCRIPT_DIR}/install_tmux_offline.sh"
+  TMUX_STATUS="未執行"
+  echo ""
+  info "檢查 tmux（scheduler 所有 session 型專案的前提）..."
+  if [ ! -f "$TMUX_INSTALLER" ]; then
+    warn "找不到 $TMUX_INSTALLER ，略過 tmux 檢查。"
+    warn "若本機沒有 tmux，啟動流程的 session 型專案會全部起不來。"
+    TMUX_STATUS="略過（找不到安裝腳本）"
+    return
+  fi
+  # 先唯讀探一次:已就緒(rc=0)就什麼都不必問,這是絕大多數情況。
+  run_rc bash "$TMUX_INSTALLER" --check-only
+  TMUX_RC="$RC"
+  if [ "$TMUX_RC" -eq 0 ]; then
+    ok "tmux 已可用（$(tmux -V 2>/dev/null || echo '版本未知')）。"
+    TMUX_STATUS="已就緒"
+    return
+  fi
+  # 以下都是「tmux 不能用」。--check-only 只回報,不安裝。
+  warn "本機的 tmux 不可用 —— 所有 session 型專案（shm / radar / wave / ecdis / flag）都起不來。"
+  if [ "$CHECK_ONLY" -eq 1 ]; then
+    case "$TMUX_RC" in
+      5) TMUX_STATUS="待安裝（離線包齊備）$DRYRUN_NOTE" ;;
+      4) TMUX_STATUS="無法安裝（離線包缺 debs/）$DRYRUN_NOTE" ;;
+      *) TMUX_STATUS="狀態不明（rc=$TMUX_RC）$DRYRUN_NOTE" ;;
+    esac
+    return
+  fi
+  if [ "$TMUX_RC" -eq 4 ]; then
+    # 離線包不完整,問也沒用 —— 沒有東西可以裝。
+    warn "離線包內沒有可用的 debs/，無法離線補齊 tmux。"
+    warn "請從有網路的**同平台**機器蒐集 deb，見 $SCRIPT_DIR/README.md。"
+    TMUX_STATUS="無法安裝（離線包缺 debs/）"
+    return
+  fi
+  if [ ! -t 0 ]; then
+    # 非互動:安裝器自己會退回免 root 路徑,不需要密碼。這與 gpio / docker 群組那兩步
+    # 不同（那兩步非互動時只能放棄），所以這裡照跑而不是略過。
+    warn "非互動終端機：以免 root 方式（~/.local）補齊 tmux。"
+  elif ! ask_yn "  現在以隨附的 deb 離線安裝 tmux？（需輸入一次密碼）[Y/n] " Y; then
+    info "略過 tmux 安裝。日後可執行：bash $TMUX_INSTALLER"
+    warn "**在補齊之前，啟動流程的 session 型專案會全部失敗。**"
+    TMUX_STATUS="使用者略過（session 型專案會失敗）"
+    return
+  fi
+  mutating "以 dpkg 離線安裝 tmux"
+  run_rc bash "$TMUX_INSTALLER"
+  TMUX_RC="$RC"
+  case "$TMUX_RC" in
+    0) ok "tmux 已安裝並可用（dpkg）。"
+       TMUX_STATUS="已安裝（dpkg）" ;;
+    3) ok "tmux 已以免 root 方式安裝到 ~/.local/bin。"
+       info "systemd user manager 的預設 PATH 已含 ~/.local/bin，nssms-boot 找得到它。"
+       TMUX_STATUS="已安裝（~/.local，未登錄 dpkg）" ;;
+    4) warn "離線包不完整，未安裝 tmux。"
+       TMUX_STATUS="無法安裝（離線包缺 debs/）" ;;
+    *) warn "tmux 安裝失敗（exit=$TMUX_RC），session 型專案將無法啟動。"
+       TMUX_STATUS="安裝失敗（exit=$TMUX_RC）" ;;
+  esac
+}
+
 # --- 是否於部署完成後立即執行完整啟動流程（只收集決定，執行在最後面） ------
 # 到目前為止只做完「一次性設定」:身分、systemd 骨架、sudoers。各專案的**程式碼、環境安裝
 # 與服務啟動**全部在啟動流程裡:
@@ -806,6 +893,16 @@ stage_launch_decision() {
       warn "本機 vsl_name=CLINK(開發機):update_booster 會刻意略過整個 OTA,"
       warn "所以**不會**下載程式碼,只會用機上現有版本啟動。"
     fi
+    # 上一步(stage_tmux)剛判定過 tmux。沒有它就沒有 session 可開,現在啟動只會得到一份
+    # 「一堆項目失敗」的紀錄 —— 那不是啟動失敗,是前提不成立,值得在按 Y 之前先說清楚。
+    case "$TMUX_STATUS" in
+      已就緒|已安裝*) ;;
+      *)
+        warn "本機 tmux 不可用($TMUX_STATUS):session 型專案(shm / radar / wave /"
+        warn "ecdis / flag)會全部 exit 2。先補齊 tmux 再啟動比較有意義:"
+        warn "  bash ${SCRIPT_DIR}/install_tmux_offline.sh"
+        ;;
+    esac
     if ask_yn "  部署完成後立即執行?（選 n 則下次開機由 nssms-boot 自動跑）[Y/n] " Y; then
       LAUNCH_DECISION="run"; ok "已排入:部署完成後會執行一次完整啟動流程。"
     else
@@ -1060,6 +1157,7 @@ stage_summary() {
   printf "  clink_* 遷移    ：%s\n" "$MIGRATE_STATUS"
   printf "  docker 群組      ：%s\n" "$DOCKER_GROUP_STATUS"
   printf "  sudo 白名單      ：%s\n" "$SUDOERS_STATUS"
+  printf "  tmux            ：%s\n" "$TMUX_STATUS"
   [ "$RUN_HEALTH" -eq 1 ] && printf "  健康檢查        ：%s\n" \
     "$( [ "$HEALTH_RC" -eq 0 ] && echo HEALTHY || echo "有問題（exit=$HEALTH_RC）" )"
   printf "  完整啟動流程    ：%s\n" "$LAUNCH_STATUS"
@@ -1151,7 +1249,8 @@ main() {
   stage_clink_migration              # A3 舊 clink_* —— **必須早於 A7，否則撞 port**
   stage_docker_group                 # A4 docker 群組（web 平台開機自啟的前提）
   stage_scheduler_units              # A5/A6/A7 timer + sudoers + 常駐服務
-  stage_launch_decision              # A8 只收集決定，執行在階段 C
+  stage_tmux                         # A8 tmux 離線補齊 —— **必須早於 A9**（見該函式）
+  stage_launch_decision              # A9 只收集決定，執行在階段 C
 
   echo ""
   info "以下不再需要任何輸入,可以離開終端機。"

@@ -26,10 +26,14 @@
 #         7) install_services.sh    → 4 支常駐服務:heartbeat(雙向心跳/接管)、
 #                                     alarm-controller / board-server / button(綁實體 IPC-1)
 #      8) install_tmux_offline.sh → 以隨附的 debs/ 離線補齊 tmux(需密碼)。
-#         **必須排在 9) 之前**:9) 的提示要據此警告「缺 tmux 時 session 型專案全起不來」。
+#         **必須排在 10) 之前**:10) 的提示要據此警告「缺 tmux 時 session 型專案全起不來」。
 #         scheduler 的每一支 start_*.sh 都靠 tmux new-session,啟動器也靠 tmux has-session
 #         對帳 —— 少了它,啟動流程會一項一項 exit 2,而船上又沒有網路可以 apt install。
-#      9) 詢問「之後要不要立即執行完整啟動流程」——**只問，執行在階段 C**
+#      9) install_setup_ssh_key.sh → 照片同步的免密碼登入(**僅實體 IPC-2**)。
+#         這一步輸入的是**遠端主機的密碼**(給 ssh-copy-id),不是本機 sudo。
+#         nssms-download-photos.timer 每 4 小時跑 script/download_photos.sh,而它以
+#         BatchMode=yes 連線 —— 沒金鑰就是立刻失敗,不會有人在旁邊輸入密碼。
+#     10) 詢問「之後要不要立即執行完整啟動流程」——**只問，執行在階段 C**
 #      這一段結束後會印「以下不再需要任何輸入」,操作者可以離開終端機。
 #
 # 實作對應:上面這份大綱就是檔尾 main() 的內容,一行一個 stage_* 函式。改流程請同時改
@@ -99,6 +103,9 @@ NO_MORE_INPUT=0
 # tmux 的補齊結果。在 file scope 先給值（比照 MIGRATE_STATUS）：stage_launch_decision
 # 與 stage_summary 都會讀它，而 set -u 下讀到未定義變數會直接中止部署。
 TMUX_STATUS="未執行"
+# 照片同步金鑰的設定結果。同上：stage_summary 會讀它，而該 stage 在非 IPC-2 上會提早
+# return —— 雖然它 return 前一定已賦值，仍在 file scope 先給值，理由與 TMUX_STATUS 相同。
+SSH_KEY_STATUS="未執行"
 
 # --- 顏色輸出 --------------------------------------------------------------
 if [ -t 1 ]; then
@@ -908,6 +915,98 @@ stage_tmux() {
   esac
 }
 
+# --- 照片同步的 SSH 金鑰（scheduler/install_setup_ssh_key.sh）---------------
+# nssms-download-photos.timer（每 4 小時，僅實體 IPC-2）會跑 script/download_photos.sh，
+# 而那支腳本以 `ssh -o BatchMode=yes` 連遠端 nsms master —— **沒有金鑰就是立刻失敗**，
+# 不會有人在旁邊輸入密碼。所以金鑰必須在這裡（唯一的人工互動視窗）一併設好。
+#
+# 這一步要輸入的是**遠端主機的密碼**（給 ssh-copy-id），不是本機 sudo —— 與 gpio /
+# docker 群組 / sudoers 那幾步性質不同，但同樣「只有現在有人在鍵盤前」。
+#
+# **只在實體 IPC-2 上做。** 閘門刻意重用 timer 用的同一支 services/require_base_ipc.sh，
+# 而不是在這裡自己判一次身分：兩份判定必然有一天不一致，而不一致不會有任何執行期錯誤 ——
+# 只會讓某台機器安靜地少設一把金鑰。用 base ipc（而非 DEPLOY_ROLE）也和 timer 一致：
+# 接管只寫 failover 旗標、不改 `ipc`，所以 ipc2emer 期間照樣要有金鑰。
+#
+# 冪等：install_setup_ssh_key.sh 會先以 BatchMode 探測，已就緒就直接回 0、不問密碼，
+# 所以重跑部署不會再卡在提示上。
+stage_ssh_key() {
+  SSH_KEY_INSTALLER="${SHARE_DIR}/scheduler/install_setup_ssh_key.sh"
+  BASE_IPC_GATE="${SHARE_DIR}/scheduler/services/require_base_ipc.sh"
+  SSH_KEY_STATUS="未執行"
+  echo ""
+  info "檢查照片同步的 SSH 金鑰（nssms-download-photos 的前提）..."
+
+  if [ ! -f "$SSH_KEY_INSTALLER" ]; then
+    warn "找不到 $SSH_KEY_INSTALLER ，略過金鑰設定。"
+    warn "若本機是 IPC-2，照片同步排程會每 4 小時失敗一次（ssh 無金鑰可用）。"
+    SSH_KEY_STATUS="略過（找不到安裝腳本）"
+    return
+  fi
+
+  # 角色閘門。找不到閘門腳本時**不擅自代它決定**：照樣往下走，讓安裝器自己判斷
+  # （最壞情況是在 IPC-1 上多問一題，比在 IPC-2 上安靜跳過安全得多）。
+  if [ -f "$BASE_IPC_GATE" ]; then
+    if ! bash "$BASE_IPC_GATE" ipc2 >/dev/null 2>&1; then
+      info "本機實體身分不是 IPC-2 —— 照片同步排程不會在此執行，略過金鑰設定。"
+      SSH_KEY_STATUS="不適用（非實體 IPC-2）"
+      return
+    fi
+  else
+    warn "找不到 $BASE_IPC_GATE ，無法判定實體身分，照樣檢查金鑰。"
+  fi
+
+  # 先唯讀探一次：已就緒（rc=0）就什麼都不必問，這是重跑部署時的絕大多數情況。
+  run_rc bash "$SSH_KEY_INSTALLER" --check-only
+  SSH_KEY_RC="$RC"
+  if [ "$SSH_KEY_RC" -eq 0 ]; then
+    ok "照片同步的免密碼登入已可用。"
+    SSH_KEY_STATUS="已就緒"
+    return
+  fi
+
+  if [ "$SSH_KEY_RC" -eq 4 ]; then
+    # 缺 ssh-copy-id 等指令，問也沒用 —— 沒有工具可以用。
+    warn "本機缺少 ssh / ssh-keygen / ssh-copy-id，無法設定金鑰登入。"
+    SSH_KEY_STATUS="無法設定（缺 openssh-client）"
+    return
+  fi
+
+  if [ "$CHECK_ONLY" -eq 1 ]; then
+    SSH_KEY_STATUS="尚未設定$DRYRUN_NOTE"
+    return
+  fi
+
+  if [ ! -t 0 ]; then
+    # 非互動：ssh-copy-id 需要遠端密碼，沒有 tty 就無從輸入。比照 gpio / docker 群組
+    # 那兩步的處理 —— 放棄並印出手動指令，而不是跑一個必定失敗的 ssh-copy-id。
+    warn "非互動終端機，略過金鑰設定（ssh-copy-id 需輸入遠端主機密碼）。"
+    warn "如需設定，請手動執行：bash $SSH_KEY_INSTALLER"
+    SSH_KEY_STATUS="略過（非互動終端機）"
+    return
+  fi
+
+  if ! ask_yn "  設定照片同步的 SSH 金鑰登入？（需輸入一次**遠端主機**的密碼）[Y/n] " Y; then
+    info "略過金鑰設定。日後可執行：bash $SSH_KEY_INSTALLER"
+    warn "在設定之前，nssms-download-photos.timer 每 4 小時會失敗一次（ssh 無金鑰）。"
+    SSH_KEY_STATUS="使用者略過（照片同步會失敗）"
+    return
+  fi
+
+  mutating "產生 SSH 金鑰並複製公鑰到遠端主機"
+  run_rc bash "$SSH_KEY_INSTALLER"
+  SSH_KEY_RC="$RC"
+  case "$SSH_KEY_RC" in
+    0) ok "照片同步的免密碼登入已設定完成。"
+       SSH_KEY_STATUS="已設定" ;;
+    4) warn "本機缺少 ssh / ssh-keygen / ssh-copy-id，未設定。"
+       SSH_KEY_STATUS="無法設定（缺 openssh-client）" ;;
+    *) warn "金鑰設定失敗（exit=$SSH_KEY_RC），照片同步排程會每 4 小時失敗一次。"
+       warn "常見原因：遠端主機沒開機、IP 不符、密碼輸入錯誤。日後可重跑：bash $SSH_KEY_INSTALLER"
+       SSH_KEY_STATUS="失敗（exit=$SSH_KEY_RC）" ;;
+  esac
+}
+
 # --- 是否於部署完成後立即執行完整啟動流程（只收集決定，執行在最後面） ------
 # 到目前為止只做完「一次性設定」:身分、systemd 骨架、sudoers。各專案的**程式碼、環境安裝
 # 與服務啟動**全部在啟動流程裡:
@@ -1211,6 +1310,7 @@ stage_summary() {
   printf "  docker 群組      ：%s\n" "$DOCKER_GROUP_STATUS"
   printf "  sudo 白名單      ：%s\n" "$SUDOERS_STATUS"
   printf "  tmux            ：%s\n" "$TMUX_STATUS"
+  printf "  照片同步金鑰    ：%s\n" "$SSH_KEY_STATUS"
   [ "$RUN_HEALTH" -eq 1 ] && printf "  健康檢查        ：%s\n" \
     "$( [ "$HEALTH_RC" -eq 0 ] && echo HEALTHY || echo "有問題（exit=$HEALTH_RC）" )"
   printf "  完整啟動流程    ：%s\n" "$LAUNCH_STATUS"
@@ -1310,8 +1410,9 @@ main() {
   stage_clink_migration              # A3 舊 clink_* —— **必須早於 A7，否則撞 port**
   stage_docker_group                 # A4 docker 群組（web 平台開機自啟的前提）
   stage_scheduler_units              # A5/A6/A7 timer + sudoers + 常駐服務
-  stage_tmux                         # A8 tmux 離線補齊 —— **必須早於 A9**（見該函式）
-  stage_launch_decision              # A9 只收集決定，執行在階段 C
+  stage_tmux                         # A8 tmux 離線補齊 —— **必須早於 A10**（見該函式）
+  stage_ssh_key                      # A9 照片同步的 SSH 金鑰（僅實體 IPC-2）
+  stage_launch_decision              # A10 只收集決定，執行在階段 C
 
   echo ""
   info "以下不再需要任何輸入,可以離開終端機。"

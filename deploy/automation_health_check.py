@@ -68,9 +68,18 @@ TAKEOVER_WARN_HOURS = 24
 BOOT_ACTIVATING_FAIL_SECONDS = 900
 
 CORE_SERVICES = ("nssms-boot.service", "nssms-heartbeat.service")
+# nssms-download-photos 只在實體 IPC-2 上真的執行,閘門是 unit 的 ExecCondition。它仍然列在
+# 這裡而不開特例:timer 本身在三台都是 enabled + active/waiting,而被 ExecCondition 跳過的
+# service 是 inactive/dead + Result=exec-condition —— 兩者都落在 check_timers /
+# evaluate_service 既有的健康判定範圍內。
+#
+# 【勿在下面的 tuple 內寫含括號的註解】device_monitor/tests/test_integration.sh 的涵蓋度斷言
+# 用 `^TIMERS = \((.*?)\)` 抓這個 tuple,非貪婪會停在**第一個**右括號:註解裡的括號會把清單
+# 截斷,於是後面的 timer 全被誤判為「沒被涵蓋」。要加說明就寫在這一段。
 TIMERS = (
     "nssms-device-monitor-probe",
     "nssms-device-monitor-report",
+    "nssms-download-photos",
     "nssms-reboot",
     "nssms-teamviewer",
     "nssms-warm-env",

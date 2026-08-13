@@ -552,17 +552,28 @@ def check_timers(strict_wave: bool) -> None:
             and timer_props.get("ActiveState") == "active"
             and timer_props.get("SubState") == "waiting"
         )
-        record(
-            "timers",
-            timer,
-            "PASS" if timer_ok else "FAIL",
-            (
-                f"{timer_props.get('ActiveState')}/{timer_props.get('SubState')}, "
-                f"enabled={timer_props.get('UnitFileState')}, "
-                f"next={timer_props.get('NextElapseUSecRealtime') or 'n/a'}, "
-                f"last={timer_props.get('LastTriggerUSec') or '尚無'}"
-            ),
+        # 【timer 這一層也要吃 optional】`optional` 原本只套用在下面的 evaluate_service 與
+        # ExecStart 檢查上,timer 本身是**無條件** FAIL。而 scheduler 的 install_timers.sh
+        # 對 OPTIONAL_UNITS(wave 兩支空樁)刻意是「佈署 unit 檔但不 enable」——
+        # 早期它們被 enable 起來、每 10 分鐘觸發一次 status=127,把 failed 清單佔住,
+        # 並持續污染各 unit 的檔案 log。所以 `UnitFileState=disabled` 是那兩支的**預期
+        # 穩定狀態**,不是故障。
+        #
+        # 少了這個降級,每一條船都會固定吐兩個紅字 → 整體 UNHEALTHY,而 deploy_offline.sh
+        # 把本程式當作首次部署唯一的驗證關卡 —— 真正的故障會被這兩個常駐紅字遮蔽。
+        # 降級規則與 evaluate_service 的 `skip = optional and not strict_optional` 逐字
+        # 相同,`--strict-wave` 可還原成嚴格檢查。
+        timer_bad_status = "SKIP" if (optional and not strict_wave) else "FAIL"
+        timer_detail = (
+            f"{timer_props.get('ActiveState')}/{timer_props.get('SubState')}, "
+            f"enabled={timer_props.get('UnitFileState')}, "
+            f"next={timer_props.get('NextElapseUSecRealtime') or 'n/a'}, "
+            f"last={timer_props.get('LastTriggerUSec') or '尚無'}"
         )
+        if not timer_ok and timer_bad_status == "SKIP":
+            # 講清楚為什麼被降級,否則報告上的 SKIP 看起來像「這項沒被檢查」。
+            timer_detail += "；wave 為可選功能,腳本未提供時 install_timers 刻意不 enable（--strict-wave 可強制檢查）"
+        record("timers", timer, "PASS" if timer_ok else timer_bad_status, timer_detail)
 
         evaluate_service(
             service,

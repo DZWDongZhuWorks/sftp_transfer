@@ -73,10 +73,15 @@ CORE_SERVICES = ("nssms-boot.service", "nssms-heartbeat.service")
 # service 是 inactive/dead + Result=exec-condition —— 兩者都落在 check_timers /
 # evaluate_service 既有的健康判定範圍內。
 #
+# nssms-cleanup-old-files 兩台都跑、刻意沒有角色閘門（碟會滿是兩台各自的事）。它出貨時
+# 規則檔整份 enabled=false，所以正常一輪是「只預覽、零刪除」—— 對本巡檢而言仍是
+# active/waiting + Result=success，不需要特例。
+#
 # 【勿在下面的 tuple 內寫含括號的註解】device_monitor/tests/test_integration.sh 的涵蓋度斷言
 # 用 `^TIMERS = \((.*?)\)` 抓這個 tuple,非貪婪會停在**第一個**右括號:註解裡的括號會把清單
 # 截斷,於是後面的 timer 全被誤判為「沒被涵蓋」。要加說明就寫在這一段。
 TIMERS = (
+    "nssms-cleanup-old-files",
     "nssms-device-monitor-probe",
     "nssms-device-monitor-report",
     "nssms-download-photos",

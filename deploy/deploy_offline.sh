@@ -125,8 +125,8 @@ err()   { printf "%s[FAIL]%s %s\n"  "$R" "$N" "$*" >&2; }
 # 逐字記錄跟兩份報告一樣落在 logs/。
 #
 # 做法：把 stdout 與 stderr 一起接到 tee，一份原樣進終端機（保留顏色），一份經 sed
-# 去掉 ANSI 逃脫碼後進檔案（讓 log 能 grep、能貼進工單）。合流 stderr 是刻意的：
-# err() 寫 stderr，分兩份存會讓「哪一步失敗」失去時間順序。
+# 去掉 ANSI 逃脫碼、再逐行加上時間戳後進檔案（讓 log 能 grep、能貼進工單）。合流
+# stderr 是刻意的：err() 寫 stderr，分兩份存會讓「哪一步失敗」失去時間順序。
 #
 # 兩個已知的取捨：
 #   * 子程序（install_*.sh / health_check.py）的 stdout 從此是 pipe 而非 tty，它們的
@@ -138,6 +138,30 @@ err()   { printf "%s[FAIL]%s %s\n"  "$R" "$N" "$*" >&2; }
 #     會晚於 shell 提示符才印出來，也可能來不及寫進檔案。
 TRANSCRIPT=""            # 記錄檔路徑；空字串＝這次沒留成記錄（stage_summary 會讀）
 TRANSCRIPT_TEE_PID=""
+
+# 記錄檔逐行加上時鐘。只加在**檔案**這一路，終端機那一路完全不動（見下方 exec）：
+# 螢幕上是即時的，時間對站在機器前的人沒有用；真正需要它的是事後排錯 ——「停在哪一步、
+# 停了多久」。原本整份記錄一個時間戳都沒有，於是要回答這個問題只能拿 launcher.log 的
+# 起訖行、兩份 Markdown 報告的檔名時間去反推，而那幾個點之間的空白仍然是猜的。
+#
+# 為什麼是 bash 迴圈而不是 awk 或 moreutils 的 ts：機上的 awk 是 mawk（沒有 strftime），
+# ts 也不在離線包裡。printf '%(...)T' 是 bash 4.2 起的內建，零依賴、不多開行程。
+#
+# 兩個要知道的限制（都不是這一層能修的）：
+#   * 時間戳記的是「這一行**抵達**記錄器」的時刻。子程序的 stdout 在這裡是 pipe，所以
+#     Python（health_check.py 等）會塊緩衝到 8 KB 才吐一次 —— 那一整批會拿到幾乎相同的
+#     時間。要看某一行真正發生的時刻，得讓那支程式自己不緩衝。
+#   * pip 那種用 \r 原地更新的進度是同一行，要等它換行才會落檔，時間戳因此是該段的結束
+#     時刻而不是開始。終端機顯示不受影響（tee 是逐位元組轉發的）。
+#
+# read -r 保留反斜線；`|| [ -n "$line" ]` 讓最後一行沒有換行時也不會被丟掉。
+stamp_lines() {
+  local line
+  while IFS= read -r line || [ -n "$line" ]; do
+    printf '%(%F %T)T %s\n' -1 "$line"
+  done
+}
+
 start_transcript() {
   local dir="${PROJECT_DIR}/logs"
   local path="${dir}/deploy_offline_$(date '+%Y%m%d_%H%M%S').log"
@@ -150,7 +174,9 @@ start_transcript() {
   fi
   TRANSCRIPT="$path"
   exec 3>&1 4>&2
-  exec > >(tee >(sed -u 's/\x1b\[[0-9;?]*[a-zA-Z]//g' >>"$TRANSCRIPT")) 2>&1
+  exec > >(tee >(sed -u 's/\x1b\[[0-9;?]*[a-zA-Z]//g' | stamp_lines >>"$TRANSCRIPT")) 2>&1
+  # $! 取到的是最外層那支 tee（stamp_lines 在內層程序替換裡，不影響這個值）。tee 收工
+  # 時內層才會看到 EOF，所以等它就等於等整條鏈 —— 這也是下面只 wait 一個 PID 的理由。
   TRANSCRIPT_TEE_PID=$!   # bash >= 5.1 會把程序替換的 PID 放進 $!；舊版取不到就少了等待
   trap stop_transcript EXIT
 }

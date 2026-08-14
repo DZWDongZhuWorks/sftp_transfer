@@ -1,0 +1,36 @@
+# Offline wheel bundle manifest — profile: ubuntu-18.04-arm64
+# Built for: Linux aarch64 / CPython 3.6 (cp36) / glibc >= 2.17 (Bionic 為 2.27)
+# Built on : 以 pip download --python-version 3.6 --abi cp36m
+#            --platform manylinux2014_aarch64 --only-binary=:all: 於有網路的建置機解析
+# Files    : 19 wheels
+#
+# 為什麼版本比 Jammy 舊：Bionic 只有 python3.6，而 paramiko 5 需要 >=3.9、
+# cffi 2.x 需要 >=3.10、cryptography 49 需要 glibc>=2.34。這一組是「仍支援 3.6」
+# 的最後一批：paramiko 3.5.1 / cryptography 40.0.2 / pytest 7.0.1。
+#
+# 注意：exceptiongroup 刻意不在此列 —— 它的 backport 需要 >=3.7，PyPI 上給 3.6 的
+# 只有一個 0.0.0a0 佔位套件（還會拖進 trio 一串）。deploy_offline.sh 會按實際存在
+# 的檔案挑測試堆疊，缺它不影響部署。
+#
+# 校驗基準目錄就是本目錄。不要併進 deploy/MANIFEST.txt。
+#
+# sha256  filename
+29e95c7f6778868dbd49170f98f8818f78f3dc5e0e37c0b1f474e3561b240836  attrs-22.2.0-py3-none-any.whl
+0eaa47d4661c326bfc9d08d16debbc4edf78778e6aaba29c1bc7ce67214d4410  bcrypt-4.0.1-cp36-abi3-manylinux_2_17_aarch64.manylinux2014_aarch64.whl
+e263d77ee3dd201c3a142934a086a4450861778baaeeb45db4591ef65550b0a6  cffi-1.15.1-cp36-cp36m-manylinux_2_17_aarch64.manylinux2014_aarch64.whl
+2641f803ee9f95b1f387f3e8f3bf28d83d9b69a39e9911e5bfee832bea75240d  coverage-6.2-cp36-cp36m-manylinux_2_17_aarch64.manylinux2014_aarch64.whl
+4df2af28d7bedc84fe45bd49bc35d710aede676e2a4cb7fc6d103a2adc8afe4d  cryptography-40.0.2-cp36-abi3-manylinux_2_17_aarch64.manylinux2014_aarch64.whl
+011e24c64b7f47f6ebd835bb12a743f2fbe9a26d4cecaa7f53bc4f35ee9da8b3  iniconfig-1.1.1-py2.py3-none-any.whl
+2413bc441b376e5cd3f55bb5d364f973ad8bdd7bf87e53c79de3c11bf3feecc8  invoke-2.2.1-py3-none-any.whl
+ef103e05f519cdc783ae24ea4e2e0f508a9c99b2d4969652eed6a2e1ea5bd522  packaging-21.3-py3-none-any.whl
+43b9a0501fc2b5e70680388d9346cf252cfb7d00b0667c39e80eb43a408b8f61  paramiko-3.5.1-py3-none-any.whl
+74134bbf457f031a36d68416e1509f34bd5ccc019f0bcc952c7b909d06b37bd3  pluggy-1.0.0-py2.py3-none-any.whl
+607c53218732647dff4acdfcd50cb62615cedf612e72d1724fb1a0cc6405b378  py-1.11.0-py2.py3-none-any.whl
+8ee45429555515e1f6b185e78100aea234072576aa43ab53aefcae078162fca9  pycparser-2.21-py2.py3-none-any.whl
+fa7bd7bd2771287c0de303af8bfdfc731f51bd2c6a47ab69d117138893b82717  Pygments-2.14.0-py3-none-any.whl
+a36d4a9dda1f19ce6e03c9a784a2921a4b726b02e1c736600ca9c22029474394  PyNaCl-1.5.0-cp36-abi3-manylinux_2_17_aarch64.manylinux2014_aarch64.whl
+a6c06a88f252e6c322f65faf8f418b16213b51bdfaece0524c1c1bc30c63c484  pyparsing-3.0.7-py3-none-any.whl
+9ce3ff477af913ecf6321fe337b93a2c0dcf2a0a1439c43f5452112c1e4280db  pytest-7.0.1-py3-none-any.whl
+2feb1b751d66a8bd934e5edfa2e961d11309dc37b73b0eabe73b5945fee20f6b  pytest_cov-4.0.0-py3-none-any.whl
+e3069e4be3ead9668e21cb9b074cd948f7b3113fd9c8bba083f48247aab8b11c  tomli-1.2.3-py3-none-any.whl
+21c85e0fe4b9a155d0799430b0ad741cdce7e359660ccbd8b530613e8df88ce2  typing_extensions-4.1.1-py3-none-any.whl

@@ -75,8 +75,14 @@ set -euo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 PLATFORMS_ROOT="${SCRIPT_DIR}/platforms"
+# wheelhouse / virtualenv_wheels 與 debs 同構：各平台一份，放在自己的 profile 底下，
+# manifest 就放在該目錄**裡面**。理由與 debs 相同 —— 校驗的基準目錄是 wheelhouse 自己，
+# 混進一份共用 manifest 只會在換平台時對不上。實際路徑在 banner_and_preflight 裡由
+# 偵測到的 profile 決定（見 resolve_wheelhouse）；這裡的值只是「還沒偵測」的預設。
 WHEELHOUSE="${SCRIPT_DIR}/wheelhouse"
 MANIFEST="${SCRIPT_DIR}/MANIFEST.txt"
+VENV_WHEELS=""         # 空＝交給 install_virtualenv_offline.sh 自己找同層 virtualenv_wheels/
+WHEELHOUSE_LAYOUT=""   # profile / legacy —— 只用於訊息，讓記錄看得出走了哪一條
 PROJECT_DIR="$(cd "${SCRIPT_DIR}/.." && pwd)"
 SHARE_DIR="$(dirname "$PROJECT_DIR")"
 # 船舶基本資訊檔：供各設定檔的 {vsl_name}/{ipc} 佔位符替換使用（見 settings.py）。
@@ -276,6 +282,44 @@ parse_args() {
   esac
 }
 
+# 依偵測到的 profile 決定 wheelhouse / virtualenv_wheels 的實際位置。
+# 必須在 nssms_detect_profile 之後呼叫（它要 $PROFILE_DIR）。
+#
+# 兩種佈局：
+#   profile — deploy/platforms/<profile>/wheelhouse/{*.whl,MANIFEST.txt}   ← 正規
+#   legacy  — deploy/wheelhouse/ + deploy/MANIFEST.txt                     ← 過渡
+#
+# legacy 留著是因為已經派送到船上的舊離線包就是那個形狀，換版不該讓它們一次全部失效。
+# 但 legacy 只有**單一**一份，換平台必然對不上 —— 所以走 legacy 時會 warn，並且
+# 相容性檢查照跑（那才是真正的守門，不是靠目錄名字）。
+resolve_wheelhouse() {
+  local prof_wh="${PROFILE_DIR}/wheelhouse"
+  local prof_vw="${PROFILE_DIR}/virtualenv_wheels"
+
+  if [ -d "$prof_wh" ]; then
+    WHEELHOUSE="$prof_wh"
+    MANIFEST="${prof_wh}/MANIFEST.txt"
+    WHEELHOUSE_LAYOUT="profile：${NSSMS_PROFILE_ID}"
+  else
+    WHEELHOUSE="${SCRIPT_DIR}/wheelhouse"
+    MANIFEST="${SCRIPT_DIR}/MANIFEST.txt"
+    WHEELHOUSE_LAYOUT="legacy 共用目錄"
+    warn "找不到 ${prof_wh}，退回共用的 deploy/wheelhouse/。"
+    warn "共用目錄只有一份，換平台一定對不上；請盡快改成 per-profile 佈局。"
+  fi
+
+  # virtualenv 的 bootstrap 輪子同理，但它可以共用：目前那一組全部宣告
+  # Requires-Python >=3.6，Bionic 與 Jammy 都吃得下。若哪天要為某個 profile 另備一份，
+  # 放 platforms/<profile>/virtualenv_wheels/ 就會自動被挑走。
+  if [ -d "$prof_vw" ]; then
+    VENV_WHEELS="$prof_vw"
+  elif [ -d "${SCRIPT_DIR}/virtualenv_wheels" ]; then
+    VENV_WHEELS="${SCRIPT_DIR}/virtualenv_wheels"
+  else
+    VENV_WHEELS=""
+  fi
+}
+
 banner_and_preflight() {
   local preflight_failures=0
   local preflight_rc=4
@@ -303,10 +347,39 @@ banner_and_preflight() {
     PY_TAG="$("$PYTHON_BIN" -c 'import sys;print("cp%d%d"%sys.version_info[:2])')"
     info "基底直譯器    : $PYTHON_BIN ($PY_VER, $PY_TAG；船端預安裝)"
   fi
-  info "Wheelhouse    : $WHEELHOUSE"
+  resolve_wheelhouse
+  info "Wheelhouse    : $WHEELHOUSE（$WHEELHOUSE_LAYOUT）"
   info "專案目錄      : $PROJECT_DIR"
   info "專屬 venv     : $VENV_DIR"
   info "船舶資訊檔    : $VESSEL_INFO"
+
+  # --- wheelhouse 與「這個」直譯器是否真的相容 ------------------------------
+  # 這一項刻意放在階段 A 之前。它擋的是「preflight 全綠、階段 B 才發現輪子根本
+  # 裝不上」——那個時序下 systemd/sudoers/tmux 已經改完，而沒裝完的 venv 會讓兩支
+  # OTA 腳本的 `[ -x $VENV_PY ]` 守門失效（venv 在、paramiko 不在），於是那條船
+  # 失去唯一的下載路徑。詳見 lib/wheel_compat.py 的檔頭。
+  if [ -z "${PY_VER:-}" ]; then
+    : # 直譯器都找不到，上面已經記過一筆，這裡不重複
+  else
+    WHEEL_REQUIRED=(paramiko bcrypt cryptography pynacl cffi pycparser)
+    PY_MM="$("$PYTHON_BIN" -c 'import sys;print("%d.%d"%sys.version_info[:2])')"
+    # 目標平台明確傳進去，不讓 checker 從「執行它的直譯器」去猜（見該檔 main() 的註解）。
+    run_rc "$PYTHON_BIN" "${SCRIPT_DIR}/lib/wheel_compat.py" \
+      --py "$PY_MM" --glibc "$NSSMS_GLIBC" --arch "$(uname -m)" \
+      "$WHEELHOUSE" "${WHEEL_REQUIRED[@]}"
+    case "$RC" in
+      0) ok "wheelhouse 與 $PY_TAG / glibc $NSSMS_GLIBC 相容。" ;;
+      *)
+        err "wheelhouse 與本機不相容（exit=$RC）；尚未做任何持久變更。"
+        err "本機需要的是 $PY_TAG / glibc $NSSMS_GLIBC 的輪子。"
+        err "正確做法是為這個 profile 另備一份 wheelhouse："
+        err "  deploy/platforms/${NSSMS_PROFILE_ID}/wheelhouse/"
+        err "重建方式見 deploy/README.md 的「未來如何更新 / 重建 wheelhouse」。"
+        preflight_failures=$((preflight_failures + 1))
+        [ "$RC" -ne 6 ] || preflight_rc=6
+        ;;
+    esac
+  fi
 
   run_rc bash "$SCRIPT_DIR/install_tmux_offline.sh" --check-only --profile-dir "$PROFILE_DIR"
   case "$RC" in
@@ -1157,7 +1230,13 @@ stage_wheelhouse_and_venv() {
     if [ ! -f "$VENV_INSTALLER" ]; then
       err "找不到離線安裝腳本：$VENV_INSTALLER"; exit 1
     fi
-    bash "$VENV_INSTALLER"
+    # VENV_WHEELS_DIR 讓 profile 專屬的 virtualenv_wheels/ 生效（見 resolve_wheelhouse）；
+    # 空字串時不設，維持安裝器自己找同層目錄的既有行為。
+    if [ -n "$VENV_WHEELS" ]; then
+      VENV_WHEELS_DIR="$VENV_WHEELS" bash "$VENV_INSTALLER"
+    else
+      bash "$VENV_INSTALLER"
+    fi
     if ! "$PYTHON_BIN" -m virtualenv --version >/dev/null 2>&1; then
       err "virtualenv 離線安裝後，$PYTHON_BIN 仍無法使用（可能裝到了其他解譯器）。"
       err "請確認 $PYTHON_BIN 與 install_virtualenv_offline.sh 選用的解譯器一致。"
@@ -1209,8 +1288,28 @@ stage_wheelhouse_and_venv() {
 
   PKGS=("${RUNTIME_PKGS[@]}")
   if [ "$INSTALL_TESTS" -eq 1 ]; then
-    PKGS+=("${TEST_PKGS[@]}")
-    info "安裝範圍      : 執行期相依 + 測試堆疊 (pytest；預設)"
+    # 執行期相依是**必須**的（preflight 的 wheel_compat.py 已經強制它們存在）；
+    # 測試堆疊則按 wheelhouse 實際有什麼裝什麼。理由：同一份清單套到不同 Python 會有
+    # 客觀上不存在的成員 —— 例如 exceptiongroup 的 backport 要 >=3.7，Bionic 的 py3.6
+    # 沒有任何真版本（PyPI 上只有一個 0.0.0a0 佔位套件，還會把 trio 一串拖進來）。
+    # 為此讓整個部署失敗是不對的：測試堆疊不是船上跑服務的必要條件。
+    local skipped=()
+    for pkg in "${TEST_PKGS[@]}"; do
+      # wheel 檔名的 name 欄位用底線與大小寫變體，比對前一起正規化（PEP 503）。
+      local norm; norm="$(printf '%s' "$pkg" | tr 'A-Z_.' 'a-z--')"
+      if find "$WHEELHOUSE" -maxdepth 1 -name '*.whl' -printf '%f\n' 2>/dev/null \
+         | sed 's/-.*//' | tr 'A-Z_.' 'a-z--' | grep -qx "$norm"; then
+        PKGS+=("$pkg")
+      else
+        skipped+=("$pkg")
+      fi
+    done
+    if [ "${#skipped[@]}" -gt 0 ]; then
+      info "安裝範圍      : 執行期相依 + 測試堆疊（本 profile 缺 ${skipped[*]}，略過）"
+      warn "此 profile 的 wheelhouse 沒有 ${skipped[*]}；health_check 的單元測試段會受限。"
+    else
+      info "安裝範圍      : 執行期相依 + 測試堆疊 (pytest；預設)"
+    fi
   else
     info "安裝範圍      : 執行期相依 (paramiko 堆疊；--skip-tests)"
   fi

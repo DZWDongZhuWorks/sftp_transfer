@@ -224,13 +224,21 @@ class OfflineDeployTests(unittest.TestCase):
         fake_home = self.temp_dir / "home"
         fake_home.mkdir()
         fake_python = self.temp_dir / "python3"
+        # 版本查詢一律回答 3.6，其餘（例如 lib/wheel_compat.py 這種真的要執行的腳本）
+        # 轉交給真實的 python3。preflight 現在會拿 wheelhouse 去比對直譯器版本，
+        # 只會回答版本的殼子已經不夠用了 —— 但「假裝是 3.6」這個測試意圖不變：
+        # 目標版本是由 --py 明確傳給 checker 的，不是由執行它的直譯器決定。
         fake_python.write_text(
             "#!/usr/bin/env bash\n"
             "case \"${2:-}\" in\n"
-            "  *join*) printf '3.6.15\\n' ;;\n"
-            "  *cp\\%d\\%d*) printf 'cp36\\n' ;;\n"
-            "  *) exit 1 ;;\n"
-            "esac\n",
+            "  *join*) printf '3.6.15\\n'; exit 0 ;;\n"
+            "  *cp\\%d\\%d*) printf 'cp36\\n'; exit 0 ;;\n"
+            "  *version_info\\[:2\\]*) printf '3.6\\n'; exit 0 ;;\n"
+            "esac\n"
+            "for a in \"$@\"; do\n"
+            "  case \"$a\" in *.py) exec /usr/bin/env python3 \"$@\" ;; esac\n"
+            "done\n"
+            "exit 1\n",
             encoding="utf-8",
         )
         fake_python.chmod(0o755)
@@ -278,6 +286,220 @@ class OfflineDeployTests(unittest.TestCase):
         self.assertNotIn("install_python_offline", source)
         self.assertNotIn("assets/common/python", source)
         self.assertFalse((DEPLOY_DIR / "install_python_offline.sh").exists())
+
+
+class WheelCompatTests(unittest.TestCase):
+    """wheel_compat.py 的守門契約。
+
+    這支守門存在的理由是一次真實事故的重現：Bionic（py3.6 / glibc 2.27）對著 cp310 +
+    manylinux_2_34 的 wheelhouse 跑 --check-only 會回 0，宣稱全部通過，然後在階段 B 的
+    pip 才失敗 —— 而階段 A 已經改完 systemd / sudoers / tmux。更糟的是沒裝完的 venv 會讓
+    兩支 OTA 腳本的 `[ -x $VENV_PY ]` 守門失效（venv 在、paramiko 不在），那條船就失去
+    唯一的下載路徑。所以下面每一項都在測「不相容時必須非 0」，而不是只測正向。
+    """
+
+    RUNTIME = ["paramiko", "bcrypt", "cryptography", "pynacl", "cffi", "pycparser"]
+
+    def setUp(self):
+        self.temp_dir = Path(tempfile.mkdtemp(prefix="nssms-wheelcompat-test."))
+        self.wh = self.temp_dir / "wheelhouse"
+        self.wh.mkdir()
+
+    def tearDown(self):
+        shutil.rmtree(str(self.temp_dir))
+
+    def touch(self, *filenames):
+        for name in filenames:
+            (self.wh / name).write_bytes(b"not-a-real-wheel")
+
+    def check(self, glibc, py_ver, arch="aarch64", required=None, wheelhouse=None):
+        """直接呼叫 check()，才能對任意 (python, glibc, arch) 組合斷言。
+
+        走 subprocess 只能測到「跑測試的那個直譯器」，而這支守門的重點正是「別的平台」。
+        """
+        import importlib.util
+
+        spec = importlib.util.spec_from_file_location(
+            "wheel_compat", str(DEPLOY_DIR / "lib" / "wheel_compat.py")
+        )
+        module = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(module)
+        target = str(self.wh if wheelhouse is None else wheelhouse)
+        rc, problems, _found = module.check(
+            target, glibc,
+            self.RUNTIME if required is None else required,
+            py_ver, arch,
+        )
+        return rc, "\n".join(problems)
+
+    # --- 正向：兩個 profile 各自的真實 wheelhouse 都要過 ---------------------
+
+    def test_real_jammy_wheelhouse_matches_cp310(self):
+        wh = DEPLOY_DIR / "platforms" / "ubuntu-22.04-arm64" / "wheelhouse"
+        if not any(wh.glob("*.whl")):
+            self.skipTest("Jammy wheelhouse 未派送到本機（*.whl 不納入版控）")
+        rc, out = self.check("2.35", (3, 10), wheelhouse=wh)
+        self.assertEqual(rc, 0, out)
+
+    def test_real_bionic_wheelhouse_matches_cp36(self):
+        wh = DEPLOY_DIR / "platforms" / "ubuntu-18.04-arm64" / "wheelhouse"
+        if not any(wh.glob("*.whl")):
+            self.skipTest("Bionic wheelhouse 未派送到本機（*.whl 不納入版控）")
+        rc, out = self.check("2.27", (3, 6), wheelhouse=wh)
+        self.assertEqual(rc, 0, out)
+
+    def test_pure_python_wheels_are_always_compatible(self):
+        self.touch(
+            "paramiko-3.5.1-py3-none-any.whl",
+            "pycparser-2.21-py2.py3-none-any.whl",
+        )
+        rc, out = self.check("2.27", (3, 6), required=["paramiko", "pycparser"])
+        self.assertEqual(rc, 0, out)
+
+    # --- 反向：這些都是實際踩過或差一步就會踩到的 ---------------------------
+
+    def test_cp310_wheel_rejected_on_py36(self):
+        self.touch("cffi-2.1.0-cp310-cp310-manylinux2014_aarch64.whl")
+        rc, out = self.check("2.27", (3, 6), required=[])
+        self.assertEqual(rc, 6, out)
+        self.assertIn("只適用 Python 3.10", out)
+
+    def test_newer_glibc_wheel_rejected_on_bionic(self):
+        # 這正是 Jammy 那三個輪子（bcrypt / cryptography / pynacl）在 Bionic 上的下場。
+        self.touch("cryptography-49.0.0-cp39-abi3-manylinux_2_34_aarch64.whl")
+        rc, out = self.check("2.27", (3, 6), required=[])
+        self.assertEqual(rc, 6, out)
+        self.assertIn("glibc >= 2.34", out)
+
+    def test_abi3_wheel_rejected_when_interpreter_too_old(self):
+        self.touch("bcrypt-5.0.0-cp39-abi3-manylinux_2_17_aarch64.whl")
+        rc, out = self.check("2.27", (3, 6), required=[])
+        self.assertEqual(rc, 6, out)
+        self.assertIn("abi3", out)
+
+    def test_abi3_wheel_accepted_when_interpreter_newer(self):
+        # abi3 的語意是「>= 這個版本」，不能當成必須相等，否則 Jammy 會誤擋自己的輪子。
+        self.touch("bcrypt-5.0.0-cp39-abi3-manylinux_2_17_aarch64.whl")
+        rc, out = self.check("2.35", (3, 10), required=["bcrypt"])
+        self.assertEqual(rc, 0, out)
+
+    def test_multiple_platform_tags_take_the_loosest(self):
+        # 同一個 wheel 宣告多個平台標籤時，只要**任一個**滿足就裝得起來。
+        self.touch(
+            "coverage-7.15.2-cp36-cp36m-manylinux2014_aarch64."
+            "manylinux_2_17_aarch64.manylinux_2_28_aarch64.whl"
+        )
+        rc, out = self.check("2.27", (3, 6), required=["coverage"])
+        self.assertEqual(rc, 0, out)
+
+    def test_wrong_architecture_rejected(self):
+        self.touch("cffi-1.15.1-cp36-cp36m-manylinux2014_x86_64.whl")
+        rc, out = self.check("2.27", (3, 6), required=[], arch="aarch64")
+        self.assertEqual(rc, 6, out)
+        self.assertIn("架構是", out)
+
+    def test_debian_arch_naming_is_not_used_for_wheel_tags(self):
+        # dpkg 說 arm64、wheel 標籤說 aarch64。拿前者來比會把每個輪子都誤判成不相容，
+        # 這個 bug 在開發時真的發生過（Jammy 自己的 17 個輪子全被擋）。
+        self.touch("cffi-1.15.1-cp36-cp36m-manylinux2014_aarch64.whl")
+        rc, out = self.check("2.27", (3, 6), required=["cffi"], arch="arm64")
+        self.assertEqual(rc, 6, out)
+        source = (DEPLOY_DIR / "lib" / "wheel_compat.py").read_text(encoding="utf-8")
+        self.assertIn("platform.machine()", source)
+        self.assertNotIn("print-architecture", source)
+
+    def test_empty_wheelhouse_is_rejected(self):
+        rc, out = self.check("2.27", (3, 6))
+        self.assertEqual(rc, 4, out)
+        self.assertIn("沒有任何 .whl", out)
+
+    def test_missing_wheelhouse_is_rejected(self):
+        rc, out = self.check("2.27", (3, 6), wheelhouse=self.temp_dir / "nope")
+        self.assertEqual(rc, 4, out)
+
+    def test_missing_required_runtime_package_is_rejected(self):
+        # 輪子全都相容，但少了 paramiko —— pip 會失敗，而失敗點在階段 B。
+        self.touch("bcrypt-4.0.1-cp36-abi3-manylinux_2_17_aarch64.whl")
+        rc, out = self.check("2.27", (3, 6))
+        self.assertEqual(rc, 4, out)
+        self.assertIn("paramiko", out)
+
+    def test_package_name_normalisation(self):
+        # 檔名是 typing_extensions，需求寫 typing-extensions，必須視為同一個（PEP 503）。
+        self.touch("typing_extensions-4.1.1-py3-none-any.whl")
+        rc, out = self.check("2.27", (3, 6), required=["typing-extensions"])
+        self.assertEqual(rc, 0, out)
+
+    def test_guard_itself_runs_on_python36(self):
+        """守門不能用它要守的那個平台跑不動的語法寫。
+
+        只看**程式碼**，不看註解 —— 檔頭刻意把這些寫法列成「不要用」的清單，
+        整檔搜字串會被自己的說明文件誤判。
+        """
+        raw = (DEPLOY_DIR / "lib" / "wheel_compat.py").read_text(encoding="utf-8")
+        code = "\n".join(
+            line for line in raw.splitlines()
+            if not line.lstrip().startswith("#")
+        )
+        self.assertNotIn("from __future__ import annotations", code)
+        self.assertNotIn("dataclass", code)
+        for token in ("list[", "dict[", "tuple[", "set["):
+            self.assertNotIn(token, code, "PEP 585 泛型在 3.6 求值會 TypeError")
+
+
+class WheelhouseLayoutTests(unittest.TestCase):
+    """per-profile wheelhouse 的佈局契約。"""
+
+    def test_deploy_resolves_wheelhouse_from_profile(self):
+        source = (DEPLOY_DIR / "deploy_offline.sh").read_text(encoding="utf-8")
+        self.assertIn("resolve_wheelhouse", source)
+        self.assertIn('WHEELHOUSE="$prof_wh"', source)
+        # manifest 要跟著 wheelhouse 走，不能再指回共用的 deploy/MANIFEST.txt。
+        self.assertIn('MANIFEST="${prof_wh}/MANIFEST.txt"', source)
+
+    def test_guard_runs_before_any_mutation(self):
+        """相容性檢查必須在階段 A 之前 —— 這是整個守門的意義所在。"""
+        source = (DEPLOY_DIR / "deploy_offline.sh").read_text(encoding="utf-8")
+        guard = source.index("wheel_compat.py")
+        preflight_end = source.index("stage_vessel_info")
+        self.assertLess(
+            guard, preflight_end,
+            "wheel_compat 的呼叫跑到階段 A 之後了；那樣擋不住「部署到一半失去 OTA」"
+        )
+
+    def test_every_shipped_profile_wheelhouse_has_a_manifest(self):
+        platforms = DEPLOY_DIR / "platforms"
+        for profile in sorted(p for p in platforms.iterdir() if p.is_dir()):
+            wh = profile / "wheelhouse"
+            if not wh.is_dir():
+                continue
+            if not any(wh.glob("*.whl")):
+                continue
+            manifest = wh / "MANIFEST.txt"
+            self.assertTrue(
+                manifest.is_file(),
+                "{} 有輪子卻沒有 MANIFEST.txt".format(wh),
+            )
+            listed = set()
+            for line in manifest.read_text(encoding="utf-8").splitlines():
+                if line.startswith("#") or not line.strip():
+                    continue
+                listed.add(line.split(None, 1)[1].strip())
+            actual = {p.name for p in wh.glob("*.whl")}
+            self.assertEqual(
+                listed, actual,
+                "{} 的 MANIFEST.txt 與實際檔案不一致".format(wh),
+            )
+
+    def test_test_stack_is_filtered_by_availability(self):
+        """測試堆疊要按 wheelhouse 實際有什麼裝什麼。
+
+        Bionic 的 py3.6 沒有任何真的 exceptiongroup（PyPI 上只有 0.0.0a0 佔位套件），
+        不該為此讓整個部署失敗 —— 測試堆疊不是船上跑服務的必要條件。
+        """
+        source = (DEPLOY_DIR / "deploy_offline.sh").read_text(encoding="utf-8")
+        self.assertIn("skipped+=", source)
+        self.assertIn("RUNTIME_PKGS", source)
 
 
 if __name__ == "__main__":

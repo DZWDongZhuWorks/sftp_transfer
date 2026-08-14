@@ -4,45 +4,50 @@
 
 ## 目標平台
 
-wheelhouse（Python 相依）與 tmux 的 `.deb` 綁定範圍**不同**，要分開看。
+**Python 相依與 tmux 都走 profile**，依 `/etc/os-release` 自動選擇，兩個平台各自獨立：
 
-Python 側：
-
-| 項目 | 值 |
-|------|----|
-| 作業系統 | Linux (NVIDIA Tegra, mic-733ao) |
-| 架構 | `aarch64` |
-| Python | CPython 3.10 (`cp310`) |
-| glibc | ≥ 2.34（目標機為 2.35） |
-
-> ⚠️ wheel 檔案與平台綁定。此包**只適用**上述平台。若要部署到不同架構
-> （x86_64）或不同 Python 版本，需在對應平台重新以 `pip download` 產生 wheelhouse。
-
-tmux 側走**雙平台 profile**，依 `/etc/os-release` 自動選擇：
-
-| Profile | Architecture | glibc baseline | tmux payload |
-|---|---:|---:|---|
-| Ubuntu 18.04 Bionic | ARM64 | 2.27 | Bionic `.deb`（tmux 2.6） |
-| Ubuntu 22.04 Jammy | ARM64 | 2.35 | Jammy `.deb`（tmux 3.2a） |
+| Profile | Arch | glibc | 船端 Python | tmux | wheelhouse 標籤 |
+|---|---|---:|---|---|---|
+| `ubuntu-18.04-arm64` | ARM64 | 2.27 | CPython 3.6 (`cp36`) | 2.6 | cp36 / manylinux2014 |
+| `ubuntu-22.04-arm64` | ARM64 | 2.35 | CPython 3.10 (`cp310`) | 3.2a | cp310 / manylinux_2_34 |
 
 其他 OS、Ubuntu 版本或架構會在**任何持久變更之前**停止，不會猜測 profile。
-tmux 相容層只負責選擇、驗證並安裝 tmux 的 dependency closure；不下載、不安裝、
-也不限制 Python runtime —— Python 一律沿用船端映像既有的預安裝版本。
+
+兩個平台的 wheelhouse 內容完全不同，這不是疏漏而是必然：
+
+| 套件 | Jammy (py3.10) | Bionic (py3.6) | 為什麼不能共用 |
+|---|---|---|---|
+| paramiko | 5.0.0 | 3.5.1 | paramiko 5 要求 `>=3.9` |
+| cryptography | 49.0.0 | 40.0.2 | 49 要求 `>=3.9` 且 `glibc>=2.34` |
+| cffi | 2.1.0 | 1.15.1 | cffi 2.x 要求 `>=3.10` |
+| pytest | 9.1.1 | 7.0.1 | pytest 8+ 要求 `>=3.8` |
+
+Bionic 也沒有任何真的 `exceptiongroup`（backport 需要 `>=3.7`，PyPI 上給 3.6 的只有一個
+`0.0.0a0` 佔位套件）。測試堆疊因此按**實際存在**的檔案挑選，缺項只 warn 不中止 ——
+它不是船上跑服務的必要條件；執行期相依則相反，缺一個就在 preflight 擋下。
+
+> ⚠️ **Bionic 的 crypto 堆疊是死路。** `cryptography 40.0.2` 是最後一個支援 3.6 的版本，
+> 匯入時自己就會警告下一版將移除 3.6。那些船拿不到 SSH/crypto 的後續安全更新 ——
+> 要脫離只能把船端 Python 升上去，而本部署包**刻意不攜帶 Python runtime**
+> （`tests/test_offline_deploy.py` 有測試釘住這個契約），所以那是另一個決定。
+
+Python runtime 本身一律沿用船端映像既有的預安裝版本：不下載、不安裝、不限制。
 
 ## 內容
 
 | 檔案 / 目錄 | 說明 |
 |-------------|------|
-| `wheelhouse/` | 17 個預先下載的 `.whl`（paramiko 執行期堆疊 + pytest 測試工具） |
-| `virtualenv_wheels/` | 建立 venv 用的 `virtualenv` 及其相依 `.whl`（供離線安裝 virtualenv） |
-| `install_virtualenv_offline.sh` | 在主環境為 `python3.10` 離線安裝 `virtualenv`（deploy 需要時自動呼叫） |
+| `platforms/<profile>/wheelhouse/` | **該平台**的 `.whl` + 同目錄的 `MANIFEST.txt`（Jammy 17 個 / Bionic 19 個） |
 | `platforms/<profile>/debs/` | 該平台的 tmux 及其依賴 `.deb`（各 4 個）+ 同目錄的 `MANIFEST.txt` |
 | `platforms/<profile>/profile.env` | 該 profile 的 OS / 架構 / glibc 下限 / 套件與版本鎖定 |
-| `lib/offline_common.sh` | profile 偵測與 manifest 校驗的共用函式（兩支安裝器共用） |
+| `virtualenv_wheels/` | 建立 venv 用的 `virtualenv` 及其相依 `.whl`；**共用**（見下方說明） |
+| `install_virtualenv_offline.sh` | 為船端 Python 離線安裝 `virtualenv`（deploy 需要時自動呼叫） |
+| `lib/offline_common.sh` | profile 偵測與 manifest 校驗的共用函式 |
+| `lib/wheel_compat.py` | preflight 守門：wheelhouse 的 wheel 標籤 vs 船端直譯器／glibc／架構 |
 | `install_tmux_offline.sh` | 依偵測到的 profile 離線安裝 tmux（deploy 需要時自動呼叫） |
 | `build/collect_tmux_debs_online.sh` | **僅建置機**：有網路時重新蒐集該平台的 `.deb` 並更新 manifest |
-| `requirements-lock.txt` | 版本鎖定清單（可重現安裝） |
-| `MANIFEST.txt` | 各 wheel 的 sha256 與建置平台資訊（安裝前完整性校驗用） |
+| `requirements-lock.txt` | Jammy 的版本鎖定清單（可重現安裝） |
+| `wheelhouse/` `MANIFEST.txt` | **legacy 過渡**：已派送到船上的舊離線包形狀，仍可用但會 warn |
 | `deploy_offline.sh` | 離線安裝腳本（全程 `--no-index`，不連外網） |
 | `health_check.py` | 安裝後能力測試 + SFTP 連線測試 + 產生健康報告 |
 | `automation_health_check.py` | systemd user service、timer、linger、sudoers、heartbeat、tmux 與 unit 同步狀態的一鍵唯讀巡檢 |
@@ -52,18 +57,31 @@ deploy/
 ├── platforms/
 │   ├── ubuntu-18.04-arm64/
 │   │   ├── profile.env
-│   │   └── debs/             Bionic tmux closure + MANIFEST.txt
+│   │   ├── debs/             Bionic tmux closure + MANIFEST.txt
+│   │   └── wheelhouse/       cp36 輪子        + MANIFEST.txt
 │   └── ubuntu-22.04-arm64/
 │       ├── profile.env
-│       └── debs/             Jammy tmux closure + MANIFEST.txt
-├── lib/offline_common.sh
+│       ├── debs/             Jammy tmux closure + MANIFEST.txt
+│       └── wheelhouse/       cp310 輪子       + MANIFEST.txt
+├── virtualenv_wheels/        共用的 bootstrap（全部 Requires-Python >=3.6）
+├── lib/{offline_common.sh,wheel_compat.py}
 ├── build/collect_tmux_debs_online.sh
 ├── install_tmux_offline.sh
 └── deploy_offline.sh
 ```
 
+`wheelhouse` 與 `debs` 刻意同構：**各 profile 一份，manifest 放在該目錄裡面**。
+校驗的基準目錄就是 wheelhouse 自己，共用一份 manifest 在換平台時必然對不上。
+
+`virtualenv_wheels/` 目前**共用**：那一組（virtualenv 20.17.1 / filelock 3.4.1 /
+importlib_metadata 4.8.3 / zipp 3.6.0 …）全部宣告 `Requires-Python >=3.6`，剛好兩個平台
+都吃得下 —— 這是刻意選的釘法，不是巧合，升版時要保持。哪天某個 profile 需要自己一份，
+放 `platforms/<profile>/virtualenv_wheels/` 就會被自動挑走（`resolve_wheelhouse`）。
+
 > `wheelhouse/` 與 `virtualenv_wheels/` 內的 `.whl` 因體積較大且與平台綁定，
-> 不納入 git 版控（見 `.gitignore`），須隨部署包一併實體派送到船機。
+> 不納入 git 版控（見 `.gitignore` 的 `*.whl`），須隨部署包一併實體派送到船機。
+> 但**各 profile 的 `wheelhouse/MANIFEST.txt` 納入版控** —— 它就是「這個平台該有哪些
+> 輪子、sha256 是什麼」的權威清單，派送漏檔時由它抓出來。
 >
 > `platforms/*/debs/` 內的 `.deb` 相反，**納入 git 版控**。兩個 profile 加起來
 > 也只有約 1 MB，而缺 tmux 是「船上無法自救」的故障（沒有網路可以 `apt install`），
@@ -233,14 +251,47 @@ python main.py --cli
 
 ## 未來如何更新 / 重建 wheelhouse
 
-須在**具網路且與目標同平台**的機器上執行：
+每個 profile **各自一份**。不需要真的有一台該平台的機器 —— `pip download` 的
+`--python-version` / `--abi` / `--platform` 可以在任何有網路的機器上解出目標平台的閉包
+（`--only-binary=:all:` 是必要的：它強迫 pip 只挑 wheel，不會退回在本機編譯 sdist 而
+產生一個只能在本機用的產物）。
+
+Jammy（cp310 / glibc ≥ 2.34）：
 
 ```bash
-pip3 download -r requirements.txt      --only-binary=:all: -d deploy/wheelhouse
-pip3 download "pytest>=7.4" "pytest-cov>=4.1" --only-binary=:all: -d deploy/wheelhouse
-# 重新產生 MANIFEST.txt：
-cd deploy/wheelhouse && sha256sum *.whl > ../MANIFEST.txt   # （檔頭註解可自行補上）
+PROF=deploy/platforms/ubuntu-22.04-arm64/wheelhouse
+pip3 download --only-binary=:all: \
+  --python-version 3.10 --implementation cp --abi cp310 --platform manylinux_2_34_aarch64 \
+  -d "$PROF" paramiko pytest pytest-cov
 ```
+
+Bionic（cp36 / glibc ≥ 2.17，Bionic 實際是 2.27）：
+
+```bash
+PROF=deploy/platforms/ubuntu-18.04-arm64/wheelhouse
+pip3 download --only-binary=:all: \
+  --python-version 3.6 --implementation cp --abi cp36m --platform manylinux2014_aarch64 \
+  -d "$PROF" paramiko pytest pytest-cov
+```
+
+兩者都要重新產生同目錄的 manifest：
+
+```bash
+cd "$PROF" && sha256sum *.whl > MANIFEST.txt   # 檔頭註解請保留/補上
+```
+
+驗收：直接問守門，不要靠肉眼看檔名。
+
+```bash
+python3 deploy/lib/wheel_compat.py --py 3.6 --glibc 2.27 --arch aarch64 \
+  deploy/platforms/ubuntu-18.04-arm64/wheelhouse \
+  paramiko bcrypt cryptography pynacl cffi pycparser
+# rc=0 相容／4 缺漏或缺必要套件／6 有輪子與目標平台不相容
+```
+
+> ⚠️ Bionic 那份**不要**用 `pip download exceptiongroup`。真正的 backport 需要 `>=3.7`，
+> pip 在 3.6 下會挑到一個 `0.0.0a0` 佔位套件，還會把 trio / outcome / sniffio 一整串
+> 拖進 wheelhouse。它本來就不該在 Bionic 的清單裡。
 
 ## 未來如何更新 / 重建 debs
 
@@ -273,8 +324,35 @@ dpkg -I deploy/platforms/ubuntu-22.04-arm64/debs/tmux_*.deb | grep Depends
 `deploy/MANIFEST.txt`：後者的校驗基準目錄是 `wheelhouse/`（見 `deploy_offline.sh`
 裡的 `cd "$WHEELHOUSE"`），混進來會壞掉。
 
+## preflight 為什麼要驗 wheel 標籤
+
+`lib/wheel_compat.py` 在**階段 A 之前**比對 wheelhouse 與船端直譯器／glibc／架構。
+這一項不是「多一層保險」，它擋的是一個具體且已在實機重現過的故障：
+
+一台 Bionic（py3.6 / glibc 2.27）對著 cp310 的 wheelhouse 跑 `--check-only`，
+舊版會回 **EXIT=0**、印出「全部通過」——`deploy_offline.sh` 一直都算得出 `cp36` 這個標籤，
+但只印出來、從不比對；wheelhouse 是空的也不會有人吭聲。於是：
+
+1. 階段 A 全部成功 —— systemd unit、sudoers、docker 群組、tmux 都已落地
+2. 腳本印出「以下不再需要任何輸入，可以離開終端機」，操作者離開
+3. 階段 B 的 `pip` 才失敗，`exit $PIP_RC`，階段 C 完全不執行
+
+最糟的是第 3 步留下的東西：**venv 建好了、套件沒裝完**。兩支 OTA 腳本
+（`run_sftp_self_update.sh` / `run_scheduler_download.sh`）都以這個 venv 的 python 執行，
+它們的守門是 `[ ! -x "$VENV_PY" ]` —— venv 在、python 可執行，守門過得去，
+然後在 `import paramiko` 炸掉。而 `update_booster.sh` 註解寫得很清楚：
+`run_scheduler_download.sh` 是 `share/scheduler` 的**唯一** OTA 路徑。
+
+結果是那條船每次開機都忠實地重試、永遠補不起來，岸上推的任何修正都到不了它，
+只能派人帶正確的 wheelhouse 上船。
+
+擋在階段 A 之前，最壞情況就只是「還沒部署」——而不是「部署到一半且失去自救能力」。
+這兩個狀態的救援成本差一個量級。
+
 ## 失敗原則
 
+- wheelhouse 的 wheel 與船端 Python／glibc／架構不符：停止（**在任何持久變更之前**）。
+- wheelhouse 缺少任一執行期相依（paramiko 堆疊）：停止。測試堆疊缺項只 warn。
 - `.deb` 缺漏、多出、hash 不符、package/version/architecture 不符：停止。
 - OS / architecture / glibc 不符任何 profile：停止，不猜測。
 - tmux 缺少且無 root/sudo：停止，不留下假的 rootless 安裝。

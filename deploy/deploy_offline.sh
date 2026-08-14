@@ -26,10 +26,14 @@
 #         7) install_services.sh    → 4 支常駐服務:heartbeat(雙向心跳/接管)、
 #                                     alarm-controller / board-server / button(綁實體 IPC-1)
 #      8) install_tmux_offline.sh → 以隨附的 debs/ 離線補齊 tmux(需密碼)。
-#         **必須排在 9) 之前**:9) 的提示要據此警告「缺 tmux 時 session 型專案全起不來」。
+#         **必須排在 10) 之前**:10) 的提示要據此警告「缺 tmux 時 session 型專案全起不來」。
 #         scheduler 的每一支 start_*.sh 都靠 tmux new-session,啟動器也靠 tmux has-session
 #         對帳 —— 少了它,啟動流程會一項一項 exit 2,而船上又沒有網路可以 apt install。
-#      9) 詢問「之後要不要立即執行完整啟動流程」——**只問，執行在階段 C**
+#      9) install_setup_ssh_key.sh → 照片同步的免密碼登入(**僅實體 IPC-2**)。
+#         這一步輸入的是**遠端主機的密碼**(給 ssh-copy-id),不是本機 sudo。
+#         nssms-download-photos.timer 每 4 小時跑 script/download_photos.sh,而它以
+#         BatchMode=yes 連線 —— 沒金鑰就是立刻失敗,不會有人在旁邊輸入密碼。
+#     10) 詢問「之後要不要立即執行完整啟動流程」——**只問，執行在階段 C**
 #      這一段結束後會印「以下不再需要任何輸入」,操作者可以離開終端機。
 #
 # 實作對應:上面這份大綱就是檔尾 main() 的內容,一行一個 stage_* 函式。改流程請同時改
@@ -67,6 +71,8 @@
 #   * venv 與系統 site-packages 隔離。
 #   * 安裝前以 MANIFEST.txt 校驗 wheel sha256（可用 --skip-verify 跳過）。
 #   * 安裝後在 venv 內驗證關鍵套件可正常匯入。
+#   * 全程輸出（stdout + stderr）逐字寫進 logs/deploy_offline_<時間>.log，與兩支巡檢器
+#     的 Markdown 報告放在同一個 logs/。報告記結果，這一份記過程；船上回報問題寄它。
 #   * tmux 同樣離線補齊：隨附 debs/ 內的 .deb 以 dpkg -i 安裝（見
 #     install_tmux_offline.sh），全程不連網。無 sudo 密碼可輸入時退回 ~/.local。
 # ---------------------------------------------------------------------------
@@ -97,6 +103,9 @@ NO_MORE_INPUT=0
 # tmux 的補齊結果。在 file scope 先給值（比照 MIGRATE_STATUS）：stage_launch_decision
 # 與 stage_summary 都會讀它，而 set -u 下讀到未定義變數會直接中止部署。
 TMUX_STATUS="未執行"
+# 照片同步金鑰的設定結果。同上：stage_summary 會讀它，而該 stage 在非 IPC-2 上會提早
+# return —— 雖然它 return 前一定已賦值，仍在 file scope 先給值，理由與 TMUX_STATUS 相同。
+SSH_KEY_STATUS="未執行"
 
 # --- 顏色輸出 --------------------------------------------------------------
 if [ -t 1 ]; then
@@ -108,6 +117,76 @@ info()  { printf "%s[INFO]%s %s\n"  "$B" "$N" "$*"; }
 ok()    { printf "%s[ OK ]%s %s\n"  "$G" "$N" "$*"; }
 warn()  { printf "%s[WARN]%s %s\n"  "$Y" "$N" "$*"; }
 err()   { printf "%s[FAIL]%s %s\n"  "$R" "$N" "$*" >&2; }
+
+# --- 完整終端記錄（logs/deploy_offline_<時間>.log）--------------------------
+# 兩支巡檢器各自會寫 Markdown 報告，但那兩份是「部署完成後的狀態」；部署當下的過程
+# ——哪個安裝器 exit 幾、操作者選了 Y 還是 n、pip 卡在哪個 wheel、sudo 有沒有輸入
+# ——原本只存在於終端機，關掉視窗就沒了。船上排錯時能寄回岸上的只有檔案，所以這一份
+# 逐字記錄跟兩份報告一樣落在 logs/。
+#
+# 做法：把 stdout 與 stderr 一起接到 tee，一份原樣進終端機（保留顏色），一份經 sed
+# 去掉 ANSI 逃脫碼、再逐行加上時間戳後進檔案（讓 log 能 grep、能貼進工單）。合流
+# stderr 是刻意的：err() 寫 stderr，分兩份存會讓「哪一步失敗」失去時間順序。
+#
+# 兩個已知的取捨：
+#   * 子程序（install_*.sh / health_check.py）的 stdout 從此是 pipe 而非 tty，它們的
+#     `[ -t 1 ]` / isatty() 會關掉自己的顏色，螢幕上因此變單色。可接受：那些判斷全都
+#     只影響顏色，真正會改變行為的分支看的是 `[ -t 0 ]`（stdin），而 stdin 不動 ——
+#     所以 ask_yn 的提問與 sudo 密碼輸入都不受影響。本腳本自己的顏色也不受影響：上面
+#     那段 `[ -t 1 ]` 在 main() 之前就算完了，那時 fd 1 還是終端機。
+#   * 原始 fd 先存進 3/4，離開前由 EXIT trap 還原並等 tee 收工。少了這一步，最後幾行
+#     會晚於 shell 提示符才印出來，也可能來不及寫進檔案。
+TRANSCRIPT=""            # 記錄檔路徑；空字串＝這次沒留成記錄（stage_summary 會讀）
+TRANSCRIPT_TEE_PID=""
+
+# 記錄檔逐行加上時鐘。只加在**檔案**這一路，終端機那一路完全不動（見下方 exec）：
+# 螢幕上是即時的，時間對站在機器前的人沒有用；真正需要它的是事後排錯 ——「停在哪一步、
+# 停了多久」。原本整份記錄一個時間戳都沒有，於是要回答這個問題只能拿 launcher.log 的
+# 起訖行、兩份 Markdown 報告的檔名時間去反推，而那幾個點之間的空白仍然是猜的。
+#
+# 為什麼是 bash 迴圈而不是 awk 或 moreutils 的 ts：機上的 awk 是 mawk（沒有 strftime），
+# ts 也不在離線包裡。printf '%(...)T' 是 bash 4.2 起的內建，零依賴、不多開行程。
+#
+# 兩個要知道的限制（都不是這一層能修的）：
+#   * 時間戳記的是「這一行**抵達**記錄器」的時刻。子程序的 stdout 在這裡是 pipe，所以
+#     Python（health_check.py 等）會塊緩衝到 8 KB 才吐一次 —— 那一整批會拿到幾乎相同的
+#     時間。要看某一行真正發生的時刻，得讓那支程式自己不緩衝。
+#   * pip 那種用 \r 原地更新的進度是同一行，要等它換行才會落檔，時間戳因此是該段的結束
+#     時刻而不是開始。終端機顯示不受影響（tee 是逐位元組轉發的）。
+#
+# read -r 保留反斜線；`|| [ -n "$line" ]` 讓最後一行沒有換行時也不會被丟掉。
+stamp_lines() {
+  local line
+  while IFS= read -r line || [ -n "$line" ]; do
+    printf '%(%F %T)T %s\n' -1 "$line"
+  done
+}
+
+start_transcript() {
+  local dir="${PROJECT_DIR}/logs"
+  local path="${dir}/deploy_offline_$(date '+%Y%m%d_%H%M%S').log"
+  # 寫不進去不是中止部署的理由（唯讀掛載、權限不對都可能）——少一份記錄而已。
+  # 兩處的 2>/dev/null 都寫在失敗的重導向**之前**：重導向錯誤是由 shell 自己印的，
+  # 寫在後面就來不及擋（`: >>path 2>/dev/null` 會漏出一行 Permission denied）。
+  if ! mkdir -p "$dir" 2>/dev/null || ! : 2>/dev/null >>"$path"; then
+    warn "無法寫入 ${dir}，本次不留完整終端記錄。"
+    return 0
+  fi
+  TRANSCRIPT="$path"
+  exec 3>&1 4>&2
+  exec > >(tee >(sed -u 's/\x1b\[[0-9;?]*[a-zA-Z]//g' | stamp_lines >>"$TRANSCRIPT")) 2>&1
+  # $! 取到的是最外層那支 tee（stamp_lines 在內層程序替換裡，不影響這個值）。tee 收工
+  # 時內層才會看到 EOF，所以等它就等於等整條鏈 —— 這也是下面只 wait 一個 PID 的理由。
+  TRANSCRIPT_TEE_PID=$!   # bash >= 5.1 會把程序替換的 PID 放進 $!；舊版取不到就少了等待
+  trap stop_transcript EXIT
+}
+
+stop_transcript() {
+  [ -n "$TRANSCRIPT_TEE_PID" ] || return 0
+  exec 1>&3 2>&4          # 先放掉寫入端，tee 才看得到 EOF
+  wait "$TRANSCRIPT_TEE_PID" 2>/dev/null || true
+  TRANSCRIPT_TEE_PID=""
+}
 
 # --help 只印檔頭那一段（第 2 行到第一個非註解行為止）。原本是 grep '^#' "$0"，
 # 會把全檔 170 多行 column-0 實作註解一起倒出來 —— 這支腳本的實作註解特別多、特別長，
@@ -141,6 +220,10 @@ ask_yn() {  # $1=提示（須含 [Y/n] 或 [y/N]） $2=預設 Y|N → rc 0=同�
     read -r -p "$1" ans || ans=""
   fi
   [ -n "$ans" ] || ans="$2"
+  # 把實際採用的答案印出來，否則終端記錄裡會是一串沒有答案的問題：提示本身走 stderr、
+  # 已隨 2>&1 進 log，但操作者敲的字只由終端機回顯，不經 fd 1/2。非互動時這一行也
+  # 順便說明採用了哪個預設。
+  printf "       （採用：%s）\n" "$ans"
   case "$ans" in Y|y) return 0 ;; *) return 1 ;; esac
 }
 
@@ -190,6 +273,9 @@ banner_and_preflight() {
   echo "==========================================================="
   echo " sftp_transfer 離線部署 (offline deploy — 專屬 venv)"
   echo "==========================================================="
+  # 開頭就報路徑（不只在總結）：--check-only 與各種 err + exit 1 都到不了 stage_summary，
+  # 而那些正是最需要「記錄在哪」的情況。這一行本身也會進記錄，等於檔案自帶檔名。
+  [ -n "$TRANSCRIPT" ] && info "完整終端記錄：$TRANSCRIPT"
 
   # --- 前置檢查 --------------------------------------------------------------
   if ! command -v "$PYTHON_BIN" >/dev/null 2>&1; then
@@ -722,31 +808,52 @@ stage_scheduler_units() {
       warn "找不到 $SUDOERS_SRC ，略過 sudo 白名單安裝。"
       warn "未安裝白名單時，reboot / teamviewer 兩支 timer 會因 sudo 需密碼而失敗。"
       SUDOERS_STATUS="略過（找不到來源檔）"
-    elif [ -f "$SUDOERS_DST" ]; then
-      ok "sudo 白名單已存在（$SUDOERS_DST），沿用現有設定。"
-      SUDOERS_STATUS="已存在"
-    elif ask_yn "  reboot / teamviewer 需 sudo 白名單，現在安裝？（需輸入一次密碼）[Y/n] " Y; then
-      # 以目前使用者名稱套用（來源檔預設 mic-733ao；換人也正確）。
+    else
+      # 先把「這台機器應該長的樣子」渲染出來,才能拿去跟已安裝的那份比對。
+      #   * 開頭的使用者欄位:來源檔預設 mic-733ao,換人也正確。
+      #   * 規則裡內嵌的絕對路徑:白名單是**逐字比對**指令路徑的,只換使用者欄位而不換
+      #     路徑的話,換名機器上的規則會指到不存在的 /home/mic-733ao/...,sudo 永遠比對
+      #     不到(失敗方向安全:清不掉、資料保留,但那一條規則等於沒裝)。
       CUR_USER="$(id -un)"
       TMP_SUDOERS="$(mktemp)"
-      sed "s/^mic-733ao /${CUR_USER} /" "$SUDOERS_SRC" > "$TMP_SUDOERS"
-      # 先驗證語法（絕不安裝壞掉的 sudoers，以免打壞整個 sudo）。
-      if sudo visudo -c -f "$TMP_SUDOERS" >/dev/null 2>&1; then
-        if sudo install -m 0440 -o root -g root "$TMP_SUDOERS" "$SUDOERS_DST"; then
-          ok "已安裝 sudo 白名單：$SUDOERS_DST"
-          SUDOERS_STATUS="已安裝"
+      sed -e "s/^mic-733ao /${CUR_USER} /" \
+          -e "s#/home/mic-733ao/#${HOME%/}/#g" "$SUDOERS_SRC" > "$TMP_SUDOERS"
+
+      # 【為什麼不是「檔案存在就沿用」】改版前這裡只看 $SUDOERS_DST 存不存在,存在就完全
+      # 不比對內容。於是白名單一旦裝過,**任何後續新增的規則都永遠傳不到已部署的船上**
+      # ——而失敗是靜默的:那條規則對應的功能只會安靜地不動作。實際踩到的是
+      # nssms-shipboard-alert-upload 的第三條規則(清 UPLOAD_DATA_DIR):沒有它,上傳與
+      # 驗證都成功、清空卻失敗,包裹目錄會無限成長,而 timer 每小時重試一次。
+      #
+      # cmp 需要讀 /etc/sudoers.d/ 底下的檔(0440 root:root,一般使用者讀不到),所以用
+      # sudo -n:此時 sudo 憑證通常已被前面幾個階段(linger / clink 遷移 / docker 群組)
+      # 快取住,比對不需要再問一次密碼。無法免密碼比對時就落到下面的安裝分支——寧可多問
+      # 一次密碼、重裝一份內容相同的檔案,也不要漏掉規則。內容相同時完全不動作。
+      if [ -f "$SUDOERS_DST" ] && sudo -n cmp -s "$TMP_SUDOERS" "$SUDOERS_DST" 2>/dev/null; then
+        ok "sudo 白名單已是最新（$SUDOERS_DST），無需變更。"
+        SUDOERS_STATUS="已是最新"
+        rm -f "$TMP_SUDOERS"
+      elif ask_yn "  timer 需 sudo 白名單（reboot / teamviewer / 清理 upload_data），現在安裝或更新？（需輸入一次密碼）[Y/n] " Y; then
+        mutating "安裝/更新 sudo 白名單"
+        # 先驗證語法（絕不安裝壞掉的 sudoers，以免打壞整個 sudo）。
+        if sudo visudo -c -f "$TMP_SUDOERS" >/dev/null 2>&1; then
+          if sudo install -m 0440 -o root -g root "$TMP_SUDOERS" "$SUDOERS_DST"; then
+            ok "已安裝/更新 sudo 白名單：$SUDOERS_DST"
+            SUDOERS_STATUS="已安裝"
+          else
+            warn "sudo 白名單安裝失敗（install 失敗）。"
+            SUDOERS_STATUS="安裝失敗"
+          fi
         else
-          warn "sudo 白名單安裝失敗（install 失敗）。"
-          SUDOERS_STATUS="安裝失敗"
+          warn "sudo 白名單語法驗證未通過，未安裝（避免打壞 sudo）。"
+          SUDOERS_STATUS="驗證失敗（未安裝）"
         fi
+        rm -f "$TMP_SUDOERS"
       else
-        warn "sudo 白名單語法驗證未通過，未安裝（避免打壞 sudo）。"
-        SUDOERS_STATUS="驗證失敗（未安裝）"
+        info "略過 sudo 白名單安裝。日後可依 $SUDOERS_SRC 檔頭說明手動安裝。"
+        SUDOERS_STATUS="使用者略過"
+        rm -f "$TMP_SUDOERS"
       fi
-      rm -f "$TMP_SUDOERS"
-    else
-      info "略過 sudo 白名單安裝。日後可依 $SUDOERS_SRC 檔頭說明手動安裝。"
-      SUDOERS_STATUS="使用者略過"
     fi
 
     # (3) 常駐服務（user 層,免 root）：
@@ -852,6 +959,98 @@ stage_tmux() {
        TMUX_STATUS="無法安裝（離線包缺 debs/）" ;;
     *) warn "tmux 安裝失敗（exit=$TMUX_RC），session 型專案將無法啟動。"
        TMUX_STATUS="安裝失敗（exit=$TMUX_RC）" ;;
+  esac
+}
+
+# --- 照片同步的 SSH 金鑰（scheduler/install_setup_ssh_key.sh）---------------
+# nssms-download-photos.timer（每 4 小時，僅實體 IPC-2）會跑 script/download_photos.sh，
+# 而那支腳本以 `ssh -o BatchMode=yes` 連遠端 nsms master —— **沒有金鑰就是立刻失敗**，
+# 不會有人在旁邊輸入密碼。所以金鑰必須在這裡（唯一的人工互動視窗）一併設好。
+#
+# 這一步要輸入的是**遠端主機的密碼**（給 ssh-copy-id），不是本機 sudo —— 與 gpio /
+# docker 群組 / sudoers 那幾步性質不同，但同樣「只有現在有人在鍵盤前」。
+#
+# **只在實體 IPC-2 上做。** 閘門刻意重用 timer 用的同一支 services/require_base_ipc.sh，
+# 而不是在這裡自己判一次身分：兩份判定必然有一天不一致，而不一致不會有任何執行期錯誤 ——
+# 只會讓某台機器安靜地少設一把金鑰。用 base ipc（而非 DEPLOY_ROLE）也和 timer 一致：
+# 接管只寫 failover 旗標、不改 `ipc`，所以 ipc2emer 期間照樣要有金鑰。
+#
+# 冪等：install_setup_ssh_key.sh 會先以 BatchMode 探測，已就緒就直接回 0、不問密碼，
+# 所以重跑部署不會再卡在提示上。
+stage_ssh_key() {
+  SSH_KEY_INSTALLER="${SHARE_DIR}/scheduler/install_setup_ssh_key.sh"
+  BASE_IPC_GATE="${SHARE_DIR}/scheduler/services/require_base_ipc.sh"
+  SSH_KEY_STATUS="未執行"
+  echo ""
+  info "檢查照片同步的 SSH 金鑰（nssms-download-photos 的前提）..."
+
+  if [ ! -f "$SSH_KEY_INSTALLER" ]; then
+    warn "找不到 $SSH_KEY_INSTALLER ，略過金鑰設定。"
+    warn "若本機是 IPC-2，照片同步排程會每 4 小時失敗一次（ssh 無金鑰可用）。"
+    SSH_KEY_STATUS="略過（找不到安裝腳本）"
+    return
+  fi
+
+  # 角色閘門。找不到閘門腳本時**不擅自代它決定**：照樣往下走，讓安裝器自己判斷
+  # （最壞情況是在 IPC-1 上多問一題，比在 IPC-2 上安靜跳過安全得多）。
+  if [ -f "$BASE_IPC_GATE" ]; then
+    if ! bash "$BASE_IPC_GATE" ipc2 >/dev/null 2>&1; then
+      info "本機實體身分不是 IPC-2 —— 照片同步排程不會在此執行，略過金鑰設定。"
+      SSH_KEY_STATUS="不適用（非實體 IPC-2）"
+      return
+    fi
+  else
+    warn "找不到 $BASE_IPC_GATE ，無法判定實體身分，照樣檢查金鑰。"
+  fi
+
+  # 先唯讀探一次：已就緒（rc=0）就什麼都不必問，這是重跑部署時的絕大多數情況。
+  run_rc bash "$SSH_KEY_INSTALLER" --check-only
+  SSH_KEY_RC="$RC"
+  if [ "$SSH_KEY_RC" -eq 0 ]; then
+    ok "照片同步的免密碼登入已可用。"
+    SSH_KEY_STATUS="已就緒"
+    return
+  fi
+
+  if [ "$SSH_KEY_RC" -eq 4 ]; then
+    # 缺 ssh-copy-id 等指令，問也沒用 —— 沒有工具可以用。
+    warn "本機缺少 ssh / ssh-keygen / ssh-copy-id，無法設定金鑰登入。"
+    SSH_KEY_STATUS="無法設定（缺 openssh-client）"
+    return
+  fi
+
+  if [ "$CHECK_ONLY" -eq 1 ]; then
+    SSH_KEY_STATUS="尚未設定$DRYRUN_NOTE"
+    return
+  fi
+
+  if [ ! -t 0 ]; then
+    # 非互動：ssh-copy-id 需要遠端密碼，沒有 tty 就無從輸入。比照 gpio / docker 群組
+    # 那兩步的處理 —— 放棄並印出手動指令，而不是跑一個必定失敗的 ssh-copy-id。
+    warn "非互動終端機，略過金鑰設定（ssh-copy-id 需輸入遠端主機密碼）。"
+    warn "如需設定，請手動執行：bash $SSH_KEY_INSTALLER"
+    SSH_KEY_STATUS="略過（非互動終端機）"
+    return
+  fi
+
+  if ! ask_yn "  設定照片同步的 SSH 金鑰登入？（需輸入一次**遠端主機**的密碼）[Y/n] " Y; then
+    info "略過金鑰設定。日後可執行：bash $SSH_KEY_INSTALLER"
+    warn "在設定之前，nssms-download-photos.timer 每 4 小時會失敗一次（ssh 無金鑰）。"
+    SSH_KEY_STATUS="使用者略過（照片同步會失敗）"
+    return
+  fi
+
+  mutating "產生 SSH 金鑰並複製公鑰到遠端主機"
+  run_rc bash "$SSH_KEY_INSTALLER"
+  SSH_KEY_RC="$RC"
+  case "$SSH_KEY_RC" in
+    0) ok "照片同步的免密碼登入已設定完成。"
+       SSH_KEY_STATUS="已設定" ;;
+    4) warn "本機缺少 ssh / ssh-keygen / ssh-copy-id，未設定。"
+       SSH_KEY_STATUS="無法設定（缺 openssh-client）" ;;
+    *) warn "金鑰設定失敗（exit=$SSH_KEY_RC），照片同步排程會每 4 小時失敗一次。"
+       warn "常見原因：遠端主機沒開機、IP 不符、密碼輸入錯誤。日後可重跑：bash $SSH_KEY_INSTALLER"
+       SSH_KEY_STATUS="失敗（exit=$SSH_KEY_RC）" ;;
   esac
 }
 
@@ -1158,6 +1357,7 @@ stage_summary() {
   printf "  docker 群組      ：%s\n" "$DOCKER_GROUP_STATUS"
   printf "  sudo 白名單      ：%s\n" "$SUDOERS_STATUS"
   printf "  tmux            ：%s\n" "$TMUX_STATUS"
+  printf "  照片同步金鑰    ：%s\n" "$SSH_KEY_STATUS"
   [ "$RUN_HEALTH" -eq 1 ] && printf "  健康檢查        ：%s\n" \
     "$( [ "$HEALTH_RC" -eq 0 ] && echo HEALTHY || echo "有問題（exit=$HEALTH_RC）" )"
   printf "  完整啟動流程    ：%s\n" "$LAUNCH_STATUS"
@@ -1226,6 +1426,13 @@ stage_summary() {
   echo ""
   echo "如需單獨再跑一次自動化存活巡檢："
   echo "  \"$PYTHON_BIN\" \"$AUTOMATION_CHECKER\""
+  # 印在總結最後：船上要回報問題時，這是唯一需要寄回岸上的檔案（兩份 Markdown 報告
+  # 只有結果，這一份有過程）。
+  if [ -n "$TRANSCRIPT" ]; then
+    echo ""
+    echo "本次部署的完整終端記錄（含以上全部輸出）："
+    echo "  $TRANSCRIPT"
+  fi
   echo "==========================================================="
 }
 
@@ -1238,6 +1445,7 @@ stage_summary() {
 # 看的是文字位置，所以搬動段落時文字順序必須跟著執行順序。
 main() {
   parse_args "$@"
+  start_transcript                   # 刻意在 parse_args 之後：--help 與參數錯誤不留檔
   banner_and_preflight
 
   # ---- 階段 A：一次性人工設定（所有需要輸入的東西都在這一段）----
@@ -1249,8 +1457,9 @@ main() {
   stage_clink_migration              # A3 舊 clink_* —— **必須早於 A7，否則撞 port**
   stage_docker_group                 # A4 docker 群組（web 平台開機自啟的前提）
   stage_scheduler_units              # A5/A6/A7 timer + sudoers + 常駐服務
-  stage_tmux                         # A8 tmux 離線補齊 —— **必須早於 A9**（見該函式）
-  stage_launch_decision              # A9 只收集決定，執行在階段 C
+  stage_tmux                         # A8 tmux 離線補齊 —— **必須早於 A10**（見該函式）
+  stage_ssh_key                      # A9 照片同步的 SSH 金鑰（僅實體 IPC-2）
+  stage_launch_decision              # A10 只收集決定，執行在階段 C
 
   echo ""
   info "以下不再需要任何輸入,可以離開終端機。"

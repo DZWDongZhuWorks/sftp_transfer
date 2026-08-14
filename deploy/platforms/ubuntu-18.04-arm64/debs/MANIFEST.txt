@@ -1,0 +1,5 @@
+# ubuntu-18.04-arm64 tmux 離線套件；由 collect_tmux_debs_online.sh 產生。
+d2799b857886a43097e98d9eaa4d8fb508d4fff69fd5b30d8274eaf57020ea19  libevent-2.1-6_2.1.8-stable-4build1_arm64.deb
+ac81524c08d86778daf5dd9f1dc9d4734369670dbff6e730c9c15977688fc24c  libtinfo5_6.1-1ubuntu1.18.04.1_arm64.deb
+38f58681c684db51fdc0495fa01fc4ad0a494387b764204d44675cdea6a0beba  libutempter0_1.1.6-3_arm64.deb
+d8505a62391f1a138e89a4e1f8b9ef1872f91112fee02762d9a94f8fc84464c2  tmux_2.6-3ubuntu0.3_arm64.deb

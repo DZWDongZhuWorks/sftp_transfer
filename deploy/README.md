@@ -113,6 +113,21 @@ python3 deploy/automation_health_check.py
 #    報告會寫到 logs/automation_health_report_<時間>.md
 ```
 
+### 部署會留下哪些檔案
+
+`logs/` 下每次部署會多三份，三份的用途不同：
+
+| 檔案 | 內容 |
+| --- | --- |
+| `deploy_offline_<時間>.log` | 部署**過程**逐字記錄（stdout + stderr 合流，已去掉顏色碼） |
+| `health_report_<時間>.md` | 能力健康檢查的**結果**（`health_check.py`） |
+| `automation_health_report_<時間>.md` | 自動化存活巡檢的**結果**（`automation_health_check.py`） |
+
+兩份 Markdown 是部署完成後的狀態快照；要查「哪一步失敗、操作者選了什麼、pip 卡在哪個
+wheel」只能看 `.log` 那一份，船上回報問題時寄它。路徑會印在部署總結的最後一行。
+指定 `--no-health-check` 時只會少兩份 Markdown，逐字記錄照留；`--help` 與參數錯誤不留檔。
+三種檔案都帶時間戳、不覆蓋、也不自動清理。
+
 ### 自動化存活巡檢
 
 `automation_health_check.py` 是唯讀工具，不會啟停服務或修改設定。它會檢查：

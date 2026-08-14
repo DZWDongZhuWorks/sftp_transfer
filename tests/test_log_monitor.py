@@ -152,6 +152,16 @@ def test_parse_non_log_csv_returns_none(tmp_path):
         ("CLINK_IPC-1_ecdis", ("CLINK", "IPC-1", "ecdis")),
         ("WH289_IPC-1_RADAR_DOWNLOADER", ("WH289", "IPC-1", "RADAR_DOWNLOADER")),
         ("RADAR_UPLOADER", (None, None, "RADAR_UPLOADER")),
+        # 英文船名含底線：船名整段要進 vsl，不能在第一個 _ 就切斷。
+        (
+            "WH_PORT_KELANG_EXPRESS_IPC-1_ecdis",
+            ("WH_PORT_KELANG_EXPRESS", "IPC-1", "ecdis"),
+        ),
+        # comp 自身含 IPC-N 時，邊界仍取第一個 _IPC-N_（非貪婪）。
+        (
+            "WH_PORT_KELANG_EXPRESS_IPC-1_sync_IPC-2_mirror",
+            ("WH_PORT_KELANG_EXPRESS", "IPC-1", "sync_IPC-2_mirror"),
+        ),
     ],
 )
 def test_parse_device_name(name, expected):

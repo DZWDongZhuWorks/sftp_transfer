@@ -77,6 +77,10 @@ CORE_SERVICES = ("nssms-boot.service", "nssms-heartbeat.service")
 # 規則檔整份 enabled=false，所以正常一輪是「只預覽、零刪除」—— 對本巡檢而言仍是
 # active/waiting + Result=success，不需要特例。
 #
+# nssms-shipboard-alert-upload 同樣兩台都跑、刻意沒有角色閘門：UPLOAD_DATA_DIR 只在
+# 目前實際跑 web_server 的那台有內容，另一台 docker inspect 問不到容器就直接 exit 0。
+# 所以 standby 上「Result=success 但什麼都沒做」是正常現象，不是漏跑，不需要特例。
+#
 # 【勿在下面的 tuple 內寫含括號的註解】device_monitor/tests/test_integration.sh 的涵蓋度斷言
 # 用 `^TIMERS = \((.*?)\)` 抓這個 tuple,非貪婪會停在**第一個**右括號:註解裡的括號會把清單
 # 截斷,於是後面的 timer 全被誤判為「沒被涵蓋」。要加說明就寫在這一段。
@@ -86,6 +90,7 @@ TIMERS = (
     "nssms-device-monitor-report",
     "nssms-download-photos",
     "nssms-reboot",
+    "nssms-shipboard-alert-upload",
     "nssms-teamviewer",
     "nssms-warm-env",
     "nssms-wave-send",

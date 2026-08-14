@@ -808,31 +808,52 @@ stage_scheduler_units() {
       warn "找不到 $SUDOERS_SRC ，略過 sudo 白名單安裝。"
       warn "未安裝白名單時，reboot / teamviewer 兩支 timer 會因 sudo 需密碼而失敗。"
       SUDOERS_STATUS="略過（找不到來源檔）"
-    elif [ -f "$SUDOERS_DST" ]; then
-      ok "sudo 白名單已存在（$SUDOERS_DST），沿用現有設定。"
-      SUDOERS_STATUS="已存在"
-    elif ask_yn "  reboot / teamviewer 需 sudo 白名單，現在安裝？（需輸入一次密碼）[Y/n] " Y; then
-      # 以目前使用者名稱套用（來源檔預設 mic-733ao；換人也正確）。
+    else
+      # 先把「這台機器應該長的樣子」渲染出來,才能拿去跟已安裝的那份比對。
+      #   * 開頭的使用者欄位:來源檔預設 mic-733ao,換人也正確。
+      #   * 規則裡內嵌的絕對路徑:白名單是**逐字比對**指令路徑的,只換使用者欄位而不換
+      #     路徑的話,換名機器上的規則會指到不存在的 /home/mic-733ao/...,sudo 永遠比對
+      #     不到(失敗方向安全:清不掉、資料保留,但那一條規則等於沒裝)。
       CUR_USER="$(id -un)"
       TMP_SUDOERS="$(mktemp)"
-      sed "s/^mic-733ao /${CUR_USER} /" "$SUDOERS_SRC" > "$TMP_SUDOERS"
-      # 先驗證語法（絕不安裝壞掉的 sudoers，以免打壞整個 sudo）。
-      if sudo visudo -c -f "$TMP_SUDOERS" >/dev/null 2>&1; then
-        if sudo install -m 0440 -o root -g root "$TMP_SUDOERS" "$SUDOERS_DST"; then
-          ok "已安裝 sudo 白名單：$SUDOERS_DST"
-          SUDOERS_STATUS="已安裝"
+      sed -e "s/^mic-733ao /${CUR_USER} /" \
+          -e "s#/home/mic-733ao/#${HOME%/}/#g" "$SUDOERS_SRC" > "$TMP_SUDOERS"
+
+      # 【為什麼不是「檔案存在就沿用」】改版前這裡只看 $SUDOERS_DST 存不存在,存在就完全
+      # 不比對內容。於是白名單一旦裝過,**任何後續新增的規則都永遠傳不到已部署的船上**
+      # ——而失敗是靜默的:那條規則對應的功能只會安靜地不動作。實際踩到的是
+      # nssms-shipboard-alert-upload 的第三條規則(清 UPLOAD_DATA_DIR):沒有它,上傳與
+      # 驗證都成功、清空卻失敗,包裹目錄會無限成長,而 timer 每小時重試一次。
+      #
+      # cmp 需要讀 /etc/sudoers.d/ 底下的檔(0440 root:root,一般使用者讀不到),所以用
+      # sudo -n:此時 sudo 憑證通常已被前面幾個階段(linger / clink 遷移 / docker 群組)
+      # 快取住,比對不需要再問一次密碼。無法免密碼比對時就落到下面的安裝分支——寧可多問
+      # 一次密碼、重裝一份內容相同的檔案,也不要漏掉規則。內容相同時完全不動作。
+      if [ -f "$SUDOERS_DST" ] && sudo -n cmp -s "$TMP_SUDOERS" "$SUDOERS_DST" 2>/dev/null; then
+        ok "sudo 白名單已是最新（$SUDOERS_DST），無需變更。"
+        SUDOERS_STATUS="已是最新"
+        rm -f "$TMP_SUDOERS"
+      elif ask_yn "  timer 需 sudo 白名單（reboot / teamviewer / 清理 upload_data），現在安裝或更新？（需輸入一次密碼）[Y/n] " Y; then
+        mutating "安裝/更新 sudo 白名單"
+        # 先驗證語法（絕不安裝壞掉的 sudoers，以免打壞整個 sudo）。
+        if sudo visudo -c -f "$TMP_SUDOERS" >/dev/null 2>&1; then
+          if sudo install -m 0440 -o root -g root "$TMP_SUDOERS" "$SUDOERS_DST"; then
+            ok "已安裝/更新 sudo 白名單：$SUDOERS_DST"
+            SUDOERS_STATUS="已安裝"
+          else
+            warn "sudo 白名單安裝失敗（install 失敗）。"
+            SUDOERS_STATUS="安裝失敗"
+          fi
         else
-          warn "sudo 白名單安裝失敗（install 失敗）。"
-          SUDOERS_STATUS="安裝失敗"
+          warn "sudo 白名單語法驗證未通過，未安裝（避免打壞 sudo）。"
+          SUDOERS_STATUS="驗證失敗（未安裝）"
         fi
+        rm -f "$TMP_SUDOERS"
       else
-        warn "sudo 白名單語法驗證未通過，未安裝（避免打壞 sudo）。"
-        SUDOERS_STATUS="驗證失敗（未安裝）"
+        info "略過 sudo 白名單安裝。日後可依 $SUDOERS_SRC 檔頭說明手動安裝。"
+        SUDOERS_STATUS="使用者略過"
+        rm -f "$TMP_SUDOERS"
       fi
-      rm -f "$TMP_SUDOERS"
-    else
-      info "略過 sudo 白名單安裝。日後可依 $SUDOERS_SRC 檔頭說明手動安裝。"
-      SUDOERS_STATUS="使用者略過"
     fi
 
     # (3) 常駐服務（user 層,免 root）：

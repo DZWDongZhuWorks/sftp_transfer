@@ -2,11 +2,9 @@
 #
 # deploy_offline.sh — 船機的唯一一次人工安裝入口
 # ---------------------------------------------------------------------------
-# ⚠ 這支腳本的職責早已超出檔名。它最初只做一件事:用 deploy/wheelhouse/ 內預先下載的
-#   wheel 為 sftp_transfer 建立專屬 venv(所以叫 offline —— 指的是**不從 PyPI 下載**,
-#   不是「機器沒有網路」;船上是連得到 SFTP 的 61.56.200.137 的,OTA 整套機制就靠它)。
-#   後來陸續被加上 timer、sudoers 白名單、心跳服務、存活巡檢(見 6fcbcad / 6192841 /
-#   708c781),於是實際上變成「船機唯一的一次性人工安裝流程」。檔頭照實寫,避免誤導。
+# 這支腳本是船機唯一的一次性人工安裝入口。雙平台相容層只負責以
+# deploy/platforms/<profile>/debs 離線補齊 tmux；Python 沿用船端既有預安裝，
+# 不攜帶、安裝或限制 Python runtime 版本。階段 C 的 SFTP OTA 只走內部網路。
 #
 # 三個階段:
 #
@@ -25,7 +23,7 @@
 #         6) sudoers 白名單         → reboot / teamviewer 需要(這一步要輸入一次密碼)
 #         7) install_services.sh    → 4 支常駐服務:heartbeat(雙向心跳/接管)、
 #                                     alarm-controller / board-server / button(綁實體 IPC-1)
-#      8) install_tmux_offline.sh → 以隨附的 debs/ 離線補齊 tmux(需密碼)。
+#      8) install_tmux_offline.sh → 以平台 profile 的 debs/ 離線補齊 tmux(需密碼)。
 #         **必須排在 10) 之前**:10) 的提示要據此警告「缺 tmux 時 session 型專案全起不來」。
 #         scheduler 的每一支 start_*.sh 都靠 tmux new-session,啟動器也靠 tmux has-session
 #         對帳 —— 少了它,啟動流程會一項一項 exit 2,而船上又沒有網路可以 apt install。
@@ -50,7 +48,7 @@
 #       那份巡檢才第一次真的有意義)
 #      可用 --no-launch 關閉;選 n 也不會壞,下次開機 nssms-boot 會跑同一支啟動器。
 #
-# 目標平台：Linux aarch64 / CPython 3.10 / glibc >= 2.34  (NVIDIA Tegra, mic-733ao)
+# tmux 離線安裝目標：Ubuntu 18.04 / 22.04 ARM64。Python 沿用主機預安裝。
 #
 # 用法：
 #   ./deploy_offline.sh                 # 建立/更新專屬 venv，安裝執行期相依 + 測試堆疊（預設）
@@ -59,26 +57,24 @@
 #   ./deploy_offline.sh --recreate      # 砍掉重建 venv（乾淨安裝）
 #   ./deploy_offline.sh --no-health-check # 部署後不自動執行能力／自動化健康檢查
 #   ./deploy_offline.sh --no-launch      # 部署後不執行啟動流程（不下載程式碼、不啟動服務）
-#   ./deploy_offline.sh --check-only    # 只驗證 wheel 完整性與環境，不安裝
+#   ./deploy_offline.sh --check-only    # 驗證平台與 tmux payload，不安裝、不修改 HOME/systemd/dpkg
 #   ./deploy_offline.sh --venv /path/to/venv        # 自訂 venv 路徑
-#   ./deploy_offline.sh --python /usr/bin/python3.10 # 指定建立 venv 用的直譯器
+#   ./deploy_offline.sh --python /path/python # 指定船端既有的 Python
 #
 # 特性：
 #   * venv 安裝全程 --no-index，永不連 PyPI（階段 C 的 SFTP 下載另當別論）。
-#   * 以 python3.10 -m virtualenv 建立 venv（與 radar / SHM 一致），不再依賴系統的
-#     python3-venv / ensurepip；若 python3.10 尚無 virtualenv，會用隨附的
-#     install_virtualenv_offline.sh + virtualenv_wheels/ 先離線補齊。
+#   * 優先使用船端 python3.10，沒有時沿用 python3；不安裝 Python runtime。
 #   * venv 與系統 site-packages 隔離。
-#   * 安裝前以 MANIFEST.txt 校驗 wheel sha256（可用 --skip-verify 跳過）。
+#   * 在任何系統變更前驗證平台、tmux deb 與其 sha256 manifest。
 #   * 安裝後在 venv 內驗證關鍵套件可正常匯入。
 #   * 全程輸出（stdout + stderr）逐字寫進 logs/deploy_offline_<時間>.log，與兩支巡檢器
 #     的 Markdown 報告放在同一個 logs/。報告記結果，這一份記過程；船上回報問題寄它。
-#   * tmux 同樣離線補齊：隨附 debs/ 內的 .deb 以 dpkg -i 安裝（見
-#     install_tmux_offline.sh），全程不連網。無 sudo 密碼可輸入時退回 ~/.local。
+#   * tmux 依平台選用 Bionic/Jammy deb；缺 sudo 時安全停止，不使用 rootless 解包。
 # ---------------------------------------------------------------------------
 set -euo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+PLATFORMS_ROOT="${SCRIPT_DIR}/platforms"
 WHEELHOUSE="${SCRIPT_DIR}/wheelhouse"
 MANIFEST="${SCRIPT_DIR}/MANIFEST.txt"
 PROJECT_DIR="$(cd "${SCRIPT_DIR}/.." && pwd)"
@@ -88,7 +84,7 @@ VESSEL_INFO="${SHARE_DIR}/.env/vessel_basic_info.json"
 
 DEFAULT_VENV="${HOME}/venv/wanhai_nssms/share/sftp_transfer"
 VENV_DIR="${DEFAULT_VENV}"
-PYTHON_BIN=""          # 空字串＝自動偵測（優先 python3.10，與下游 install_env.sh 一致）
+PYTHON_BIN=""          # 空字串＝自動偵測（優先 python3.10，其次 python3）
 # 預設安裝測試堆疊（pytest 等），讓部署後的 health_check 預設就會實際跑單元測試。
 # 以 --skip-tests 關閉：不裝測試套件，且轉傳 --skip-tests 讓 health_check 略過。
 INSTALL_TESTS=1
@@ -258,8 +254,6 @@ parse_args() {
     shift
   done
 
-  # 未指定 --python 時自動選直譯器：優先 python3.10（下游 install_env.sh 與 wheelhouse
-  # 的 cp310 wheel 皆以此為準），退而求其次才用 python3。
   if [ -z "$PYTHON_BIN" ]; then
     if command -v python3.10 >/dev/null 2>&1; then
       PYTHON_BIN="python3.10"
@@ -267,9 +261,24 @@ parse_args() {
       PYTHON_BIN="python3"
     fi
   fi
+
+  case "$VENV_DIR" in
+    /*) ;;
+    *) err "--venv 必須使用絕對路徑：$VENV_DIR"; exit 2 ;;
+  esac
+  VENV_DIR="$(readlink -m -- "$VENV_DIR")"
+  case "$VENV_DIR" in
+    /|/bin|/boot|/dev|/etc|/home|/lib|/lib64|/opt|/proc|/root|/run|/sbin|/srv|/sys|/tmp|/usr|/var|\
+    "$HOME"|"$PROJECT_DIR"|"$SHARE_DIR")
+      err "拒絕把重要目錄當成 venv：$VENV_DIR"
+      exit 2
+      ;;
+  esac
 }
 
 banner_and_preflight() {
+  local preflight_failures=0
+  local preflight_rc=4
   echo "==========================================================="
   echo " sftp_transfer 離線部署 (offline deploy — 專屬 venv)"
   echo "==========================================================="
@@ -277,18 +286,49 @@ banner_and_preflight() {
   # 而那些正是最需要「記錄在哪」的情況。這一行本身也會進記錄，等於檔案自帶檔名。
   [ -n "$TRANSCRIPT" ] && info "完整終端記錄：$TRANSCRIPT"
 
-  # --- 前置檢查 --------------------------------------------------------------
+  # --- 嚴格前置檢查：本函式完成前不得有任何持久變更 -------------------------
+  # shellcheck source=deploy/lib/offline_common.sh
+  . "${SCRIPT_DIR}/lib/offline_common.sh"
+  nssms_detect_profile "$PLATFORMS_ROOT" || exit $?
+  PROFILE_DIR="$NSSMS_PROFILE_DIR"
+  export NSSMS_PROFILE_ID NSSMS_PROFILE_DIR
+  info "平台 profile  : $NSSMS_PROFILE_ID"
+  info "系統版本      : $NSSMS_OS_ID $NSSMS_OS_VERSION / $NSSMS_ARCH"
+  info "glibc          : $NSSMS_GLIBC"
   if ! command -v "$PYTHON_BIN" >/dev/null 2>&1; then
-    err "找不到 Python 直譯器：$PYTHON_BIN"; exit 1
+    err "找不到船端預安裝的 Python：$PYTHON_BIN"
+    preflight_failures=$((preflight_failures + 1))
+  else
+    PY_VER="$("$PYTHON_BIN" -c 'import sys;print(".".join(map(str,sys.version_info[:3])))')"
+    PY_TAG="$("$PYTHON_BIN" -c 'import sys;print("cp%d%d"%sys.version_info[:2])')"
+    info "基底直譯器    : $PYTHON_BIN ($PY_VER, $PY_TAG；船端預安裝)"
   fi
-  PY_VER="$("$PYTHON_BIN" -c 'import sys;print(".".join(map(str,sys.version_info[:3])))')"
-  PY_TAG="$("$PYTHON_BIN" -c 'import sys;print("cp%d%d"%sys.version_info[:2])')"
-  info "基底直譯器    : $PYTHON_BIN ($PY_VER, $PY_TAG)"
-  info "系統架構      : $(uname -m) ($(uname -s) $(uname -r))"
   info "Wheelhouse    : $WHEELHOUSE"
   info "專案目錄      : $PROJECT_DIR"
   info "專屬 venv     : $VENV_DIR"
   info "船舶資訊檔    : $VESSEL_INFO"
+
+  run_rc bash "$SCRIPT_DIR/install_tmux_offline.sh" --check-only --profile-dir "$PROFILE_DIR"
+  case "$RC" in
+    0|5) ok "tmux profile 與本機 ABI 驗證通過。" ;;
+    *)
+      err "tmux preflight 失敗（exit=$RC）；尚未執行 dpkg。"
+      preflight_failures=$((preflight_failures + 1))
+      [ "$RC" -ne 6 ] || preflight_rc=6
+      ;;
+  esac
+
+  if [ "$preflight_failures" -ne 0 ]; then
+    err "離線部署 preflight 共發現 $preflight_failures 個問題；未執行任何持久變更。"
+    exit "$preflight_rc"
+  fi
+  ok "雙平台 tmux 離線資產 preflight 通過。"
+
+  if [ "$CHECK_ONLY" -eq 1 ]; then
+    ok "--check-only 完成：未執行安裝或其他持久變更。"
+    exit 0
+  fi
+
 }
 
 # --- 船舶基本資訊檔（vessel_basic_info.json）檢查 / 互動建立 ----------------
@@ -891,15 +931,15 @@ stage_scheduler_units() {
 # 「有項目失敗」,要交叉三份 log 才會發現原因是缺一個指令。船上又沒有對外網路,
 # `apt install tmux` 不成立,所以這件事在船上原本**無法自救**。
 #
-# 語意與上面兩段的群組設定同一類:一次性、需要密碼、由專用安裝器負責、失敗只警告。
-# 差別是它有免 root 的後備路徑(解到 ~/.local),所以非互動終端機下也還能補齊。
+# 語意與上面兩段的群組設定同一類:一次性、需要密碼、由專用安裝器負責。tmux 是啟動
+# 前提，所以缺 sudo 或 dpkg 失敗時整份部署必須停止，不再留下「部署成功但全無 session」。
 #
 # **必須排在 stage_launch_decision 之前**:那一題的提示要據 TMUX_STATUS 警告操作者
 # 「現在按 Y 立刻啟動,session 型專案會全部起不來」。
 #
 # 冪等:tmux 已可用時安裝器自己會判斷並安靜跳過（rc=0），這裡不問任何問題。
-# 離開碼見 install_tmux_offline.sh 檔頭:0 就緒 / 3 免 root 裝好 / 4 離線包不完整 /
-# 5 (--check-only) 待安裝 / 1 失敗。
+# 離開碼見 install_tmux_offline.sh 檔頭:0 就緒 / 4 離線包不完整 /
+# 5 (--check-only) 待安裝 / 6 平台不相容 / 1 失敗。
 stage_tmux() {
   TMUX_INSTALLER="${SCRIPT_DIR}/install_tmux_offline.sh"
   TMUX_STATUS="未執行"
@@ -911,55 +951,35 @@ stage_tmux() {
     TMUX_STATUS="略過（找不到安裝腳本）"
     return
   fi
-  # 先唯讀探一次:已就緒(rc=0)就什麼都不必問,這是絕大多數情況。
-  run_rc bash "$TMUX_INSTALLER" --check-only
+  # preflight 已做過全套 asset/ABI probe；這裡再判斷現有 tmux 能否保留。
+  run_rc bash "$TMUX_INSTALLER" --check-only --profile-dir "$PROFILE_DIR"
   TMUX_RC="$RC"
   if [ "$TMUX_RC" -eq 0 ]; then
     ok "tmux 已可用（$(tmux -V 2>/dev/null || echo '版本未知')）。"
     TMUX_STATUS="已就緒"
     return
   fi
-  # 以下都是「tmux 不能用」。--check-only 只回報,不安裝。
+  # main 的 --check-only 已在全域 preflight 結束；以下只可能是正式部署。
   warn "本機的 tmux 不可用 —— 所有 session 型專案（shm / radar / wave / ecdis / flag）都起不來。"
-  if [ "$CHECK_ONLY" -eq 1 ]; then
-    case "$TMUX_RC" in
-      5) TMUX_STATUS="待安裝（離線包齊備）$DRYRUN_NOTE" ;;
-      4) TMUX_STATUS="無法安裝（離線包缺 debs/）$DRYRUN_NOTE" ;;
-      *) TMUX_STATUS="狀態不明（rc=$TMUX_RC）$DRYRUN_NOTE" ;;
-    esac
-    return
-  fi
-  if [ "$TMUX_RC" -eq 4 ]; then
-    # 離線包不完整,問也沒用 —— 沒有東西可以裝。
-    warn "離線包內沒有可用的 debs/，無法離線補齊 tmux。"
-    warn "請從有網路的**同平台**機器蒐集 deb，見 $SCRIPT_DIR/README.md。"
-    TMUX_STATUS="無法安裝（離線包缺 debs/）"
-    return
+  if [ "$TMUX_RC" -ne 5 ]; then
+    err "tmux 狀態或離線資產異常（exit=$TMUX_RC），停止部署。"
+    exit "$TMUX_RC"
   fi
   if [ ! -t 0 ]; then
-    # 非互動:安裝器自己會退回免 root 路徑,不需要密碼。這與 gpio / docker 群組那兩步
-    # 不同（那兩步非互動時只能放棄），所以這裡照跑而不是略過。
-    warn "非互動終端機：以免 root 方式（~/.local）補齊 tmux。"
+    info "非互動終端機：只有 sudo 已預先授權時才能安裝 tmux。"
   elif ! ask_yn "  現在以隨附的 deb 離線安裝 tmux？（需輸入一次密碼）[Y/n] " Y; then
-    info "略過 tmux 安裝。日後可執行：bash $TMUX_INSTALLER"
-    warn "**在補齊之前，啟動流程的 session 型專案會全部失敗。**"
-    TMUX_STATUS="使用者略過（session 型專案會失敗）"
-    return
+    err "tmux 是完整部署的必要條件；使用者取消安裝，停止部署。"
+    exit 1
   fi
   mutating "以 dpkg 離線安裝 tmux"
-  run_rc bash "$TMUX_INSTALLER"
+  run_rc bash "$TMUX_INSTALLER" --profile-dir "$PROFILE_DIR"
   TMUX_RC="$RC"
-  case "$TMUX_RC" in
-    0) ok "tmux 已安裝並可用（dpkg）。"
-       TMUX_STATUS="已安裝（dpkg）" ;;
-    3) ok "tmux 已以免 root 方式安裝到 ~/.local/bin。"
-       info "systemd user manager 的預設 PATH 已含 ~/.local/bin，nssms-boot 找得到它。"
-       TMUX_STATUS="已安裝（~/.local，未登錄 dpkg）" ;;
-    4) warn "離線包不完整，未安裝 tmux。"
-       TMUX_STATUS="無法安裝（離線包缺 debs/）" ;;
-    *) warn "tmux 安裝失敗（exit=$TMUX_RC），session 型專案將無法啟動。"
-       TMUX_STATUS="安裝失敗（exit=$TMUX_RC）" ;;
-  esac
+  if [ "$TMUX_RC" -ne 0 ]; then
+    err "tmux 安裝失敗（exit=$TMUX_RC），停止部署。"
+    exit "$TMUX_RC"
+  fi
+  ok "tmux 已安裝並通過 session 能力測試（dpkg）。"
+  TMUX_STATUS="已安裝（dpkg / $NSSMS_PROFILE_ID）"
 }
 
 # --- 照片同步的 SSH 金鑰（scheduler/install_setup_ssh_key.sh）---------------

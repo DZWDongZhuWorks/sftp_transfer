@@ -4,6 +4,10 @@
 
 ## 目標平台
 
+wheelhouse（Python 相依）與 tmux 的 `.deb` 綁定範圍**不同**，要分開看。
+
+Python 側：
+
 | 項目 | 值 |
 |------|----|
 | 作業系統 | Linux (NVIDIA Tegra, mic-733ao) |
@@ -13,9 +17,17 @@
 
 > ⚠️ wheel 檔案與平台綁定。此包**只適用**上述平台。若要部署到不同架構
 > （x86_64）或不同 Python 版本，需在對應平台重新以 `pip download` 產生 wheelhouse。
->
-> ⚠️ `debs/` 內的 `.deb`（tmux 及其依賴）同樣平台綁定，目標是 Ubuntu 22.04
-> (jammy) / arm64。換架構或換發行版需重新蒐集，見下方「未來如何更新 / 重建 debs」。
+
+tmux 側走**雙平台 profile**，依 `/etc/os-release` 自動選擇：
+
+| Profile | Architecture | glibc baseline | tmux payload |
+|---|---:|---:|---|
+| Ubuntu 18.04 Bionic | ARM64 | 2.27 | Bionic `.deb`（tmux 2.6） |
+| Ubuntu 22.04 Jammy | ARM64 | 2.35 | Jammy `.deb`（tmux 3.2a） |
+
+其他 OS、Ubuntu 版本或架構會在**任何持久變更之前**停止，不會猜測 profile。
+tmux 相容層只負責選擇、驗證並安裝 tmux 的 dependency closure；不下載、不安裝、
+也不限制 Python runtime —— Python 一律沿用船端映像既有的預安裝版本。
 
 ## 內容
 
@@ -24,20 +36,39 @@
 | `wheelhouse/` | 17 個預先下載的 `.whl`（paramiko 執行期堆疊 + pytest 測試工具） |
 | `virtualenv_wheels/` | 建立 venv 用的 `virtualenv` 及其相依 `.whl`（供離線安裝 virtualenv） |
 | `install_virtualenv_offline.sh` | 在主環境為 `python3.10` 離線安裝 `virtualenv`（deploy 需要時自動呼叫） |
-| `debs/` | tmux 及其依賴的 `.deb`（4 個，約 620 KB）+ `MANIFEST.txt` |
-| `install_tmux_offline.sh` | 以 `debs/` 離線安裝 tmux（deploy 需要時自動呼叫） |
+| `platforms/<profile>/debs/` | 該平台的 tmux 及其依賴 `.deb`（各 4 個）+ 同目錄的 `MANIFEST.txt` |
+| `platforms/<profile>/profile.env` | 該 profile 的 OS / 架構 / glibc 下限 / 套件與版本鎖定 |
+| `lib/offline_common.sh` | profile 偵測與 manifest 校驗的共用函式（兩支安裝器共用） |
+| `install_tmux_offline.sh` | 依偵測到的 profile 離線安裝 tmux（deploy 需要時自動呼叫） |
+| `build/collect_tmux_debs_online.sh` | **僅建置機**：有網路時重新蒐集該平台的 `.deb` 並更新 manifest |
 | `requirements-lock.txt` | 版本鎖定清單（可重現安裝） |
 | `MANIFEST.txt` | 各 wheel 的 sha256 與建置平台資訊（安裝前完整性校驗用） |
 | `deploy_offline.sh` | 離線安裝腳本（全程 `--no-index`，不連外網） |
 | `health_check.py` | 安裝後能力測試 + SFTP 連線測試 + 產生健康報告 |
 | `automation_health_check.py` | systemd user service、timer、linger、sudoers、heartbeat、tmux 與 unit 同步狀態的一鍵唯讀巡檢 |
 
+```text
+deploy/
+├── platforms/
+│   ├── ubuntu-18.04-arm64/
+│   │   ├── profile.env
+│   │   └── debs/             Bionic tmux closure + MANIFEST.txt
+│   └── ubuntu-22.04-arm64/
+│       ├── profile.env
+│       └── debs/             Jammy tmux closure + MANIFEST.txt
+├── lib/offline_common.sh
+├── build/collect_tmux_debs_online.sh
+├── install_tmux_offline.sh
+└── deploy_offline.sh
+```
+
 > `wheelhouse/` 與 `virtualenv_wheels/` 內的 `.whl` 因體積較大且與平台綁定，
 > 不納入 git 版控（見 `.gitignore`），須隨部署包一併實體派送到船機。
 >
-> `debs/` 內的 `.deb` 相反，**納入 git 版控**。它們一共只有約 620 KB，而缺 tmux
-> 是「船上無法自救」的故障（沒有網路可以 `apt install`），所以讓它跟著 repo 與 OTA
-> 一起走，比省下這點體積重要 —— 派送時漏掉的機率降到零。
+> `platforms/*/debs/` 內的 `.deb` 相反，**納入 git 版控**。兩個 profile 加起來
+> 也只有約 1 MB，而缺 tmux 是「船上無法自救」的故障（沒有網路可以 `apt install`），
+> 所以讓它跟著 repo 與 OTA 一起走，比省下這點體積重要 —— 派送時漏掉的機率降到零。
+> **兩個 profile 的 `debs/` 都要隨 release 派送**，因為船機映像不保證是哪一版。
 
 ## tmux：另一個離線前置
 
@@ -49,7 +80,8 @@
 指令。而船上沒有對外網路，`apt install tmux` 不成立。
 
 所以 tmux 用與 wheelhouse 完全同構的方式處理：預先蒐集的 `.deb` 隨包派送，
-`dpkg -i` 安裝，全程不連網。
+`dpkg -i` 安裝，全程不連網。正式安裝路徑不呼叫 `apt update`、`apt install`、
+`curl` 或 `wget`。
 
 ```bash
 # 只回報現況，不做任何變更
@@ -57,21 +89,28 @@
 
 # 需要時安裝（deploy_offline.sh 的階段 A 會自動呼叫，不必手動跑）
 ./deploy/install_tmux_offline.sh
+
+# 強制指定 profile（跳過 /etc/os-release 偵測，測試用）
+./deploy/install_tmux_offline.sh --profile-dir deploy/platforms/ubuntu-18.04-arm64
 ```
 
-兩條安裝路徑：
+安裝器先依 `/etc/os-release` 選出 profile，然後在動任何東西之前驗證：
 
-- **主路徑** `sudo dpkg -i` —— 正式登錄進 dpkg 資料庫，之後 apt 也認得。
-- **後備路徑** `dpkg-deb -x` 解到 `~/.local` —— 免 root，用於沒有密碼可輸入的場合
-  （非互動終端機）。systemd user manager 的預設 PATH 已含 `~/.local/bin`
-  （systemd ≥ 248），所以 `nssms-boot` 找得到它，不需要改任何 unit 檔。
+- manifest 條目與實際 `.deb` inventory 完全一致；
+- 每個 `.deb` 的 SHA256；
+- package set、architecture 與 profile 鎖定的 tmux 版本；
+- `.deb` 宣告的 glibc 下限；
+- 所有 `.deb` 解到 `/tmp` 之後，該 tmux 二進位真的能建立、查詢與刪除測試 session。
 
-離開碼：`0` 已就緒／`1` 安裝失敗／`2` 參數錯誤／`3` 已以免 root 方式裝好／
-`4` 離線包不完整（未做任何變更）／`5` （`--check-only`）待安裝。
+payload / ABI 驗證全過之後才輪到既有 tmux：功能正常就沿用，**不強制升級**；
+缺少或已壞掉才以 `dpkg -i` 安裝鎖定的 closure。
 
-安裝器只裝**真正缺的**套件：`libtinfo6` 這類核心程式庫在機上幾乎一定已是同版本，
-對運行中的機器做無謂 reinstall 只是白白製造風險。例外是 tmux 本身 —— 若它在 dpkg
-資料庫裡卻跑不起來，就會被強制重裝。
+離開碼：`0` 已就緒／`1` 安裝失敗／`2` 參數錯誤／`4` 離線包不完整（未做任何變更）／
+`5`（`--check-only`）待安裝／`6` 平台或 ABI 不相容。
+
+> ⚠️ **沒有 root/sudo 時是停止，不是降級。** 舊版曾以 `dpkg-deb -x` 解到 `~/.local`
+> 當後備路徑，現已移除：那條路徑會留下一個沒登錄進 dpkg 資料庫的假安裝，
+> 之後的巡檢與 apt 都看不到它。缺權限請補 sudo 後重跑，不要繞過。
 
 ## 安裝目標：專屬 venv
 
@@ -97,11 +136,14 @@ sftp_transfer 使用**專屬虛擬環境**（與 radar / SHM 等其他專案慣�
 #    砍掉重建 venv（乾淨安裝）
 ./deploy/deploy_offline.sh --recreate --with-tests
 
-#    只校驗 wheel 與環境、不安裝
+#    只校驗平台、tmux payload 與 wheel，不安裝、不修改 HOME/systemd/dpkg
 ./deploy/deploy_offline.sh --check-only
 
 #    自訂 venv 路徑
 ./deploy/deploy_offline.sh --venv /path/to/venv
+
+#    指定船端既有的 Python（只是選直譯器，不會安裝 Python runtime）
+./deploy/deploy_offline.sh --python /absolute/path/to/python
 
 # 2) 安裝後健康檢查（能力測試 + SFTP 連線 + 健康報告）
 #    務必用 venv 內的 python 執行：
@@ -112,6 +154,8 @@ sftp_transfer 使用**專屬虛擬環境**（與 radar / SHM 等其他專案慣�
 python3 deploy/automation_health_check.py
 #    報告會寫到 logs/automation_health_report_<時間>.md
 ```
+
+`deploy_offline.sh` 會優先使用船端的 `python3.10`，沒有時使用 `python3`。
 
 ### 部署會留下哪些檔案
 
@@ -200,23 +244,38 @@ cd deploy/wheelhouse && sha256sum *.whl > ../MANIFEST.txt   # （檔頭註解可
 
 ## 未來如何更新 / 重建 debs
 
-同樣須在**具網路且與目標同平台**（Ubuntu 22.04 / arm64）的機器上執行：
+分別在 **Bionic ARM64** 與 **Jammy ARM64** 的建置環境（有對外網路）各跑一次：
 
 ```bash
-cd deploy/debs && apt-get download tmux libevent-core-2.1-7 libtinfo6 libutempter0
-sha256sum *.deb >> MANIFEST.txt   # 檔頭註解保留，只換掉 hash 那幾行
+./deploy/build/collect_tmux_debs_online.sh --allow-network-build
 ```
+
+腳本會自動偵測所在 profile、以當前 Ubuntu repository 下載鎖定套件、驗證名稱／
+版本／架構，然後更新對應的 `platforms/<profile>/debs/` 與其 manifest。
+**這支腳本只供建置機使用，不應在船機執行**（它是這整包唯一會連網的路徑，
+`--allow-network-build` 就是要你按下去之前先確認自己在哪台機器上）。
+
+兩個 profile 的產物合併進同一份 release bundle。每種目標映像至少跑一次
+`--check-only`；正式 release 還應在「預先移除 tmux」的測試機上驗證
+`sudo dpkg -i` 分支真的走得通。
 
 清單就是 tmux 的 `Depends` 減去 `libc6`：
 
 ```bash
-dpkg -I deploy/debs/tmux_*.deb | grep Depends
+dpkg -I deploy/platforms/ubuntu-22.04-arm64/debs/tmux_*.deb | grep Depends
 ```
 
-`libc6` 刻意**不打包**：tmux 只要求 `libc6 >= 2.34`，那是基底系統的東西，而在免 root
-路徑上用 `LD_LIBRARY_PATH` 蓋掉 libc 是會把機器弄壞的操作。若換到 libc 更舊的映像，
-正確做法是換映像或改用靜態編譯的 tmux，不是把 libc 塞進這個目錄。
+`libc6` 刻意**不打包**：tmux 只要求特定 glibc 下限，那是基底系統的東西，而用
+`LD_LIBRARY_PATH` 蓋掉 libc 是會把機器弄壞的操作。若換到 libc 更舊的映像，
+正確做法是新增一個 profile 或改用靜態編譯的 tmux，不是把 libc 塞進這個目錄。
 
-`MANIFEST.txt` 刻意放在 `debs/` **裡面**，而不是併進 `deploy/MANIFEST.txt`：後者的
-校驗基準目錄是 `wheelhouse/`（見 `deploy_offline.sh` 裡的 `cd "$WHEELHOUSE"`），
-混進來會壞掉。
+`MANIFEST.txt` 刻意放在各 profile 的 `debs/` **裡面**，而不是併進
+`deploy/MANIFEST.txt`：後者的校驗基準目錄是 `wheelhouse/`（見 `deploy_offline.sh`
+裡的 `cd "$WHEELHOUSE"`），混進來會壞掉。
+
+## 失敗原則
+
+- `.deb` 缺漏、多出、hash 不符、package/version/architecture 不符：停止。
+- OS / architecture / glibc 不符任何 profile：停止，不猜測。
+- tmux 缺少且無 root/sudo：停止，不留下假的 rootless 安裝。
+- `--check-only` 不寫 HOME、不安裝套件、不修改 systemd 或 dpkg。

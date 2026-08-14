@@ -483,7 +483,7 @@ class ShipInterpreterCompatTests(unittest.TestCase):
         (".removesuffix(", "str.removesuffix 是 3.9", "3.9"),
     )
 
-    PEP585 = ("list[", "dict[", "tuple[", "set[", "frozenset[", "type[")
+    PEP585_BUILTINS = {"list", "dict", "tuple", "set", "frozenset", "type"}
 
     def _code_lines(self, path):
         """去掉整行註解 —— 檔頭常把這些寫法列成「不要用」的清單。"""
@@ -491,6 +491,35 @@ class ShipInterpreterCompatTests(unittest.TestCase):
         return "\n".join(
             line for line in raw.splitlines() if not line.lstrip().startswith("#")
         )
+
+    def _annotations(self, path):
+        """走訪所有註解節點。
+
+        用 AST 而不是字串比對，有兩個具體理由（開發這一批時兩者都踩到了）：
+
+        1. `Tuple[str | None, str]` 這種**嵌在下標裡**的 PEP 604 union，用 regex 比對
+           「註解開頭」抓不到，`compile()` 也會過（語法合法），只有在 3.6 上求值時才
+           `TypeError: unsupported operand type(s) for |`。
+        2. 反過來，用 `"list["` 當子字串會誤判 —— `mylist[0]` 也含這串。
+        """
+        import ast
+
+        tree = ast.parse((PROJECT_DIR / path).read_text(encoding="utf-8"))
+        for node in ast.walk(tree):
+            if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)):
+                args = node.args
+                every = list(args.args) + list(args.kwonlyargs)
+                every += list(getattr(args, "posonlyargs", []))
+                for arg in every:
+                    if arg.annotation is not None:
+                        yield ast, arg.annotation, "參數 {}".format(arg.arg)
+                for extra in (args.vararg, args.kwarg):
+                    if extra is not None and extra.annotation is not None:
+                        yield ast, extra.annotation, extra.arg
+                if node.returns is not None:
+                    yield ast, node.returns, "回傳值"
+            elif isinstance(node, ast.AnnAssign) and node.annotation is not None:
+                yield ast, node.annotation, "變數註解"
 
     def test_no_post36_constructs(self):
         for path in self.MUST_RUN_ON_36:
@@ -500,27 +529,31 @@ class ShipInterpreterCompatTests(unittest.TestCase):
                     token, code,
                     "{}：{}（需要 {}，Bionic 船端只有 3.6）".format(path, why, ver),
                 )
-            for token in self.PEP585:
-                self.assertNotIn(
-                    token, code,
-                    "{}：PEP 585 內建泛型在 3.6 會在求值時 TypeError（改用 "
-                    "typing.List 等）".format(path),
-                )
+
+    def test_no_pep585_builtin_generics_in_annotations(self):
+        for path in self.MUST_RUN_ON_36:
+            for ast, ann, where in self._annotations(path):
+                for sub in ast.walk(ann):
+                    if not isinstance(sub, ast.Subscript):
+                        continue
+                    base = sub.value
+                    if isinstance(base, ast.Name) and base.id in self.PEP585_BUILTINS:
+                        self.fail(
+                            "{}:{} [{}] 用了 PEP 585 的 {}[...]；3.6 求值會 "
+                            "TypeError，改用 typing.{}".format(
+                                path, sub.lineno, where, base.id,
+                                base.id.capitalize()),
+                        )
 
     def test_no_pep604_unions_in_annotations(self):
-        import re
-
-        # 只看註解位置的 `X | Y`（`:` 或 `->` 之後），避免誤判位元運算。
-        pattern = re.compile(
-            r"(?::\s*|->\s*)[A-Za-z_][\w.\[\]\"']*\s*\|\s*[A-Za-z_\"']"
-        )
         for path in self.MUST_RUN_ON_36:
-            for lineno, line in enumerate(self._code_lines(path).splitlines(), 1):
-                self.assertIsNone(
-                    pattern.search(line),
-                    "{}:{} 用了 PEP 604 union（3.10+）：{}".format(
-                        path, lineno, line.strip()),
-                )
+            for ast, ann, where in self._annotations(path):
+                for sub in ast.walk(ann):
+                    if isinstance(sub, ast.BinOp) and isinstance(sub.op, ast.BitOr):
+                        self.fail(
+                            "{}:{} [{}] 用了 PEP 604 union（3.10+）；改用 "
+                            "typing.Optional / Union".format(path, sub.lineno, where),
+                        )
 
     def test_files_actually_parse(self):
         """順手確認掃描對象真的還在、而且語法沒壞。"""

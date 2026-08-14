@@ -8,6 +8,7 @@
 - `main.py`：進入點。不帶參數 → 開啟 GUI；帶參數 → CLI 模式。以 `--mode {download,upload}` 決定方向。
 - `downloader.py`：傳輸核心邏輯。`SFTPBase` 收攏連線/斷線重連/網路偵測/忽略規則/版本紀錄等方向無關邏輯；`SFTPDownloader` 為下載實作。
 - `uploader.py`：上傳核心邏輯（`SFTPUploader`，繼承 `SFTPBase`），與下載對稱：遞迴走訪本地目錄、斷點續傳、忽略規則與版本紀錄。
+- `pack_upload.py`：讀取既有 upload 設定，但不連線 SFTP；把同一批待上傳內容封裝成可攜式本地 `.tar`。
 - `gitignore.py`：「忽略設定檔」的 gitignore 規則比對（純 Python 標準庫實作，不需安裝額外套件）。
 - `gui.py`：圖形化介面（右上角可切換「下載／上傳」模式）。
 - `settings.py`：設定檔（`settings.json`）讀取/開啟工具，CLI 與 GUI 共用。
@@ -160,7 +161,7 @@ cp example_settings.json settings.json
 
 除了預設的下載，本工具也支援把本地端檔案/資料夾上傳到 SFTP 遠端。上傳與下載共用**同一套**連線、斷線重連、網路偵測、忽略規則、斷點續傳與版本紀錄機制；差別只在方向相反：
 
-- **`local_path` 為上傳來源**（單一檔案或整個資料夾），**`remote_path` 為遠端目的地**（單一路徑；上傳不支援多來源合併，若填路徑陣列只取第一個並記錄警告）。
+- **`local_path` 為上傳來源**（單一檔案、資料夾或路徑陣列），**`remote_path` 為遠端目的地**。兩邊都是等長陣列時逐一配對；單一目的地帶尾斜線時依各來源 basename 展開；單一目的地不帶尾斜線時合併多個來源，碰到同名相對路徑以後面的來源為準。
 - `recursive`、`ignore_file`、`resume`、`duplicate_mode`、`duplicate_suffix`、`retry_*`、`auto_reconnect`、`wait_for_network` 等設定的意義與下載完全相同。
 - **遠端同名檔案處理**沿用 `duplicate_mode`：`overwrite`（**預設**，直接覆蓋遠端舊檔）或 `duplicate`（在遠端以 `_copy` 後綴另存新檔、保留舊檔）。
 - **跳過未變更**：以本地檔案的 size/mtime 搭配版本紀錄判斷，遠端已存在且未變更的檔案會略過不重傳。
@@ -178,6 +179,20 @@ python main.py --cli --mode upload --host 192.168.6.79 --username myuser \
 # 或把 "mode": "upload" 寫進設定檔，之後只需帶 --config
 python main.py --cli --config config/sftp_upload_settings.json
 ```
+
+### 將待上傳內容封裝成本地 tar
+
+使用同一份 upload 設定，把原本會送到 SFTP 的檔案與空資料夾改寫入本地 tar：
+
+```bash
+python pack_upload.py \
+    --config config/radar_upload_settings.json \
+    --output radar.tar
+```
+
+這個流程完全不建立網路連線，也不需要設定檔中的 SFTP 帳密。它直接沿用 uploader 的 `local_path` / `remote_path` 映射、`recursive`、`ignore_file`、`.part` 與 manifest 排除規則；tar 的頂層資料夾會對應 SFTP 目的資料夾，例如上述輸出內容為 `radar/...`。設定檔及其中的帳密不會被放進 tar。
+
+若省略 `--output`，檔名會由設定檔推導（`radar_upload_settings.json` → `radar.tar`）並寫到目前目錄。既有輸出預設不會被覆蓋；確認要取代時才加 `--force`。
 
 設定檔：複製 `example_upload_settings.json` 作為範本（其中 `mode` 已設為 `upload`），依實際值填入後另存到 `config/` 內、檔名以 `_upload_settings.json` 結尾。
 

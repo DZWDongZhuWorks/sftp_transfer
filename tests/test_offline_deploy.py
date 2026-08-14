@@ -447,6 +447,122 @@ class WheelCompatTests(unittest.TestCase):
             self.assertNotIn(token, code, "PEP 585 泛型在 3.6 求值會 TypeError")
 
 
+class ShipInterpreterCompatTests(unittest.TestCase):
+    """跑在船端直譯器上的程式必須維持 Python 3.6 相容。
+
+    Bionic 的船端只有 python3.6.9（沒有任何 3.7+），而下面這些檔案**不是**用專案 venv
+    跑就是用系統 python3 跑，兩者在 Bionic 上都是 3.6：
+
+      * deploy/automation_health_check.py — 系統 python3（README 明示「使用系統 python3
+        即可」），所以連 backport 都補不了，只能用標準庫。
+      * deploy/health_check.py — venv 的 python，而 Bionic 的 venv 是 3.6。
+      * deploy/lib/wheel_compat.py — preflight 守門，用船端直譯器執行。
+
+    這一項用靜態掃描而不是真的跑 3.6：CI 與開發機是 3.10，跑不出 3.6 的行為。掃描抓不到
+    全部（例如某些只在特定分支才執行的新 API），但 `from __future__ import annotations`、
+    `dataclasses`、PEP 585/604 這幾類是實際踩過的，值得釘死。
+    """
+
+    MUST_RUN_ON_36 = (
+        "deploy/automation_health_check.py",
+        "deploy/health_check.py",
+        "deploy/lib/wheel_compat.py",
+    )
+
+    # (樣式, 說明, 需要的版本)
+    FORBIDDEN = (
+        ("from __future__ import annotations", "3.6 沒有這個 future，SyntaxError", "3.7"),
+        ("from dataclasses import", "dataclasses 是 3.7 才進標準庫", "3.7"),
+        ("import dataclasses", "dataclasses 是 3.7 才進標準庫", "3.7"),
+        ("capture_output=", "subprocess 的 capture_output= 是 3.7", "3.7"),
+        ("text=True", "subprocess 的 text= 是 3.7（用 universal_newlines=）", "3.7"),
+        (".fromisoformat(", "datetime.fromisoformat 是 3.7", "3.7"),
+        ("shlex.join(", "shlex.join 是 3.8", "3.8"),
+        ("cached_property", "functools.cached_property 是 3.8", "3.8"),
+        (".removeprefix(", "str.removeprefix 是 3.9", "3.9"),
+        (".removesuffix(", "str.removesuffix 是 3.9", "3.9"),
+    )
+
+    PEP585_BUILTINS = {"list", "dict", "tuple", "set", "frozenset", "type"}
+
+    def _code_lines(self, path):
+        """去掉整行註解 —— 檔頭常把這些寫法列成「不要用」的清單。"""
+        raw = (PROJECT_DIR / path).read_text(encoding="utf-8")
+        return "\n".join(
+            line for line in raw.splitlines() if not line.lstrip().startswith("#")
+        )
+
+    def _annotations(self, path):
+        """走訪所有註解節點。
+
+        用 AST 而不是字串比對，有兩個具體理由（開發這一批時兩者都踩到了）：
+
+        1. `Tuple[str | None, str]` 這種**嵌在下標裡**的 PEP 604 union，用 regex 比對
+           「註解開頭」抓不到，`compile()` 也會過（語法合法），只有在 3.6 上求值時才
+           `TypeError: unsupported operand type(s) for |`。
+        2. 反過來，用 `"list["` 當子字串會誤判 —— `mylist[0]` 也含這串。
+        """
+        import ast
+
+        tree = ast.parse((PROJECT_DIR / path).read_text(encoding="utf-8"))
+        for node in ast.walk(tree):
+            if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)):
+                args = node.args
+                every = list(args.args) + list(args.kwonlyargs)
+                every += list(getattr(args, "posonlyargs", []))
+                for arg in every:
+                    if arg.annotation is not None:
+                        yield ast, arg.annotation, "參數 {}".format(arg.arg)
+                for extra in (args.vararg, args.kwarg):
+                    if extra is not None and extra.annotation is not None:
+                        yield ast, extra.annotation, extra.arg
+                if node.returns is not None:
+                    yield ast, node.returns, "回傳值"
+            elif isinstance(node, ast.AnnAssign) and node.annotation is not None:
+                yield ast, node.annotation, "變數註解"
+
+    def test_no_post36_constructs(self):
+        for path in self.MUST_RUN_ON_36:
+            code = self._code_lines(path)
+            for token, why, ver in self.FORBIDDEN:
+                self.assertNotIn(
+                    token, code,
+                    "{}：{}（需要 {}，Bionic 船端只有 3.6）".format(path, why, ver),
+                )
+
+    def test_no_pep585_builtin_generics_in_annotations(self):
+        for path in self.MUST_RUN_ON_36:
+            for ast, ann, where in self._annotations(path):
+                for sub in ast.walk(ann):
+                    if not isinstance(sub, ast.Subscript):
+                        continue
+                    base = sub.value
+                    if isinstance(base, ast.Name) and base.id in self.PEP585_BUILTINS:
+                        self.fail(
+                            "{}:{} [{}] 用了 PEP 585 的 {}[...]；3.6 求值會 "
+                            "TypeError，改用 typing.{}".format(
+                                path, sub.lineno, where, base.id,
+                                base.id.capitalize()),
+                        )
+
+    def test_no_pep604_unions_in_annotations(self):
+        for path in self.MUST_RUN_ON_36:
+            for ast, ann, where in self._annotations(path):
+                for sub in ast.walk(ann):
+                    if isinstance(sub, ast.BinOp) and isinstance(sub.op, ast.BitOr):
+                        self.fail(
+                            "{}:{} [{}] 用了 PEP 604 union（3.10+）；改用 "
+                            "typing.Optional / Union".format(path, sub.lineno, where),
+                        )
+
+    def test_files_actually_parse(self):
+        """順手確認掃描對象真的還在、而且語法沒壞。"""
+        for path in self.MUST_RUN_ON_36:
+            full = PROJECT_DIR / path
+            self.assertTrue(full.is_file(), "{} 不見了".format(path))
+            compile(full.read_text(encoding="utf-8"), str(full), "exec")
+
+
 class WheelhouseLayoutTests(unittest.TestCase):
     """per-profile wheelhouse 的佈局契約。"""
 

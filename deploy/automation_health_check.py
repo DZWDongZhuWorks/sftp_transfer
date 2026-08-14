@@ -13,8 +13,6 @@ systemd、sudoers、tmux 或 failover 狀態。
   1  至少一項 FAIL
   2  指定 --fail-on-warn 且至少一項 WARN（但沒有 FAIL）
 """
-from __future__ import annotations
-
 import argparse
 import getpass
 import grp
@@ -27,9 +25,9 @@ import socket
 import stat
 import subprocess
 import sys
-from dataclasses import dataclass
 from datetime import datetime
 from pathlib import Path
+from typing import Dict, List, NamedTuple, Optional, Set, Tuple
 
 
 SCRIPT_DIR = Path(__file__).resolve().parent
@@ -122,15 +120,17 @@ _RESET = "\033[0m"
 _COMPACT = False
 
 
-@dataclass
-class Check:
+# NamedTuple 而不是 dataclass：dataclasses 是 3.7 才進標準庫，而本程式跑在
+# **系統 python3**（不是 venv），Bionic 的船端就是 3.6 —— 靠 wheelhouse 補 backport
+# 在這裡行不通。Check 全程只被建構與讀取，不改欄位，NamedTuple 語意上剛好等價。
+class Check(NamedTuple):
     section: str
     name: str
     status: str
     detail: str
 
 
-RESULTS: list[Check] = []
+RESULTS = []  # type: List[Check]
 
 
 def color(status: str) -> str:
@@ -150,7 +150,7 @@ def heading(title: str) -> None:
         print(f"\n=== {title} ===")
 
 
-def _takeover_age_hours(since) -> float | None:
+def _takeover_age_hours(since):
     """接管已持續幾小時。since 不是合法時間就回傳 None。
 
     負值（since 位於未來）同樣視為不合法——heartbeat.sanitize_since() 會把它
@@ -163,7 +163,7 @@ def _takeover_age_hours(since) -> float | None:
     return age if age >= 0 else None
 
 
-def _monotonic_age_seconds(value: str) -> float | None:
+def _monotonic_age_seconds(value):
     """systemd 的 *TimestampMonotonic（開機以來的微秒）→ 距今幾秒。
 
     刻意用 monotonic 而不是人類可讀的 *Timestamp：後者長成
@@ -187,12 +187,14 @@ def _monotonic_age_seconds(value: str) -> float | None:
     return age if age >= 0 else None
 
 
-def run(cmd: list[str], timeout: float = 15) -> subprocess.CompletedProcess[str]:
+def run(cmd, timeout=15):
     try:
         return subprocess.run(
             cmd,
-            text=True,
-            capture_output=True,
+            # text= / capture_output= 都是 3.7 才有；Bionic 的船端是 3.6。
+            universal_newlines=True,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
             timeout=timeout,
             check=False,
         )
@@ -200,12 +202,12 @@ def run(cmd: list[str], timeout: float = 15) -> subprocess.CompletedProcess[str]
         return subprocess.CompletedProcess(cmd, 127, "", str(exc))
 
 
-def systemctl_show(unit: str, *properties: str) -> dict[str, str]:
+def systemctl_show(unit, *properties):
     cmd = ["systemctl", "--user", "show", unit, "--no-pager"]
     for prop in properties:
         cmd.extend(["-p", prop])
     proc = run(cmd)
-    values: dict[str, str] = {"_returncode": str(proc.returncode)}
+    values = {"_returncode": str(proc.returncode)}  # type: Dict[str, str]
     for line in proc.stdout.splitlines():
         if "=" in line:
             key, value = line.split("=", 1)
@@ -239,7 +241,7 @@ def _failover_on(value) -> bool:
     return False
 
 
-def check_identity() -> tuple[str, str]:
+def check_identity():
     heading("身分與路徑")
     role = "unknown"
     vessel = "unknown"
@@ -338,10 +340,10 @@ def evaluate_service(
     unit: str,
     *,
     expected_active: str,
-    expected_substates: set[str],
+    expected_substates,  # type: Set[str]
     optional: bool = False,
     strict_optional: bool = False,
-) -> dict[str, str]:
+) -> Dict[str, str]:
     props = systemctl_show(
         unit,
         "LoadState",
@@ -473,7 +475,7 @@ def check_core_services() -> None:
     )
 
 
-def unit_source_path(unit: str) -> Path | None:
+def unit_source_path(unit):
     """unit 檔名 → repo 母體路徑。
 
     刻意不再對 nssms-heartbeat.service 做特例:改成依序在 services/ 與 timers/ 找。
@@ -518,8 +520,8 @@ def check_unit_sources() -> None:
         )
 
 
-def parse_execstart_targets(service_file: Path) -> list[Path]:
-    targets: list[Path] = []
+def parse_execstart_targets(service_file):
+    targets = []  # type: List[Path]
     for raw in service_file.read_text(encoding="utf-8").splitlines():
         line = raw.strip()
         if not line.startswith("ExecStart="):
@@ -737,7 +739,7 @@ def heartbeat_probe(role: str) -> None:
         )
 
 
-def load_expected_tmux() -> dict[str, set[str]]:
+def load_expected_tmux():
     """從 scheduler/reboot_script/roles.conf 推導「角色 → 預期的 tmux session」。
 
     取 kind=session 且相位含 run 的專案。@inherit <role> from <parent> 會展開。
@@ -752,8 +754,8 @@ def load_expected_tmux() -> dict[str, set[str]]:
                f"{ROLES_CONF}: {exc}；改用內建保底清單比對")
         return dict(FALLBACK_EXPECTED_TMUX)
 
-    expected: dict[str, set[str]] = {}
-    inherits: list[tuple[str, str]] = []
+    expected = {}  # type: Dict[str, Set[str]]
+    inherits = []  # type: List[Tuple[str, str]]
     for line in text.splitlines():
         line = line.strip()
         if not line or line.startswith("#"):

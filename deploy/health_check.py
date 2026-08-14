@@ -18,7 +18,6 @@
 
 離開碼：所有關鍵檢查通過 -> 0；有任何 FAIL -> 1。
 """
-from __future__ import annotations
 
 import argparse
 import importlib
@@ -32,6 +31,7 @@ import sys
 import time
 from contextlib import redirect_stdout, redirect_stderr
 from datetime import datetime
+from typing import List, Tuple
 from pathlib import Path
 
 SCRIPT_DIR = Path(__file__).resolve().parent
@@ -52,7 +52,7 @@ CYAN = lambda s: _c("36", s)
 BOLD = lambda s: _c("1", s)
 
 # 收集所有檢查結果： (分類, 名稱, 狀態, 細節)   狀態 in {PASS, FAIL, WARN, INFO}
-RESULTS: list[tuple[str, str, str, str]] = []
+RESULTS = []  # type: List[Tuple[str, str, str, str]]
 
 def record(category: str, name: str, status: str, detail: str = "") -> None:
     RESULTS.append((category, name, status, detail))
@@ -155,7 +155,10 @@ def run_unit_tests() -> str:
     t0 = time.time()
     proc = subprocess.run(
         [sys.executable, "-m", "pytest", "-q", "--no-header", "--color=no"],
-        cwd=str(PROJECT_DIR), capture_output=True, text=True,
+        # capture_output= / text= 都是 3.7 才有；本程式以 venv 的 python 執行，
+        # 而 Bionic 的 venv 是 3.6。
+        cwd=str(PROJECT_DIR), stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+        universal_newlines=True,
     )
     dur = time.time() - t0
     out = (proc.stdout or "") + (proc.stderr or "")

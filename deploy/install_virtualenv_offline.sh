@@ -55,6 +55,15 @@ if ! "$PY" -m pip --version >/dev/null 2>&1; then
     echo "嘗試使用 $PY -m ensurepip 建立 pip..."
     "$PY" -m ensurepip --default-pip || true
 fi
+# Ubuntu 把 ensurepip 從 python3 拆出去(在 python3-venv 裡),所以上面那步在船上很可能
+# 無效。這裡明講,否則下一行的 pip 只會吐 "No module named pip",讓人以為是離線 wheel
+# 的問題,而真正要做的是補裝 python3-pip 的 deb。
+if ! "$PY" -m pip --version >/dev/null 2>&1; then
+    echo "錯誤: $PY 沒有可用的 pip,ensurepip 也補不起來(Ubuntu 的 python3 不含 ensurepip)。"
+    echo "      請以離線 deb 安裝對應的 python3-pip 後重跑,或以 PYTHON_BIN 指定另一支"
+    echo "      已有 pip 的系統直譯器。"
+    exit 1
+fi
 
 # 檢查 virtualenv_wheels 資料夾是否存在(同層找不到再退而找當前目錄)
 if [ ! -d "$WHEELS_DIR" ]; then

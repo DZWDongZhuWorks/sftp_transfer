@@ -19,6 +19,7 @@ import grp
 import json
 import os
 import pwd
+import re
 import shlex
 import shutil
 import socket
@@ -53,6 +54,12 @@ LEGACY_FAILOVER_STATE = Path(
 )
 USER_UNIT_DIR = Path.home() / ".config" / "systemd" / "user"
 SUDOERS_FILE = Path("/etc/sudoers.d/nssms-scheduler")
+# 時區的兩個退路來源（Bionic 的 timedatectl 沒有 show 子命令，見 detect_timezone）。
+ETC_TIMEZONE = Path("/etc/timezone")
+ETC_LOCALTIME = Path("/etc/localtime")
+# 白名單舊拼法指向的路徑。它在本機存不存在，決定了「白名單還沒更新」是壞掉還是漂移
+# （見 check_sudoers）。
+LEGACY_SYSTEMCTL = Path("/usr/bin/systemctl")
 REPORT_DIR = PROJECT_DIR / "logs"
 
 # 接管持續超過這麼久就從 INFO 升為 WARN。真實接管撐過一天代表 ipc1 一直沒修好，
@@ -334,9 +341,33 @@ def check_user_manager() -> None:
         detail = linger.stdout.strip() or linger.stderr.strip() or "Linger!=yes"
         record("systemd", "linger", "FAIL", detail)
 
-    timezone = run(["timedatectl", "show", "-p", "Timezone", "--value"])
-    zone = timezone.stdout.strip() if timezone.returncode == 0 else "unknown"
-    record("systemd", "排程時區", "INFO", f"{zone}（OnCalendar 依此時區解讀）")
+    record("systemd", "排程時區", "INFO", f"{detect_timezone()}（OnCalendar 依此時區解讀）")
+
+
+def detect_timezone() -> str:
+    """本機時區；問不到才回 "unknown"。
+
+    `timedatectl show` 是 systemd 239 才有的子命令，Bionic 的 237 只有 `status` ——
+    在 IPC3 上這一項固定印 unknown，而 OnCalendar 全靠時區解讀，看報告的人反而最需要
+    這個值。所以問不到就退到 Ubuntu 自己的兩個權威來源。
+    """
+    proc = run(["timedatectl", "show", "-p", "Timezone", "--value"])
+    if proc.returncode == 0 and proc.stdout.strip():
+        return proc.stdout.strip()
+    try:
+        zone = ETC_TIMEZONE.read_text(encoding="utf-8").strip()
+    except OSError:
+        zone = ""
+    if zone:
+        return zone
+    # /etc/localtime 是指向 /usr/share/zoneinfo/<Area>/<City> 的符號連結。
+    try:
+        target = os.readlink(str(ETC_LOCALTIME))
+    except OSError:
+        return "unknown"
+    marker = "/zoneinfo/"
+    index = target.find(marker)
+    return target[index + len(marker):] if index >= 0 else "unknown"
 
 
 def evaluate_service(
@@ -504,6 +535,11 @@ def unit_source_path(unit):
     return None
 
 
+# 實體 IPC 的合法值。與 check_identity 的判定、scheduler/services/require_base_ipc.sh
+# 的參數白名單是同一份契約。
+KNOWN_BASE_IPCS = frozenset({"ipc1", "ipc2", "ipc3"})
+
+
 def base_ipc(role: str) -> str:
     return role[:-4] if role.endswith("emer") else role
 
@@ -527,7 +563,16 @@ def unit_applicable(unit: str, role: str) -> bool:
     # timer 的適用性宣告放在同 stem 的 service，讓 service/timer 成對處理。
     contract_unit = unit[:-5] + "service" if unit.endswith(".timer") else unit
     allowed = unit_base_ipcs(unit_source_path(contract_unit))
-    return not allowed or base_ipc(role) in allowed
+    if not allowed:
+        return True
+    base = base_ipc(role)
+    if base not in KNOWN_BASE_IPCS:
+        # 身分檔缺席/壞掉時 check_identity 會回 role="unknown"。這時**不能**把有宣告的
+        # unit 一律判成 N/A：一台裝好的 ipc1 會被報成「N/A 卻殘留 unit，請重跑安裝器」,
+        # 把操作者推去重裝正確的東西。身分本身的 FAIL 已由 check_identity 單獨記錄,
+        # 這裡照常檢查所有 unit,寧可多報也不要報錯方向。
+        return True
+    return base in allowed
 
 
 def check_unit_sources(role: str = "ipc1") -> None:
@@ -718,6 +763,18 @@ def check_failed_units(strict_wave: bool) -> None:
         record("failed-units", unit, status, detail)
 
 
+def whitelist_has(text: str, command: str) -> bool:
+    """白名單裡有沒有這一條指令 —— 比對整段路徑，不是子字串。
+
+    子字串比對會被前綴吃掉：`/usr/bin/systemctl reboot` **含有**
+    `/bin/systemctl reboot`，於是舊白名單（路徑在 Bionic 上不存在、sudo 永遠比對不到）
+    也會被判成通過 —— 而那正是這一項要抓的東西。所以要求前面是行首或分隔符
+    （空白 / `:` / `,`），後面不能再接非分隔字元。
+    """
+    pattern = r"(?:^|[\s:,])" + re.escape(command) + r"(?![^\s,])"
+    return re.search(pattern, text, re.M) is not None
+
+
 def check_sudoers() -> None:
     heading("sudoers 最小權限")
     if not SUDOERS_FILE.exists():
@@ -740,20 +797,37 @@ def check_sudoers() -> None:
 
     proc = run(["sudo", "-n", "-l"])
     text = f"{proc.stdout}\n{proc.stderr}"
+    # 逐字比對 nssms-reboot.service / nssms-teamviewer.service 實際呼叫的指令。
+    # systemctl 是 /bin/ 而不是 /usr/bin/：Bionic 沒有 usr-merge，只有 /bin/systemctl
+    # （Jammy 的 /bin 是符號連結，兩個平台都在）。
     expected = (
-        "/usr/bin/systemctl reboot",
+        "/bin/systemctl reboot",
         "/usr/bin/teamviewer daemon restart",
     )
-    if proc.returncode == 0 and all(item in text for item in expected):
+    if proc.returncode == 0 and all(whitelist_has(text, item) for item in expected):
         record("sudoers", "NOPASSWD 白名單", "PASS", "reboot 與 teamviewer 精確命令皆存在")
     else:
-        missing = [item for item in expected if item not in text]
-        record(
-            "sudoers",
-            "NOPASSWD 白名單",
-            "FAIL",
-            "缺少：" + ", ".join(missing) if missing else f"sudo -n -l exit={proc.returncode}",
-        )
+        missing = [item for item in expected if not whitelist_has(text, item)]
+        status = "FAIL"
+        if missing:
+            detail = "缺少：" + ", ".join(missing)
+            if whitelist_has(text, "/usr/bin/systemctl reboot"):
+                # 白名單還是舊拼法。它是「壞掉」還是「漂移」取決於本機有沒有那個路徑：
+                #   * Jammy（usr-merge）：/usr/bin/systemctl 在，sudo 比對前會解符號連結，
+                #     所以 unit 呼叫的 /bin/systemctl 仍然放行得了 —— 實測 sudo 1.9.9 確認。
+                #     報 FAIL 會讓每台只吃 OTA 的機器固定紅一條，把真正的故障蓋掉。
+                #   * Bionic（無 usr-merge）：那個路徑根本不存在，sudo 無從比對 → 排程重開機
+                #     每 5 天靜靜失敗一次（WH102-3 的巡檢實際抓到「缺少 /usr/bin/systemctl」）。
+                if LEGACY_SYSTEMCTL.exists():
+                    status = "WARN"
+                    detail += "；白名單是舊拼法 /usr/bin/systemctl，本機有該路徑（sudo 會解"
+                    detail += "符號連結，仍可運作）；重跑 deploy_offline.sh 會以內容比對更新它"
+                else:
+                    detail += "；白名單是舊拼法 /usr/bin/systemctl，而本機沒有這個路徑 →"
+                    detail += " sudo 比對不到，排程重開機不會執行；請重跑 deploy_offline.sh"
+        else:
+            detail = f"sudo -n -l exit={proc.returncode}"
+        record("sudoers", "NOPASSWD 白名單", status, detail)
 
 
 DEFAULT_PEERS = {"ipc1": "192.168.8.115", "ipc2": "192.168.8.220"}

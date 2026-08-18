@@ -13,6 +13,7 @@ OPTIONAL_UNITS 刻意是「佈署 unit 檔但不 enable」—— 早期它們被
 整體 UNHEALTHY,而 deploy_offline.sh 把這支程式當作首次部署唯一的驗證關卡:真正的故障會被
 那兩個常駐紅字遮蔽。
 """
+import subprocess
 import sys
 from pathlib import Path
 
@@ -233,3 +234,137 @@ def test_ipc3_heartbeat_probe_is_skip_without_config(monkeypatch, tmp_path):
     check = next(c for c in hc.RESULTS if c.name == "角色探針")
     assert check.status == "SKIP"
     assert "不參與" in check.detail
+
+
+def test_unknown_role_still_checks_gated_timers(fake_systemd, monkeypatch, tmp_path):
+    """身分檔缺席/壞掉時,限制型 unit 不可一律當成 N/A。
+
+    role="unknown" 是 check_identity 讀不到身分檔時的回傳值。若那時把有 NSSMS-BaseIPC
+    宣告的 unit 都判成 N/A,一台裝好的 ipc1 會被報成「N/A 卻殘留 unit,請重跑安裝器」——
+    把操作者指向重裝正確的東西,而真正的問題(身分檔)已經另有一筆 FAIL 在記錄。
+    """
+    monkeypatch.setattr(hc, "USER_UNIT_DIR", tmp_path / "units")
+    fake_systemd["nssms-download-photos.timer"] = HEALTHY_TIMER
+    fake_systemd["nssms-download-photos.service"] = HEALTHY_ONESHOT
+
+    hc.check_timers(strict_wave=False, role="unknown")
+
+    assert timer_checks()["nssms-download-photos.timer"] == "PASS"
+
+
+def test_takeover_role_keeps_base_ipc_applicability(fake_systemd, monkeypatch, tmp_path):
+    """接管中的 ipc2emer 仍是實體 ipc2：照片同步照樣要跑（適用性是 failover-invariant）。"""
+    monkeypatch.setattr(hc, "USER_UNIT_DIR", tmp_path / "units")
+    fake_systemd["nssms-download-photos.timer"] = HEALTHY_TIMER
+    fake_systemd["nssms-download-photos.service"] = HEALTHY_ONESHOT
+
+    hc.check_timers(strict_wave=False, role="ipc2emer")
+
+    assert timer_checks()["nssms-download-photos.timer"] == "PASS"
+
+
+def _fake_run(returncode, stdout="", stderr=""):
+    def runner(cmd, timeout=15):
+        return subprocess.CompletedProcess(cmd, returncode, stdout, stderr)
+    return runner
+
+
+def test_sudoers_check_accepts_the_shipped_whitelist(monkeypatch, tmp_path):
+    """白名單的指令路徑是跨 repo 契約：scheduler 那份改了,這支巡檢必須跟著。
+
+    sudo 是逐字比對指令路徑的,所以「巡檢期待的字串」與「scheduler 出貨的白名單」一旦
+    分岔,不是巡檢誤報 FAIL,就是巡檢對真正的錯誤路徑蓋章 PASS（WH102-3 就是後者：
+    白名單寫 /usr/bin/systemctl,而 Bionic 只有 /bin/systemctl）。
+    """
+    sudoers_src = hc.SCHEDULER_DIR / "etc" / "nssms-scheduler.sudoers"
+    if not sudoers_src.is_file():
+        pytest.skip(f"scheduler 不在場:{sudoers_src}")
+    placeholder = tmp_path / "nssms-scheduler"
+    placeholder.write_text("", encoding="utf-8")
+    monkeypatch.setattr(hc, "SUDOERS_FILE", placeholder)
+    monkeypatch.setattr(hc, "_COMPACT", True)
+    monkeypatch.setattr(
+        hc, "run", _fake_run(0, sudoers_src.read_text(encoding="utf-8"))
+    )
+    hc.RESULTS.clear()
+
+    hc.check_sudoers()
+
+    check = next(c for c in hc.RESULTS if c.name == "NOPASSWD 白名單")
+    assert check.status == "PASS", check.detail
+
+
+STALE_WHITELIST = (
+    "  (root) NOPASSWD: /usr/bin/systemctl reboot, "
+    "/usr/bin/teamviewer daemon restart\n"
+)
+
+
+def _stale_whitelist_check(monkeypatch, tmp_path, legacy_path):
+    placeholder = tmp_path / "nssms-scheduler"
+    placeholder.write_text("", encoding="utf-8")
+    monkeypatch.setattr(hc, "SUDOERS_FILE", placeholder)
+    monkeypatch.setattr(hc, "LEGACY_SYSTEMCTL", legacy_path)
+    monkeypatch.setattr(hc, "_COMPACT", True)
+    monkeypatch.setattr(hc, "run", _fake_run(0, STALE_WHITELIST))
+    hc.RESULTS.clear()
+
+    hc.check_sudoers()
+
+    return next(c for c in hc.RESULTS if c.name == "NOPASSWD 白名單")
+
+
+def test_stale_whitelist_is_only_drift_where_the_old_path_exists(monkeypatch, tmp_path):
+    """Jammy:sudo 比對前會解符號連結,舊拼法仍放行得了 unit 的 /bin/systemctl。
+
+    實測(sudo 1.9.9、/bin -> usr/bin、裝著舊白名單):`sudo -l /bin/systemctl reboot`
+    回報的是白名單那條 `/usr/bin/systemctl reboot`,而參數改成沒放行的 `restart foo`
+    就退回原樣回印 —— 證明命中的是那條規則,不是 fallthrough。所以只吃 OTA 的機器
+    不會壞;報 FAIL 只會讓它們固定紅一條,把真正的故障蓋掉。
+    """
+    legacy = tmp_path / "systemctl"
+    legacy.write_text("", encoding="utf-8")
+
+    check = _stale_whitelist_check(monkeypatch, tmp_path, legacy)
+
+    assert check.status == "WARN"
+    assert "deploy_offline.sh" in check.detail
+
+
+def test_stale_whitelist_is_a_real_failure_where_the_old_path_is_absent(
+    monkeypatch, tmp_path
+):
+    """Bionic 沒有 usr-merge:/usr/bin/systemctl 不存在,sudo 無從比對 → 真的壞掉。"""
+    check = _stale_whitelist_check(monkeypatch, tmp_path, tmp_path / "absent-systemctl")
+
+    assert check.status == "FAIL"
+    assert "/usr/bin/systemctl" in check.detail
+    assert "deploy_offline.sh" in check.detail
+
+
+def test_timezone_falls_back_to_etc_timezone(monkeypatch, tmp_path):
+    """Bionic 的 systemd 237 沒有 `timedatectl show`,不該讓報告固定印 unknown。"""
+    monkeypatch.setattr(hc, "run", _fake_run(1, "", "Unknown command verb show."))
+    etc_timezone = tmp_path / "timezone"
+    etc_timezone.write_text("Asia/Taipei\n", encoding="utf-8")
+    monkeypatch.setattr(hc, "ETC_TIMEZONE", etc_timezone)
+
+    assert hc.detect_timezone() == "Asia/Taipei"
+
+
+def test_timezone_falls_back_to_localtime_symlink(monkeypatch, tmp_path):
+    monkeypatch.setattr(hc, "run", _fake_run(1, "", "Unknown command verb show."))
+    monkeypatch.setattr(hc, "ETC_TIMEZONE", tmp_path / "absent")
+    localtime = tmp_path / "localtime"
+    localtime.symlink_to("/usr/share/zoneinfo/Asia/Taipei")
+    monkeypatch.setattr(hc, "ETC_LOCALTIME", localtime)
+
+    assert hc.detect_timezone() == "Asia/Taipei"
+
+
+def test_timezone_reports_unknown_when_nothing_answers(monkeypatch, tmp_path):
+    monkeypatch.setattr(hc, "run", _fake_run(1, "", "Unknown command verb show."))
+    monkeypatch.setattr(hc, "ETC_TIMEZONE", tmp_path / "absent")
+    monkeypatch.setattr(hc, "ETC_LOCALTIME", tmp_path / "absent-localtime")
+
+    assert hc.detect_timezone() == "unknown"

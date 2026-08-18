@@ -323,6 +323,110 @@ def test_key_action():
     assert tui.key_action(ord("z")) is None
 
 
+def test_mouse_event_kind_and_safe_initialisation():
+    assert tui.mouse_event_kind(curses.BUTTON1_CLICKED) == "click"
+    assert tui.mouse_event_kind(curses.BUTTON1_DOUBLE_CLICKED) == "activate"
+    assert tui.mouse_event_kind(curses.BUTTON3_CLICKED) == "close"
+    assert tui.mouse_event_kind(curses.BUTTON4_PRESSED) == "wheel_up"
+    assert tui.mouse_event_kind(curses.BUTTON5_PRESSED) == "wheel_down"
+    assert tui.mouse_event_kind(curses.BUTTON1_RELEASED) is None
+
+    with mock.patch.object(curses, "mousemask", return_value=(curses.ALL_MOUSE_EVENTS, 0)) as mask, \
+         mock.patch.object(curses, "mouseinterval") as interval:
+        assert tui._enable_mouse() is True
+    mask.assert_called_once_with(curses.ALL_MOUSE_EVENTS)
+    interval.assert_called_once_with(tui._MOUSE_INTERVAL_MS)
+
+    with mock.patch.object(curses, "mousemask", side_effect=curses.error):
+        assert tui._enable_mouse() is False
+
+
+def test_main_mouse_row_mapping_and_actions():
+    rows = [
+        tui.Row("mode", 0, ("M", "download"), "下載", "success", object()),
+        tui.Row("vessel", 1, ("V", "download", "CLINK"), "CLINK", "success", object()),
+        tui.Row("device", 2, ("D", "download", "CLINK", "IPC-1", "ecdis"),
+                "ecdis", "success", object()),
+    ]
+    state = tui.TuiState()
+
+    # 分群資料從 y=2 開始；表頭、底列與資料後的空白都不可選。
+    assert tui.mouse_row_index(1, maxy=10, state=state, scroll=0, total=3) is None
+    assert tui.mouse_row_index(2, maxy=10, state=state, scroll=0, total=3) == 0
+    assert tui.mouse_row_index(4, maxy=10, state=state, scroll=0, total=3) == 2
+    assert tui.mouse_row_index(5, maxy=10, state=state, scroll=0, total=3) is None
+    assert tui.mouse_row_index(9, maxy=10, state=state, scroll=0, total=3) is None
+
+    # 單擊文字只選取；雙擊啟動；群組三角形（depth*2）單擊即開合。
+    assert tui.main_mouse_action(8, 3, curses.BUTTON1_CLICKED, rows, state, 10) == (
+        "select", 1
+    )
+    assert tui.main_mouse_action(8, 3, curses.BUTTON1_DOUBLE_CLICKED, rows, state, 10) == (
+        "enter", 1
+    )
+    assert tui.main_mouse_action(2, 3, curses.BUTTON1_CLICKED, rows, state, 10) == (
+        "enter", 1
+    )
+    assert tui.main_mouse_action(8, 4, curses.BUTTON1_CLICKED, rows, state, 10) == (
+        "select", 2
+    )
+    assert tui.main_mouse_action(0, 0, curses.BUTTON4_PRESSED, rows, state, 10) == (
+        "wheel_up", None
+    )
+
+    # 平坦模式多一行欄名，因此第一筆從 y=3 開始；scroll 要加回資料索引。
+    state.flat = True
+    state.scroll = 1
+    assert tui.mouse_row_index(2, maxy=10, state=state, scroll=1, total=3) is None
+    assert tui.mouse_row_index(3, maxy=10, state=state, scroll=1, total=3) == 1
+
+
+def test_popup_mouse_actions():
+    bounds = dict(x0=10, y0=5, w=30, h=8)
+    assert tui.popup_mouse_action(12, 7, curses.BUTTON1_CLICKED, **bounds) == "activate"
+    assert tui.popup_mouse_action(2, 2, curses.BUTTON1_CLICKED, **bounds) == "close"
+    assert tui.popup_mouse_action(12, 7, curses.BUTTON3_CLICKED, **bounds) == "close"
+    assert tui.popup_mouse_action(2, 2, curses.BUTTON4_PRESSED, **bounds) == "wheel_up"
+
+
+def test_main_loop_routes_mouse_click_to_selection():
+    """完整接線：KEY_MOUSE → getmouse 座標換算 → 下一幀選取列改變。"""
+    rows = [
+        tui.Row("mode", 0, ("M", "download"), "下載", "success", object()),
+        tui.Row("vessel", 1, ("V", "download", "CLINK"), "CLINK", "success", object()),
+    ]
+
+    class FakeScreen:
+        def __init__(self):
+            self.keys = iter([curses.KEY_MOUSE, ord("q")])
+
+        def timeout(self, _delay):
+            pass
+
+        def getmaxyx(self):
+            return 20, 80
+
+        def getch(self):
+            return next(self.keys)
+
+    selected = []
+    args = SimpleNamespace(flat=False, watch=None)
+    with mock.patch.object(curses, "curs_set"), \
+         mock.patch.object(curses, "has_colors", return_value=False), \
+         mock.patch.object(tui, "_enable_mouse") as enable, \
+         mock.patch.object(tui, "load_tree", return_value=[]), \
+         mock.patch.object(tui, "write_html_snapshot", return_value=""), \
+         mock.patch.object(tui, "visible_rows", return_value=rows), \
+         mock.patch.object(tui, "_draw",
+                           side_effect=lambda _s, st, *_a: selected.append(st.sel_key)), \
+         mock.patch.object(tui, "_read_mouse",
+                           return_value=(8, 3, curses.BUTTON1_CLICKED)):
+        tui._main_loop(FakeScreen(), args)
+
+    enable.assert_called_once_with()
+    assert selected == [rows[0].key, rows[1].key]
+
+
 # --- 明細 ------------------------------------------------------------------
 def test_display_width_helpers():
     assert tui.disp_width("abc") == 3
@@ -564,12 +668,28 @@ def test_csv_key_action():
     assert tui.csv_key_action(-1) is None             # watch 逾時不該當成按鍵
 
 
+def test_csv_mouse_action():
+    assert tui.csv_mouse_action(5, curses.BUTTON4_PRESSED, 20) == "wheel_up"
+    assert tui.csv_mouse_action(5, curses.BUTTON5_PRESSED, 20) == "wheel_down"
+    assert tui.csv_mouse_action(
+        5, curses.BUTTON_SHIFT | curses.BUTTON4_PRESSED, 20
+    ) == "left"
+    assert tui.csv_mouse_action(
+        5, curses.BUTTON_SHIFT | curses.BUTTON5_PRESSED, 20
+    ) == "right"
+    assert tui.csv_mouse_action(5, curses.BUTTON3_CLICKED, 20) == "close"
+    assert tui.csv_mouse_action(19, curses.BUTTON1_CLICKED, 20) == "close"
+    assert tui.csv_mouse_action(5, curses.BUTTON1_CLICKED, 20) is None
+
+
 def test_csv_apply_scroll_and_sort():
     v = tui.CsvView()
     assert (v.sort_key, v.desc, v.off, v.hoff) == ("原序", False, 0, 0)
 
     geom = dict(total=100, view_h=10)
     tui.csv_apply(v, "down", **geom); assert v.off == 1
+    tui.csv_apply(v, "wheel_down", **geom); assert v.off == 1 + tui._MOUSE_SCROLL_LINES
+    tui.csv_apply(v, "wheel_up", **geom); assert v.off == 1
     tui.csv_apply(v, "pgdn", **geom); assert v.off == 11
     tui.csv_apply(v, "pgup", **geom); assert v.off == 1
     tui.csv_apply(v, "bottom", **geom); assert v.off == 100  # 由 clamp_scroll 收尾

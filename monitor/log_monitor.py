@@ -1071,7 +1071,7 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument(
         "--tui",
         action="store_true",
-        help="互動式終端機介面（curses）：可鍵盤展開/收合/搜尋/過濾/看明細；非 TTY 自動退回靜態輸出",
+        help="互動式終端機介面（curses）：可用鍵盤/滑鼠展開、收合、搜尋、過濾及看明細；非 TTY 自動退回靜態輸出",
     )
     grp = p.add_mutually_exclusive_group()
     grp.add_argument("--expand-all", action="store_true", help="分群時全部展開")

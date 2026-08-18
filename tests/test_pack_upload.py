@@ -159,3 +159,100 @@ def test_rejects_download_config(tmp_path):
 
     with pytest.raises(ValueError, match="mode 必須是 upload"):
         pack_upload.build_archive_plan(_settings(source, mode="download"))
+
+
+def _members(output):
+    with tarfile.open(output, "r") as archive:
+        return {m.name: m for m in archive.getmembers()}
+
+
+def test_symlinks_inside_source_are_preserved_as_links(tmp_path):
+    source = tmp_path / "radar"
+    _write(source / "realdir" / "a.txt", b"A")
+    (source / "filelink").symlink_to("realdir/a.txt")
+    (source / "dirlink").symlink_to("realdir")
+
+    plan = pack_upload.build_archive_plan(_settings(source))
+    output = pack_upload.write_archive(plan, tmp_path / "radar.tar")
+
+    members = _members(output)
+    assert members["radar/filelink"].issym()
+    assert members["radar/filelink"].linkname == "realdir/a.txt"
+    assert members["radar/dirlink"].issym()
+    assert members["radar/dirlink"].linkname == "realdir"
+    # 連結沒有被展開成第二份內容。
+    assert "radar/dirlink/a.txt" not in members
+    assert members["radar/realdir/a.txt"].isfile()
+
+
+def test_symlink_pointing_outside_source_stores_real_content(tmp_path):
+    outside = tmp_path / "outside"
+    _write(outside / "out.txt", b"OUT")
+    source = tmp_path / "radar"
+    _write(source / "keep.txt", b"keep")
+    (source / "abslink").symlink_to(outside / "out.txt")
+    (source / "outlink").symlink_to(outside)
+
+    plan = pack_upload.build_archive_plan(_settings(source))
+    output = pack_upload.write_archive(plan, tmp_path / "radar.tar")
+
+    members = _members(output)
+    # 保留成連結的話，解到目的端會指向不存在的路徑，所以改存實際內容。
+    assert members["radar/abslink"].isfile()
+    assert members["radar/outlink"].isdir()
+    assert members["radar/outlink/out.txt"].isfile()
+    with tarfile.open(output, "r") as archive:
+        assert archive.extractfile("radar/abslink").read() == b"OUT"
+
+
+def test_broken_symlink_inside_source_is_kept_instead_of_failing(tmp_path):
+    source = tmp_path / "radar"
+    _write(source / "keep.txt", b"keep")
+    (source / "broken").symlink_to("nowhere.txt")
+
+    plan = pack_upload.build_archive_plan(_settings(source))
+    output = pack_upload.write_archive(plan, tmp_path / "radar.tar")
+
+    members = _members(output)
+    assert members["radar/broken"].issym()
+    assert members["radar/broken"].linkname == "nowhere.txt"
+    assert members["radar/keep.txt"].isfile()
+
+
+def test_broken_symlink_outside_source_is_skipped(tmp_path):
+    source = tmp_path / "radar"
+    _write(source / "keep.txt", b"keep")
+    (source / "absbroken").symlink_to(tmp_path / "gone" / "x.txt")
+
+    plan = pack_upload.build_archive_plan(_settings(source))
+    output = pack_upload.write_archive(plan, tmp_path / "radar.tar")
+
+    members = _members(output)
+    assert "radar/absbroken" not in members
+    assert members["radar/keep.txt"].isfile()
+
+
+def test_symlink_cycle_does_not_duplicate_the_subtree(tmp_path):
+    source = tmp_path / "radar"
+    _write(source / "realdir" / "a.txt", b"A")
+    (source / "realdir" / "cycle").symlink_to("..")
+
+    plan = pack_upload.build_archive_plan(_settings(source))
+    output = pack_upload.write_archive(plan, tmp_path / "radar.tar")
+
+    members = _members(output)
+    assert members["radar/realdir/cycle"].issym()
+    assert sorted(members) == ["radar", "radar/realdir", "radar/realdir/a.txt", "radar/realdir/cycle"]
+
+
+def test_ignored_symlink_is_not_packed(tmp_path):
+    source = tmp_path / "radar"
+    _write(source / "realdir" / "a.txt", b"A")
+    (source / "filelink").symlink_to("realdir/a.txt")
+    ignore = tmp_path / "radar_ignore.txt"
+    ignore.write_text("filelink\n", encoding="utf-8")
+
+    plan = pack_upload.build_archive_plan(_settings(source, ignore_file=str(ignore)))
+    output = pack_upload.write_archive(plan, tmp_path / "radar.tar")
+
+    assert "radar/filelink" not in _members(output)

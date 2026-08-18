@@ -363,6 +363,37 @@ class WheelCompatTests(unittest.TestCase):
 
     # --- 正向：兩個 profile 各自的真實 wheelhouse 都要過 ---------------------
 
+    def test_real_virtualenv_wheels_manifest_matches_directory(self):
+        """virtualenv bootstrap 輪子的 manifest 必須與目錄一致。
+
+        它是船上每一個 venv 的前提，而 OTA 走 SFTP —— 少送或截斷一個檔的話，失敗會晚到
+        pip 解析相依那一刻才浮出來。這一項守的是「manifest 與實際檔案同步」；deploy 端的
+        preflight 另外會在需要 bootstrap 時做 sha256 校驗。
+
+        *.whl 不納入版控（見 .gitignore），所以輪子不在場時 skip —— 那是乾淨 clone 的
+        正常狀態，不該讓它變成測試失敗。
+        """
+        directory = DEPLOY_DIR / "virtualenv_wheels"
+        manifest = directory / "MANIFEST.txt"
+        self.assertTrue(manifest.is_file(),
+                        "{} 不存在；preflight 少了一道校驗".format(manifest))
+        listed = {}
+        for line in manifest.read_text(encoding="utf-8").splitlines():
+            if line.startswith("#") or not line.strip():
+                continue
+            digest, name = line.split()
+            listed[name] = digest
+        self.assertTrue(listed, "manifest 沒有列出任何 wheel")
+
+        on_disk = sorted(p.name for p in directory.glob("*.whl"))
+        if not on_disk:
+            self.skipTest("virtualenv_wheels 未派送到本機（*.whl 不納入版控）")
+        self.assertEqual(sorted(listed), on_disk,
+                         "manifest 與目錄內容不一致（重建後忘了更新 MANIFEST？）")
+        for name, digest in listed.items():
+            actual = hashlib.sha256((directory / name).read_bytes()).hexdigest()
+            self.assertEqual(digest, actual, "{} 的 sha256 不符".format(name))
+
     def test_real_jammy_wheelhouse_matches_cp310(self):
         wh = DEPLOY_DIR / "platforms" / "ubuntu-22.04-arm64" / "wheelhouse"
         if not any(wh.glob("*.whl")):

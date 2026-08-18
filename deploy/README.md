@@ -309,6 +309,28 @@ python3 deploy/lib/wheel_compat.py --py 3.6 --glibc 2.27 --arch aarch64 \
 > `tests/test_offline_deploy.py` 有一條斷言把「程式碼用了 backport」與「Bionic 的
 > MANIFEST 有那個輪子」綁在一起 —— 漏帶就會紅。
 
+### `virtualenv_wheels/`（兩個 profile 共用）
+
+這一組是「在主環境（非 venv）離線補上 `virtualenv`」用的，由
+`install_virtualenv_offline.sh` 以 `pip install --user --no-index --find-links` 安裝 ——
+它是船上**每一個** venv 的前提。目前一份共用即可：全部宣告 `Requires-Python >=3.6`，
+Bionic 的 3.6.9 與 Jammy 的 3.10 都吃得下（要為某個 profile 另備一份就放
+`platforms/<profile>/virtualenv_wheels/`，會自動被挑走）。
+
+```bash
+pip download virtualenv --no-deps --only-binary=:all: --python-version 36 \
+  -d deploy/virtualenv_wheels     # 相依（distlib / filelock / platformdirs /
+                                  # importlib-metadata / importlib-resources /
+                                  # zipp / typing-extensions）也要一併抓
+cd deploy/virtualenv_wheels && sha256sum *.whl > MANIFEST.txt   # 檔頭註解請保留/補上
+```
+
+> `MANIFEST.txt` 不是可選的。OTA 走 SFTP，少送或截斷一個檔的話，失敗會晚到 pip 解析相依
+> 那一刻才以「找不到相依」浮出來 —— 而那時 `deploy_offline.sh` 已經動過機器了。preflight
+> 會在**確定需要 bootstrap 時**校驗它（已經有 `virtualenv` 的機器走略過，不會被卡住），
+> 用的是與 tmux debs 同一支 `nssms_verify_flat_manifest`。舊離線包沒有這份 manifest 時只
+> 會 warn，不會讓那些包一次全部失效。
+
 ## 未來如何更新 / 重建 debs
 
 分別在 **Bionic ARM64** 與 **Jammy ARM64** 的建置環境（有對外網路）各跑一次：

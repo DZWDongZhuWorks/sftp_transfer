@@ -402,6 +402,29 @@ banner_and_preflight() {
     esac
   fi
 
+  # virtualenv bootstrap 輪子的完整性。**只在確定需要它時**才列為部署前提:已經有
+  # virtualenv 的機器不該因為這個目錄少一個檔而卡住(它那時根本用不到)。
+  #
+  # 為什麼要校驗:它是船上每一個 venv 的前提,而 OTA 走 SFTP —— 少送或截斷一個檔,失敗會
+  # 晚到 pip 解析相依那一刻才以「找不到相依」浮出來,而那時已經動過機器了。這裡讓它提早、
+  # 明確地失敗,與 tmux debs 用的是同一支校驗器。
+  if [ -n "$PYTHON_BIN" ] && command -v "$PYTHON_BIN" >/dev/null 2>&1 \
+     && ! "$PYTHON_BIN" -m virtualenv --version >/dev/null 2>&1; then
+    if [ -z "$VENV_WHEELS" ]; then
+      err "$PYTHON_BIN 沒有 virtualenv,而找不到 virtualenv bootstrap 輪子目錄。"
+      err "應位於 deploy/virtualenv_wheels/ 或 platforms/${NSSMS_PROFILE_ID}/virtualenv_wheels/。"
+      preflight_failures=$((preflight_failures + 1))
+    elif [ ! -f "$VENV_WHEELS/MANIFEST.txt" ]; then
+      # 舊離線包沒有這份 manifest。缺它只是少一道校驗,不該讓那些包一次全部失效。
+      warn "$VENV_WHEELS 沒有 MANIFEST.txt,略過完整性校驗(舊離線包可能沒有這份)。"
+    elif ! nssms_verify_flat_manifest "$VENV_WHEELS" "$VENV_WHEELS/MANIFEST.txt" \
+            '*.whl' "virtualenv bootstrap 輪子"; then
+      err "virtualenv bootstrap 輪子校驗未通過;尚未做任何持久變更。"
+      err "重建方式見 deploy/README.md 的「未來如何更新 / 重建 wheelhouse」。"
+      preflight_failures=$((preflight_failures + 1))
+    fi
+  fi
+
   run_rc bash "$SCRIPT_DIR/install_tmux_offline.sh" --check-only --profile-dir "$PROFILE_DIR"
   case "$RC" in
     0|5) ok "tmux profile 與本機 ABI 驗證通過。" ;;

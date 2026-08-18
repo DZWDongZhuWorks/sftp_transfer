@@ -1,0 +1,33 @@
+# virtualenv bootstrap wheel manifest — 兩個 profile 共用
+# Built for: 任何 >= 3.6 的船端 python（這一組全部宣告 Requires-Python >=3.6，
+#            Bionic 的 3.6.9 與 Jammy 的 3.10 都吃得下）
+# Files    : 8 wheels
+#
+# 這一組是「在主環境（非 venv）離線補上 virtualenv」用的，由 install_virtualenv_offline.sh
+# 以 pip install --user --no-index --find-links 安裝。它是船上**每一個** venv 的前提。
+#
+# 為什麼需要這份 manifest：OTA 走 SFTP，少送或截斷一個檔的話，失敗會晚到 pip 解析相依
+# 那一刻才以「找不到相依」的形式浮出來 —— 而那時 deploy_offline.sh 已經動過機器了。
+# deploy_offline.sh 的 preflight 會在**確定需要 bootstrap 時**校驗這份（已經有 virtualenv
+# 的機器不該因為這個目錄少一個檔而卡住）。
+#
+# 為什麼版本偏舊：virtualenv 20.17.1 是最後一版支援 3.6 的；importlib-metadata 4.8.3 /
+# importlib-resources 5.4.0 / zipp 3.6.0 / filelock 3.4.1 / platformdirs 2.4.0 /
+# typing-extensions 4.1.1 / distlib 0.4.0 同理。在真的 Bionic（3.6.9）上實測可安裝，
+# 並且裝出來的 virtualenv 能建出可用的 3.6.9 venv。
+#
+# 重建（有網路的機器上，見 deploy/README.md）：
+#   pip download virtualenv --python-version 36 --only-binary=:all: -d deploy/virtualenv_wheels
+#   cd deploy/virtualenv_wheels && sha256sum *.whl > MANIFEST.txt   # 檔頭註解請保留/補上
+#
+# 校驗基準目錄就是本目錄。不要併進 deploy/MANIFEST.txt。
+#
+# sha256  filename
+9659f7d87e46584a30b5780e43ac7a2143098441670ff0a49d5f9034c54a6c16  distlib-0.4.0-py2.py3-none-any.whl
+a4bc51381e01502a30e9f06dd4fa19a1712eab852b6fb0f84fd7cce0793d8ca3  filelock-3.4.1-py3-none-any.whl
+65a9576a5b2d58ca44d133c42a241905cc45e34d2c06fd5ba2bafa221e5d7b5e  importlib_metadata-4.8.3-py3-none-any.whl
+33a95faed5fc19b4bc16b29a6eeae248a3fe69dd55d4d229d2b480e23eeaad45  importlib_resources-5.4.0-py3-none-any.whl
+8868bbe3c3c80d42f20156f22e7131d2fb321f5bc86a2a345375c6481a67021d  platformdirs-2.4.0-py3-none-any.whl
+21c85e0fe4b9a155d0799430b0ad741cdce7e359660ccbd8b530613e8df88ce2  typing_extensions-4.1.1-py3-none-any.whl
+ce3b1684d6e1a20a3e5ed36795a97dfc6af29bc3970ca8dab93e11ac6094b3c4  virtualenv-20.17.1-py3-none-any.whl
+9fe5ea21568a0a70e50f273397638d39b03353731e6cbbb3fd8502a33fec40bc  zipp-3.6.0-py3-none-any.whl

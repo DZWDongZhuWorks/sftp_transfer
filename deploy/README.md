@@ -293,6 +293,22 @@ python3 deploy/lib/wheel_compat.py --py 3.6 --glibc 2.27 --arch aarch64 \
 > pip 在 3.6 下會挑到一個 `0.0.0a0` 佔位套件，還會把 trio / outcome / sniffio 一整串
 > 拖進 wheelhouse。它本來就不該在 Bionic 的清單裡。
 
+> ⚠️ Bionic 那份**必須**包含 `dataclasses`（`0.8`，純 python）。`dataclasses` 是 3.7 才
+> 進標準庫，而 `monitor/log_monitor.py`、`monitor/tui.py`、`run_selected_transfers.py`、
+> `pack_upload.py` 都用 `@dataclass` —— 少了它，那四支人工工具在 Bionic 的 3.6 venv 上
+> 一律 `ModuleNotFoundError`（在 Bionic 開發機實測確認）。重建時記得帶上：
+>
+> ```bash
+> pip download 'dataclasses==0.8' --no-deps --only-binary=:all: \
+>   --python-version 36 -d "$PROF"
+> ```
+>
+> Jammy 那份**不要**放它：3.10 已內建，而 `dataclasses==0.8` 的 `python_requires` 是
+> `>=3.6,<3.7`，pip 在 3.10 上本來就會拒絕。`deploy_offline.sh` 對它走「wheelhouse 有
+> 才裝」（`BACKPORT_PKGS`），所以同一份安裝清單在兩個 profile 上都正確。
+> `tests/test_offline_deploy.py` 有一條斷言把「程式碼用了 backport」與「Bionic 的
+> MANIFEST 有那個輪子」綁在一起 —— 漏帶就會紅。
+
 ## 未來如何更新 / 重建 debs
 
 分別在 **Bionic ARM64** 與 **Jammy ARM64** 的建置環境（有對外網路）各跑一次：

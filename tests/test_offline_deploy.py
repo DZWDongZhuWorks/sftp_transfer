@@ -492,17 +492,38 @@ class ShipInterpreterCompatTests(unittest.TestCase):
     `dataclasses`、PEP 585/604 這幾類是實際踩過的，值得釘死。
     """
 
-    MUST_RUN_ON_36 = (
+    # 【為什麼是「全掃 + 具名豁免」而不是白名單】這裡原本是一張三個檔的清單。清單只保護
+    # 「當時想到的檔」，新增的檔預設落在保護之外 —— monitor/{log_monitor,tui}.py、
+    # run_selected_transfers.py、pack_upload.py 全部是 3.7+，而清單上那三個檔一路綠燈。
+    # 在 Bionic 開發機（192.168.6.230）上實測才發現那四支一個都 import 不起來。
+    # 反過來以「船側目錄全掃、例外要具名並寫理由」為預設。
+    VENV_PYTHON_DIRS = (".", "monitor", "deploy", "deploy/lib")
+
+    # 由**系統 python3** 執行的檔：它不在任何 venv 裡，wheelhouse 補不到它身上，所以連
+    # 「有 backport 就能用」的東西也不行（README 明示 automation_health_check.py 用系統
+    # python3 即可）。
+    SYSTEM_PYTHON_FILES = (
         "deploy/automation_health_check.py",
-        "deploy/health_check.py",
-        "deploy/lib/wheel_compat.py",
     )
 
-    # (樣式, 說明, 需要的版本)
+    # 明確豁免、可以不維持 3.6 相容的檔，以及理由。空的也要留著這個機制：新增 3.7+ 的檔
+    # 時要逼出一次有意識的決定，而不是等到船上才發現。
+    EXEMPT = {}
+
+    # 可以靠 per-profile wheelhouse 補上的標準庫 backport：套件名 → (token 樣式, 版本)。
+    # 只有 venv 執行的檔可以用，而且**必須**確認 Bionic 的 wheelhouse 真的帶了那個輪子
+    # —— 否則就是「程式碼假設有、離線包沒帶」，在船上才炸。
+    BACKPORTED = {
+        "dataclasses": (("from dataclasses import", "import dataclasses"), "3.7"),
+    }
+
+    BIONIC_WHEELHOUSE_MANIFEST = (
+        "deploy/platforms/ubuntu-18.04-arm64/wheelhouse/MANIFEST.txt"
+    )
+
+    # (樣式, 說明, 需要的版本) —— 這些是**任何 backport 都補不了**的（語法或標準庫 API）。
     FORBIDDEN = (
         ("from __future__ import annotations", "3.6 沒有這個 future，SyntaxError", "3.7"),
-        ("from dataclasses import", "dataclasses 是 3.7 才進標準庫", "3.7"),
-        ("import dataclasses", "dataclasses 是 3.7 才進標準庫", "3.7"),
         ("capture_output=", "subprocess 的 capture_output= 是 3.7", "3.7"),
         ("text=True", "subprocess 的 text= 是 3.7（用 universal_newlines=）", "3.7"),
         (".fromisoformat(", "datetime.fromisoformat 是 3.7", "3.7"),
@@ -510,9 +531,91 @@ class ShipInterpreterCompatTests(unittest.TestCase):
         ("cached_property", "functools.cached_property 是 3.8", "3.8"),
         (".removeprefix(", "str.removeprefix 是 3.9", "3.9"),
         (".removesuffix(", "str.removesuffix 是 3.9", "3.9"),
+        # 比對 import 形式而不是裸字串 "zoneinfo":後者會誤中
+        # /usr/share/zoneinfo/ 這種路徑(automation_health_check 的時區退路就用到)。
+        ("import zoneinfo", "zoneinfo 是 3.9", "3.9"),
+        ("from zoneinfo import", "zoneinfo 是 3.9", "3.9"),
     )
 
     PEP585_BUILTINS = {"list", "dict", "tuple", "set", "frozenset", "type"}
+
+    def _ship_side_files(self):
+        """所有必須維持 3.6 相容的船側 .py（相對專案根目錄）。"""
+        found = []
+        for sub in self.VENV_PYTHON_DIRS:
+            directory = PROJECT_DIR / sub
+            if not directory.is_dir():
+                continue
+            for path in sorted(directory.glob("*.py")):
+                rel = path.relative_to(PROJECT_DIR).as_posix()
+                if rel not in self.EXEMPT:
+                    found.append(rel)
+        for rel in self.SYSTEM_PYTHON_FILES:
+            if rel not in found and rel not in self.EXEMPT:
+                found.append(rel)
+        return found
+
+    def _bionic_wheelhouse_names(self):
+        """Bionic wheelhouse 帶了哪些套件（讀 MANIFEST 而不是掃目錄）。
+
+        *.whl 不納入版控（見 .gitignore），乾淨 clone 上目錄是空的 —— 只有 MANIFEST.txt
+        是版控過的事實，所以契約要對它斷言。
+        """
+        manifest = PROJECT_DIR / self.BIONIC_WHEELHOUSE_MANIFEST
+        names = set()
+        if not manifest.is_file():
+            return names
+        for line in manifest.read_text(encoding="utf-8").splitlines():
+            if not line.endswith(".whl"):
+                continue
+            filename = line.split()[-1]
+            names.add(filename.split("-")[0].lower().replace("_", "-"))
+        return names
+
+    def test_scan_finds_the_known_ship_side_files(self):
+        """掃描壞掉時清單會變空，而空清單會讓底下每一項都「通過」。"""
+        found = self._ship_side_files()
+        self.assertTrue(found, "船側 .py 掃描結果是空的（目錄結構變了？）")
+        for anchor in ("deploy/automation_health_check.py", "monitor/tui.py",
+                       "downloader.py", "pack_upload.py"):
+            self.assertIn(anchor, found, "{} 應該在守門範圍內".format(anchor))
+        for rel in self.EXEMPT:
+            self.assertTrue((PROJECT_DIR / rel).is_file(),
+                            "豁免清單上的 {} 已不存在，請把該項一起刪掉".format(rel))
+
+    def test_system_python_files_reject_even_backportable_imports(self):
+        """系統 python3 那一層不能靠 wheelhouse 救 —— dataclasses 之類一律不行。"""
+        for path in self.SYSTEM_PYTHON_FILES:
+            code = self._code_lines(path)
+            for pkg, (tokens, ver) in self.BACKPORTED.items():
+                for token in tokens:
+                    self.assertNotIn(
+                        token, code,
+                        "{}：用了 {}（需要 {}）。這支由**系統 python3** 執行，"
+                        "不在 venv 裡，wheelhouse 的 {} backport 補不到它身上。".format(
+                            path, token, ver, pkg),
+                    )
+
+    def test_backported_imports_are_actually_in_the_bionic_wheelhouse(self):
+        """用了 backport 的檔，離線包就必須真的帶那個輪子。
+
+        這正是實際踩到的形狀：四支工具 import dataclasses，而 Bionic 的 wheelhouse 沒帶
+        —— 在開發機（3.10 內建 dataclasses）上完全看不出來，只有到 Bionic 才
+        ModuleNotFoundError。
+        """
+        shipped = self._bionic_wheelhouse_names()
+        for path in self._ship_side_files():
+            code = self._code_lines(path)
+            for pkg, (tokens, ver) in self.BACKPORTED.items():
+                if not any(token in code for token in tokens):
+                    continue
+                self.assertIn(
+                    pkg.lower(), shipped,
+                    "{} 用了 {}（3.6 沒有，需要 {}），但 {} 沒列出該輪子。"
+                    "請把 backport 放進 Bionic 的 wheelhouse 並補進 MANIFEST，"
+                    "或改寫掉這個相依。".format(
+                        path, pkg, ver, self.BIONIC_WHEELHOUSE_MANIFEST),
+                )
 
     def _code_lines(self, path):
         """去掉整行註解 —— 檔頭常把這些寫法列成「不要用」的清單。"""
@@ -551,7 +654,7 @@ class ShipInterpreterCompatTests(unittest.TestCase):
                 yield ast, node.annotation, "變數註解"
 
     def test_no_post36_constructs(self):
-        for path in self.MUST_RUN_ON_36:
+        for path in self._ship_side_files():
             code = self._code_lines(path)
             for token, why, ver in self.FORBIDDEN:
                 self.assertNotIn(
@@ -560,7 +663,7 @@ class ShipInterpreterCompatTests(unittest.TestCase):
                 )
 
     def test_no_pep585_builtin_generics_in_annotations(self):
-        for path in self.MUST_RUN_ON_36:
+        for path in self._ship_side_files():
             for ast, ann, where in self._annotations(path):
                 for sub in ast.walk(ann):
                     if not isinstance(sub, ast.Subscript):
@@ -575,7 +678,7 @@ class ShipInterpreterCompatTests(unittest.TestCase):
                         )
 
     def test_no_pep604_unions_in_annotations(self):
-        for path in self.MUST_RUN_ON_36:
+        for path in self._ship_side_files():
             for ast, ann, where in self._annotations(path):
                 for sub in ast.walk(ann):
                     if isinstance(sub, ast.BinOp) and isinstance(sub.op, ast.BitOr):
@@ -586,7 +689,7 @@ class ShipInterpreterCompatTests(unittest.TestCase):
 
     def test_files_actually_parse(self):
         """順手確認掃描對象真的還在、而且語法沒壞。"""
-        for path in self.MUST_RUN_ON_36:
+        for path in self._ship_side_files():
             full = PROJECT_DIR / path
             self.assertTrue(full.is_file(), "{} 不見了".format(path))
             compile(full.read_text(encoding="utf-8"), str(full), "exec")

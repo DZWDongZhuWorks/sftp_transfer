@@ -11,7 +11,7 @@
 設計：curses 只出現在最外層（draw / run 迴圈）；資料壓平與狀態轉移都是純函式，
 可在無終端機環境下單元測試。資料層（collect/aggregate/build_tree）完全沿用 log_monitor。
 """
-from __future__ import annotations
+from typing import List, Optional, Tuple
 
 import curses
 import re
@@ -82,7 +82,7 @@ def disp_width(s: str) -> int:
     return sum(_char_width(c) for c in s)
 
 
-def fit_display(s: str, cols: int) -> tuple[str, int]:
+def fit_display(s: str, cols: int) -> Tuple[str, int]:
     """截斷 s 至顯示寬度不超過 cols，回傳 (截斷後字串, 實際顯示寬度)。"""
     if cols <= 0:
         return "", 0
@@ -147,9 +147,9 @@ class TuiState:
     mode: str = ""       # '' | 'download' | 'upload'
     status: str = "all"  # 'all' | 'ok' | 'stale' | 'problem'
     only_problem: bool = False
-    sel_key: tuple | None = None
+    sel_key: Optional[tuple] = None
     scroll: int = 0
-    now: datetime | None = None
+    now: Optional[datetime] = None
     flat: bool = False                 # True＝平坦模式（不分群，全船隊一張表）
     sort_key: str = _SORT_CYCLE[0]      # 見 _SORT_CYCLE
     sort_desc: bool = True             # 預設由 _SORT_CYCLE 首欄位降冪排序
@@ -171,7 +171,7 @@ def _searchtext(d) -> str:
     ).lower()
 
 
-def _device_line(d, now: datetime | None) -> str:
+def _device_line(d, now: Optional[datetime]) -> str:
     rec = d.latest
     comp = pad_display(d.component, 20)
     last = pad_display(rec.started_at.strftime(TS_FMT) if rec.started_at else "—", 19)
@@ -194,7 +194,7 @@ def _flat_cells(cells) -> str:
     return f"{fixed} {cells[len(_FLAT_COLS)]}"  # 最後一欄（摘要）不設寬，由 _put 截斷
 
 
-def _device_line_flat(item, now: datetime | None) -> str:
+def _device_line_flat(item, now: Optional[datetime]) -> str:
     """平坦模式的裝置列：沒有分群結構交代身分，故列本身要帶方向/船/IPC。
 
     方向必須顯示——同一台裝置的下載與上傳是兩筆 DeviceStatus，少了方向兩列會長得一樣。
@@ -287,12 +287,12 @@ def _device_matches(d, state: TuiState) -> bool:
     return True
 
 
-def flatten_tree(tree, state: TuiState, now: datetime | None) -> list[Row]:
+def flatten_tree(tree, state: TuiState, now: Optional[datetime]) -> List[Row]:
     """依 expanded 集合與過濾條件把樹壓平成目前可見列（純函式）。
 
     收合的群組不展開子列；過濾後沒有任何可見裝置的群組整個略過。
     """
-    rows: list[Row] = []
+    rows: List[Row] = []
     for m in tree:
         m_has = any(
             _device_matches(d, state)
@@ -353,7 +353,7 @@ class FlatItem:
     dev: object
 
 
-def tree_devices(tree) -> list[FlatItem]:
+def tree_devices(tree) -> List[FlatItem]:
     """把樹走回扁平清單（純函式）。
 
     輸出順序＝資料層既有順序，正是 sort_devices 穩定排序所依賴的天然 tiebreak。
@@ -366,7 +366,7 @@ def tree_devices(tree) -> list[FlatItem]:
     ]
 
 
-def flatten_flat(tree, state: TuiState, now: datetime | None) -> list[Row]:
+def flatten_flat(tree, state: TuiState, now: Optional[datetime]) -> List[Row]:
     """平坦模式：忽略 方向/船/IPC 分群，全船隊裝置壓成單一表格（純函式）。
 
     全部 depth=0、kind='device'，key 與分群模式同一組 ("D", mode, vessel, ipc, component)。
@@ -388,13 +388,13 @@ def flatten_flat(tree, state: TuiState, now: datetime | None) -> list[Row]:
     ]
 
 
-def visible_rows(tree, state: TuiState, now: datetime | None) -> list[Row]:
+def visible_rows(tree, state: TuiState, now: Optional[datetime]) -> List[Row]:
     """依 state.flat 選壓平方式；_main_loop 只呼叫這一個，分支不外流到 curses 層。"""
     return flatten_flat(tree, state, now) if state.flat else flatten_tree(tree, state, now)
 
 
-def all_group_keys(tree) -> list[tuple]:
-    keys: list[tuple] = []
+def all_group_keys(tree) -> List[tuple]:
+    keys: List[tuple] = []
     for m in tree:
         keys.append(("M", m.mode))
         for v in m.vessels:
@@ -420,7 +420,7 @@ def seed_expanded(tree, state: TuiState) -> None:
                 consider(("I", m.mode, v.name, ip.name), ip.summary)
 
 
-def global_counts(tree) -> tuple[int, int, int, int]:
+def global_counts(tree) -> Tuple[int, int, int, int]:
     t = o = s = b = 0
     for m in tree:
         t += m.summary.total
@@ -486,14 +486,14 @@ def set_query(state: TuiState, q: str) -> None:
     state.scroll = 0
 
 
-def selected_index(rows: list[Row], state: TuiState) -> int:
+def selected_index(rows: List[Row], state: TuiState) -> int:
     for i, r in enumerate(rows):
         if r.key == state.sel_key:
             return i
     return 0
 
 
-def clamp_selection(rows: list[Row], state: TuiState) -> None:
+def clamp_selection(rows: List[Row], state: TuiState) -> None:
     if not rows:
         state.sel_key = None
         return
@@ -501,7 +501,7 @@ def clamp_selection(rows: list[Row], state: TuiState) -> None:
         state.sel_key = rows[0].key
 
 
-def move_selection(rows: list[Row], state: TuiState, delta: int) -> None:
+def move_selection(rows: List[Row], state: TuiState, delta: int) -> None:
     if not rows:
         state.sel_key = None
         return
@@ -509,7 +509,7 @@ def move_selection(rows: list[Row], state: TuiState, delta: int) -> None:
     state.sel_key = rows[max(0, min(len(rows) - 1, idx + delta))].key
 
 
-def parent_key(key: tuple) -> tuple | None:
+def parent_key(key: tuple) -> Optional[tuple]:
     if key[0] == "D":
         return ("I",) + key[1:4]
     if key[0] == "I":
@@ -519,7 +519,7 @@ def parent_key(key: tuple) -> tuple | None:
     return None
 
 
-def reveal(state: TuiState, key: tuple | None) -> None:
+def reveal(state: TuiState, key: Optional[tuple]) -> None:
     """展開 key 的所有祖先群組，讓它在分群模式必然可見。"""
     k = parent_key(key) if key else None
     while k:
@@ -527,7 +527,7 @@ def reveal(state: TuiState, key: tuple | None) -> None:
         k = parent_key(k)
 
 
-def collapse_or_parent(state: TuiState, row: Row | None) -> None:
+def collapse_or_parent(state: TuiState, row: Optional[Row]) -> None:
     """←/h：先收合自己，否則跳回父群；平坦模式沒有父群故不跳。
 
     平坦模式若跳父群，sel_key 會被設成不存在的 ("I", …)，clamp_selection 只能彈回
@@ -545,7 +545,7 @@ def collapse_or_parent(state: TuiState, row: Row | None) -> None:
         state.sel_key = pk
 
 
-def key_action(ch: int) -> str | None:
+def key_action(ch: int) -> Optional[str]:
     """把原始按鍵碼映射成動作標籤（純函式，可測；curses.KEY_* 為模組常數）。"""
     if ch == ord("q"):
         return "quit"
@@ -592,7 +592,7 @@ def key_action(ch: int) -> str | None:
     return None
 
 
-def mouse_event_kind(bstate: int) -> str | None:
+def mouse_event_kind(bstate: int) -> Optional[str]:
     """把 curses bstate 正規化；只處理本介面用得到的按鈕，不理會移動／放開事件。"""
     if bstate & _MOUSE_WHEEL_UP:
         return "wheel_up"
@@ -633,13 +633,13 @@ def _flatten_cell(s: str) -> str:
     return "".join(" " if ch < " " else ch for ch in s)
 
 
-def csv_rows(rows: list[list[str]]) -> list[CsvRow]:
+def csv_rows(rows: List[List[str]]) -> List[CsvRow]:
     """把原始 CSV 列拆成顯示用的 CsvRow。
 
     device_name / version_info 在同一份 log 的每列都相同（`_CSVFileHandler` 的實例屬性），
     放標題列就好、不佔格線欄位；格線只留 時間｜級別｜訊息。
     """
-    out: list[CsvRow] = []
+    out: List[CsvRow] = []
     for row in rows:
         ts, _dev, _ver, level, message = (list(row) + [""] * 5)[:5]
         out.append(
@@ -668,7 +668,7 @@ def csv_header_line(hoff: int, width: int) -> str:
     return csv_line(CsvRow("時間", "級別", label), 0, width)
 
 
-def csv_sort_rows(rows: list[CsvRow], key: str, desc: bool) -> list[CsvRow]:
+def csv_sort_rows(rows: List[CsvRow], key: str, desc: bool) -> List[CsvRow]:
     """依欄位排序（穩定）：同鍵值維持原始時間順序，log 的脈絡才不會被打散。"""
     if key == "級別":
         ranked = sorted(rows, key=lambda r: _LEVEL_RANK.get(r.level.strip().upper(), 0),
@@ -693,7 +693,7 @@ class CsvView:
     desc: bool = False
 
 
-def csv_key_action(ch: int) -> str | None:
+def csv_key_action(ch: int) -> Optional[str]:
     """CSV 檢視的按鍵映射（純函式，可測；curses.KEY_* 為模組常數）。"""
     if ch in (ord("q"), ord("Q"), 27):  # 27=Esc：逐層往上回明細
         return "close"
@@ -722,7 +722,7 @@ def csv_key_action(ch: int) -> str | None:
     return None
 
 
-def csv_mouse_action(y: int, bstate: int, maxy: int) -> str | None:
+def csv_mouse_action(y: int, bstate: int, maxy: int) -> Optional[str]:
     """CSV 全畫面檢視的滑鼠映射：滾輪捲動，右鍵或點底列返回。
 
     Shift+滾輪若終端機有傳遞修飾鍵，改為水平捲動；沒傳遞時仍是一般垂直捲動。
@@ -859,7 +859,7 @@ def _enable_mouse() -> bool:
     return bool(available)
 
 
-def _read_mouse() -> tuple[int, int, int] | None:
+def _read_mouse() -> Optional[Tuple[int, int, int]]:
     """安全讀取目前滑鼠事件，回傳 (x, y, bstate)。佇列競態或無事件時忽略。"""
     try:
         _device_id, x, y, _z, bstate = curses.getmouse()
@@ -938,7 +938,7 @@ def body_top(maxy: int, state: TuiState) -> int:
 
 
 def mouse_row_index(y: int, *, maxy: int, state: TuiState,
-                    scroll: int, total: int) -> int | None:
+                    scroll: int, total: int) -> Optional[int]:
     """把螢幕 y 座標換成 rows 索引；表頭、欄名、底列及空白區都回傳 None。"""
     top = body_top(maxy, state)
     bottom = min(top + body_height(maxy, state), max(0, maxy - 1))
@@ -948,8 +948,8 @@ def mouse_row_index(y: int, *, maxy: int, state: TuiState,
     return idx if 0 <= idx < total else None
 
 
-def main_mouse_action(x: int, y: int, bstate: int, rows: list[Row],
-                      state: TuiState, maxy: int) -> tuple[str | None, int | None]:
+def main_mouse_action(x: int, y: int, bstate: int, rows: List[Row],
+                      state: TuiState, maxy: int) -> Tuple[Optional[str], Optional[int]]:
     """主列表滑鼠事件 → (動作, 列索引)，供 curses 迴圈與純邏輯測試共用。"""
     kind = mouse_event_kind(bstate)
     if kind in ("wheel_up", "wheel_down"):
@@ -977,7 +977,7 @@ def footer_hint(state: TuiState) -> str:
             "  /搜尋  m方向  s狀態  p異常  r重載  ?說明  q離開")
 
 
-def _draw(stdscr, state: TuiState, rows: list[Row], tree, watch: float) -> None:
+def _draw(stdscr, state: TuiState, rows: List[Row], tree, watch: float) -> None:
     stdscr.erase()
     maxy, maxx = stdscr.getmaxyx()
     width = maxx - 1
@@ -1041,7 +1041,7 @@ def _draw(stdscr, state: TuiState, rows: list[Row], tree, watch: float) -> None:
 
 
 def popup_mouse_action(x: int, y: int, bstate: int, *,
-                       x0: int, y0: int, w: int, h: int) -> str | None:
+                       x0: int, y0: int, w: int, h: int) -> Optional[str]:
     """彈窗滑鼠映射：滾輪瀏覽、內部左鍵啟動、外部左鍵或右鍵關閉。"""
     kind = mouse_event_kind(bstate)
     if kind in ("wheel_up", "wheel_down", "close"):

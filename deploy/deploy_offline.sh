@@ -203,6 +203,14 @@ usage() { awk 'NR == 1 { next } !/^#/ { exit } { sub(/^# ?/, ""); print }' "$0";
 RC=0
 run_rc() { RC=0; "$@" || RC=$?; }
 
+# wheelhouse 裡有沒有這個套件的輪子。wheel 檔名的 name 欄位用底線與大小寫變體,
+# 比對前一起正規化(PEP 503)。
+wheelhouse_has() {  # $1 = 套件名, $2 = wheelhouse 目錄
+  local norm; norm="$(printf '%s' "$1" | tr 'A-Z_.' 'a-z--')"
+  find "$2" -maxdepth 1 -name '*.whl' -printf '%f\n' 2>/dev/null \
+    | sed 's/-.*//' | tr 'A-Z_.' 'a-z--' | grep -qx "$norm"
+}
+
 # 是非題。提示文字（含 "[Y/n]" / "[y/N]"）由呼叫點自帶：它同時是給操作者看的說明**和**
 # 預設值的宣告，分開寫必然會有一天不一致。$2 是「直接按 Enter」與非互動時採用的預設。
 #
@@ -1298,8 +1306,32 @@ stage_wheelhouse_and_venv() {
   # --- 執行離線安裝 ----------------------------------------------------------
   RUNTIME_PKGS=(paramiko bcrypt cryptography pynacl cffi pycparser invoke typing-extensions)
   TEST_PKGS=(pytest pytest-cov coverage pluggy iniconfig packaging pygments tomli exceptiongroup)
+  # 只有舊平台才需要的標準庫 backport。dataclasses 是 3.7 才進標準庫,而
+  # monitor/log_monitor.py、monitor/tui.py、run_selected_transfers.py、pack_upload.py
+  # 都用 @dataclass —— Bionic 的 venv 是 3.6,少了它那四支人工工具一律
+  # ModuleNotFoundError(在 Bionic 開發機 192.168.6.230 實測確認)。
+  #
+  # 與 TEST_PKGS 同樣走「wheelhouse 有才裝」而**不是**放進 RUNTIME_PKGS:Jammy 的
+  # wheelhouse 刻意不放它(3.10 已內建,而 dataclasses==0.8 的 python_requires 是
+  # >=3.6,<3.7,pip 在 3.10 上本來就會拒絕)。放進 RUNTIME_PKGS 會讓 preflight 在
+  # Jammy 上把「正確地不存在」判成缺件。也刻意不受 --skip-tests 影響:那四支工具是
+  # 給人用的,不屬於測試堆疊。
+  BACKPORT_PKGS=(dataclasses)
 
   PKGS=("${RUNTIME_PKGS[@]}")
+  local missing_backports=()
+  for pkg in "${BACKPORT_PKGS[@]}"; do
+    if wheelhouse_has "$pkg" "$WHEELHOUSE"; then
+      PKGS+=("$pkg")
+    else
+      missing_backports+=("$pkg")
+    fi
+  done
+  if [ "${#missing_backports[@]}" -gt 0 ]; then
+    info "標準庫 backport: 本 profile 無 ${missing_backports[*]}（該版 Python 內建則屬正常）"
+  else
+    info "標準庫 backport: ${BACKPORT_PKGS[*]}（舊平台的 3.6 需要）"
+  fi
   if [ "$INSTALL_TESTS" -eq 1 ]; then
     # 執行期相依是**必須**的（preflight 的 wheel_compat.py 已經強制它們存在）；
     # 測試堆疊則按 wheelhouse 實際有什麼裝什麼。理由：同一份清單套到不同 Python 會有
@@ -1308,10 +1340,7 @@ stage_wheelhouse_and_venv() {
     # 為此讓整個部署失敗是不對的：測試堆疊不是船上跑服務的必要條件。
     local skipped=()
     for pkg in "${TEST_PKGS[@]}"; do
-      # wheel 檔名的 name 欄位用底線與大小寫變體，比對前一起正規化（PEP 503）。
-      local norm; norm="$(printf '%s' "$pkg" | tr 'A-Z_.' 'a-z--')"
-      if find "$WHEELHOUSE" -maxdepth 1 -name '*.whl' -printf '%f\n' 2>/dev/null \
-         | sed 's/-.*//' | tr 'A-Z_.' 'a-z--' | grep -qx "$norm"; then
+      if wheelhouse_has "$pkg" "$WHEELHOUSE"; then
         PKGS+=("$pkg")
       else
         skipped+=("$pkg")

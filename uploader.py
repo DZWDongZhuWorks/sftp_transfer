@@ -46,6 +46,15 @@ class SFTPUploader(SFTPBase):
         except FileNotFoundError:
             return False
 
+    def _handle_symlink(self, local_path, rel_path):
+        """走訪遇到 symlink 時的掛鉤；回傳 True 代表已自行處理、不再往下走訪。
+
+        預設回傳 False，也就是沿用「跟著連結看實體」的既有行為：SFTP 遠端沒有
+        可靠的 symlink 語意，上傳仍需把連結解析成實際的檔案或資料夾。只有把內容
+        封裝成 tar 時（見 pack_upload.py）才會覆寫成保留連結本身。
+        """
+        return False
+
     def _list_local_files(self, source, remote_root):
         """回傳 [(本地絕對路徑, rel_path)]。rel_path 一律以 / 分隔，作為遠端相對路徑與 manifest 的鍵。"""
         files = []
@@ -69,6 +78,8 @@ class SFTPUploader(SFTPBase):
                     continue
                 elif self._is_ignored(name):
                     self.logger.info(f"依忽略設定檔略過: {name}")
+                elif full.is_symlink() and self._handle_symlink(full, name):
+                    continue
                 else:
                     files.append((full, name))
             if skipped_dirs:
@@ -95,9 +106,14 @@ class SFTPUploader(SFTPBase):
                 if self._is_ignored(rel_path + "/"):
                     self.logger.info(f"依忽略設定檔略過資料夾: {rel_path}/")
                     continue
+                # 目錄連結先問掛鉤；沒人接手就照舊跟進去，等同於把連結解析成實體內容。
+                if full.is_symlink() and self._handle_symlink(full, rel_path):
+                    continue
                 self._walk_local_dir(full, rel_path, files, remote_root)
             elif self._is_ignored(rel_path):
                 self.logger.info(f"依忽略設定檔略過: {rel_path}")
+            elif full.is_symlink() and self._handle_symlink(full, rel_path):
+                continue
             else:
                 files.append((full, rel_path))
 

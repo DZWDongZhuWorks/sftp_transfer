@@ -3,6 +3,10 @@
 此工具不建立任何網路連線。選檔、gitignore 規則、內建 manifest/暫存檔排除，
 以及 local_path/remote_path 的多來源映射，都直接沿用 :class:`SFTPUploader`。
 
+與 SFTP 上傳的差別在符號連結：tar 能表達連結本身，因此指向封裝範圍內的
+symlink 會原樣保留；指向範圍外（絕對路徑或跳出來源根目錄）的連結若照樣保留，
+解開後會指向目的端不存在的路徑，所以仍沿用上傳端的行為改存實際內容。
+
 用法：
     python pack_upload.py --config config/radar_upload_settings.json --output radar.tar
 """
@@ -44,12 +48,22 @@ class ArchiveDirectory:
 
 
 @dataclass(frozen=True)
+class ArchiveSymlink:
+    """一個保留原樣的 tar 符號連結成員；target 為連結字面值，不做解析。"""
+
+    source: Path
+    archive_path: str
+    target: str
+
+
+@dataclass(frozen=True)
 class ArchivePlan:
     """完成 ignore 與目的路徑映射後的封裝計畫。"""
 
     directories: tuple
     files: tuple
     total_bytes: int
+    symlinks: tuple = ()
 
 
 class _LocalUploadPlanner(SFTPUploader):
@@ -58,11 +72,37 @@ class _LocalUploadPlanner(SFTPUploader):
     def __init__(self, *args, **kwargs):
         super().__init__(*args, **kwargs)
         self.planned_remote_dirs = []
+        self.planned_symlinks = []
+        # 由 build_archive_plan 在走訪每個來源前設定，作為「封裝範圍」的判準。
+        self.pack_source_root = None
 
     def _ensure_remote_dir(self, remote_dir):
         # SFTPUploader._walk_local_dir 會在這裡建立遠端資料夾；封裝模式只記下
         # 同一個目的路徑，稍後轉成 tar 的資料夾成員。
         self.planned_remote_dirs.append(str(remote_dir))
+
+    def _handle_symlink(self, local_path, rel_path):
+        local_path = Path(local_path)
+        target = os.readlink(local_path)
+        if self._points_inside_source(local_path):
+            # 目標同在來源樹內，代表它也會被封進同一個 tar，連結解開後依然成立。
+            self.planned_symlinks.append((local_path, rel_path))
+            return True
+        if not local_path.exists():
+            # 指向範圍外又是斷鏈：沒有內容可存，保留連結也只會在目的端斷掉。
+            self.logger.warning(f"略過指向封裝範圍外的斷鏈符號連結: {rel_path} -> {target}")
+            return True
+        self.logger.warning(f"符號連結指向封裝範圍外，改存實際內容: {rel_path} -> {target}")
+        return False
+
+    def _points_inside_source(self, local_path):
+        """連結解析後是否仍落在目前來源根目錄內（含根目錄本身）。"""
+        root = self.pack_source_root
+        if root is None or os.path.isabs(os.readlink(local_path)):
+            return False
+        # strict=False：斷鏈連結也要能判斷，指向來源內的斷鏈仍值得原樣保留。
+        resolved = local_path.resolve(strict=False)
+        return resolved == root or root in resolved.parents
 
 
 def load_pack_settings(config_path):
@@ -197,6 +237,7 @@ def build_archive_plan(settings, excluded_paths=(), logger=None):
     excluded = _resolved_paths(excluded_paths)
     directories = {}
     files = {}
+    symlinks = {}
 
     for job_sources, remote_root in jobs:
         for local in job_sources:
@@ -204,9 +245,12 @@ def build_archive_plan(settings, excluded_paths=(), logger=None):
             if not source.exists():
                 continue
 
+            planner.pack_source_root = source.resolve(strict=False)
             first_dir = len(planner.planned_remote_dirs)
+            first_link = len(planner.planned_symlinks)
             selected_files = planner._list_local_files(source, remote_root)
             new_remote_dirs = planner.planned_remote_dirs[first_dir:]
+            new_symlinks = planner.planned_symlinks[first_link:]
 
             for remote_dir in new_remote_dirs:
                 archive_path = _to_archive_path(remote_dir, archive_base)
@@ -214,13 +258,19 @@ def build_archive_plan(settings, excluded_paths=(), logger=None):
                     continue
                 rel_dir = _relative_remote_dir(remote_dir, remote_root)
                 local_dir = source if not rel_dir else source.joinpath(*PurePosixPath(rel_dir).parts)
-                if archive_path in files:
+                if archive_path in files or archive_path in symlinks:
                     raise ValueError(f"目的路徑同時是檔案與資料夾: {archive_path}")
+                if local_dir.is_symlink():
+                    local_dir = local_dir.resolve(strict=False)
                 directories[archive_path] = local_dir
                 _add_parent_directories(directories, archive_path)
 
             for local_file, rel_path in selected_files:
                 local_file = Path(local_file)
+                if local_file.is_symlink():
+                    # 走到這裡的連結都是已決定「存實際內容」的；tar 不再跟隨連結，
+                    # 因此成員來源要換成解析後的實體路徑。
+                    local_file = local_file.resolve(strict=False)
                 if local_file.resolve(strict=False) in excluded:
                     logger.warning(f"輸出 tar 位於來源內，已避免把 tar 自己封裝進去: {local_file}")
                     continue
@@ -232,13 +282,29 @@ def build_archive_plan(settings, excluded_paths=(), logger=None):
                     raise ValueError(f"目的路徑同時是檔案與資料夾: {archive_path}")
                 if archive_path in files and files[archive_path] != local_file:
                     logger.warning(f"多個來源都含有 {archive_path}，tar 以後面的來源為準: {source}")
+                if symlinks.pop(archive_path, None) is not None:
+                    logger.warning(f"多個來源都含有 {archive_path}，tar 以後面的來源為準: {source}")
                 files[archive_path] = local_file
+                _add_parent_directories(directories, archive_path)
+
+            for local_link, rel_path in new_symlinks:
+                remote_link = _join_remote(remote_root, rel_path)
+                archive_path = _to_archive_path(remote_link, archive_base)
+                if not archive_path:
+                    raise ValueError(f"符號連結無法映射成有效的 tar 路徑: {local_link}")
+                if archive_path in directories:
+                    raise ValueError(f"目的路徑同時是檔案與資料夾: {archive_path}")
+                if files.pop(archive_path, None) is not None:
+                    logger.warning(f"多個來源都含有 {archive_path}，tar 以後面的來源為準: {source}")
+                symlinks[archive_path] = (local_link, os.readlink(local_link))
                 _add_parent_directories(directories, archive_path)
 
     # 父路徑若已被另一個來源規劃成檔案，SFTP 上傳同樣無法成立；封裝時提早報錯。
     for archive_path in directories:
-        if archive_path in files:
+        if archive_path in files or archive_path in symlinks:
             raise ValueError(f"目的路徑同時是檔案與資料夾: {archive_path}")
+
+    _warn_unpacked_symlink_targets(symlinks, files, directories, logger)
 
     directory_entries = tuple(
         ArchiveDirectory(source=directories[name], archive_path=name)
@@ -248,15 +314,33 @@ def build_archive_plan(settings, excluded_paths=(), logger=None):
         ArchiveFile(source=files[name], archive_path=name)
         for name in sorted(files)
     )
+    symlink_entries = tuple(
+        ArchiveSymlink(source=symlinks[name][0], archive_path=name, target=symlinks[name][1])
+        for name in sorted(symlinks)
+    )
     try:
         total_bytes = sum(entry.source.stat().st_size for entry in file_entries)
     except OSError as e:
         raise ValueError(f"計算來源檔案大小失敗: {e}") from e
-    return ArchivePlan(directory_entries, file_entries, total_bytes)
+    return ArchivePlan(directory_entries, file_entries, total_bytes, symlink_entries)
+
+
+def _warn_unpacked_symlink_targets(symlinks, files, directories, logger):
+    """連結目標可能被忽略規則排除；那種連結解開後會是斷鏈，值得先講一聲。"""
+    members = set(files) | set(directories) | set(symlinks)
+    for name in sorted(symlinks):
+        target = symlinks[name][1]
+        resolved = posixpath.normpath(posixpath.join(posixpath.dirname(name), target))
+        if resolved in (".", "") or resolved.startswith(".."):
+            # 指向封裝根目錄本身或更外層，成不成立要看解開的位置，不在這裡判斷。
+            continue
+        if resolved not in members:
+            logger.warning(f"符號連結的目標未納入封裝，解開後會是斷鏈: {name} -> {target}")
 
 
 def _portable_tarinfo(info):
     """保留權限與 mtime，但不把本機帳號、群組資訊寫入可攜式封裝。"""
+    # 註：符號連結成員的 mode 在解開時會被忽略，這裡不特別處理。
     info.uid = 0
     info.gid = 0
     info.uname = ""
@@ -275,7 +359,9 @@ def write_archive(plan, output_path, force=False):
     os.close(fd)
     temp_path = Path(temp_name)
     try:
-        with tarfile.open(temp_path, mode="w", format=tarfile.PAX_FORMAT, dereference=True) as archive:
+        # dereference=False：符號連結成員要存成連結本身。需要存實際內容的來源，
+        # build_archive_plan 已經先解析成實體路徑了。
+        with tarfile.open(temp_path, mode="w", format=tarfile.PAX_FORMAT, dereference=False) as archive:
             for entry in plan.directories:
                 if entry.source is None:
                     info = tarfile.TarInfo(entry.archive_path + "/")
@@ -291,6 +377,14 @@ def write_archive(plan, output_path, force=False):
                         filter=_portable_tarinfo,
                     )
             for entry in plan.files:
+                archive.add(
+                    str(entry.source),
+                    arcname=entry.archive_path,
+                    recursive=False,
+                    filter=_portable_tarinfo,
+                )
+            # 連結最後寫入：目標成員都已就位，解開的順序才不會受影響。
+            for entry in plan.symlinks:
                 archive.add(
                     str(entry.source),
                     arcname=entry.archive_path,
@@ -349,8 +443,9 @@ def main(argv=None):
         if output.exists() and not args.force:
             raise FileExistsError(f"輸出檔已存在（如要覆蓋請加 --force）: {output.resolve()}")
         plan = build_archive_plan(settings, excluded_paths=(output,), logger=logger)
+        symlink_note = f"、{len(plan.symlinks)} 個符號連結" if plan.symlinks else ""
         print(
-            f"準備封裝 {len(plan.files)} 個檔案、{len(plan.directories)} 個資料夾"
+            f"準備封裝 {len(plan.files)} 個檔案、{len(plan.directories)} 個資料夾{symlink_note}"
             f"（來源資料 {_format_size(plan.total_bytes)}）...",
             flush=True,
         )

@@ -123,6 +123,34 @@ class TestListLocalFiles:
 
         assert sorted(rel for _, rel in files) == ["keep.txt", "up_ignore.txt"]
 
+    def test_symlinks_are_still_followed_by_default(self, uploader_factory, fake_sftp_factory, tmp_path):
+        """_handle_symlink 預設不接手，SFTP 上傳仍把連結解析成實體檔案與資料夾。
+
+        pack_upload 會覆寫這個掛鉤以保留連結；這裡釘住「上傳端不受影響」的契約。
+        """
+        _write(tmp_path / "realdir" / "a.txt", b"a")
+        (tmp_path / "filelink").symlink_to("realdir/a.txt")
+        (tmp_path / "dirlink").symlink_to("realdir")
+        d = uploader_factory(recursive=True)
+        d.sftp = fake_sftp_factory(files={})
+
+        files = d._list_local_files(tmp_path, "/remote")
+
+        assert sorted(rel for _, rel in files) == ["dirlink/a.txt", "filelink", "realdir/a.txt"]
+
+    def test_symlink_hook_can_take_over_the_walk(self, uploader_factory, fake_sftp_factory, tmp_path):
+        _write(tmp_path / "realdir" / "a.txt", b"a")
+        (tmp_path / "dirlink").symlink_to("realdir")
+        d = uploader_factory(recursive=True)
+        d.sftp = fake_sftp_factory(files={})
+        seen = []
+        d._handle_symlink = lambda local_path, rel_path: (seen.append(rel_path), True)[1]
+
+        files = d._list_local_files(tmp_path, "/remote")
+
+        assert seen == ["dirlink"]
+        assert sorted(rel for _, rel in files) == ["realdir/a.txt"]
+
 
 class TestNextRemoteDuplicatePath:
     def test_first_duplicate_uses_suffix(self, uploader_factory, fake_sftp_factory):

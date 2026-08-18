@@ -172,3 +172,64 @@ def test_timers_list_covers_every_scheduler_timer(fake_systemd):
     assert on_disk, f"{timers_dir} 內沒有任何 .timer"
     missing = on_disk - set(hc.TIMERS)
     assert not missing, f"TIMERS 沒涵蓋:{sorted(missing)}"
+
+
+def test_ipc3_n_a_timer_is_skip_when_absent(fake_systemd, monkeypatch, tmp_path):
+    """IPC3 沒有 failover/web 工作負載；未安裝限制型 timer 是正確狀態。"""
+    monkeypatch.setattr(hc, "USER_UNIT_DIR", tmp_path / "units")
+    absent = {
+        "LoadState": "not-found",
+        "UnitFileState": "",
+        "ActiveState": "inactive",
+        "SubState": "dead",
+        "Result": "success",
+    }
+    fake_systemd["nssms-download-photos.timer"] = absent
+    fake_systemd["nssms-download-photos.service"] = absent
+
+    hc.check_timers(strict_wave=False, role="ipc3")
+
+    assert timer_checks()["nssms-download-photos.timer"] == "SKIP"
+    assert timer_checks()["nssms-warm-env.timer"] == "PASS"
+
+
+def test_ipc3_n_a_timer_fails_if_still_active(fake_systemd, monkeypatch, tmp_path):
+    """Bionic 曾忽略 ExecCondition；IPC3 上殘留且 active 的 timer 必須浮成 FAIL。"""
+    monkeypatch.setattr(hc, "USER_UNIT_DIR", tmp_path / "units")
+    fake_systemd["nssms-download-photos.timer"] = HEALTHY_TIMER
+    fake_systemd["nssms-download-photos.service"] = HEALTHY_ONESHOT
+
+    hc.check_timers(strict_wave=False, role="ipc3")
+
+    assert timer_checks()["nssms-download-photos.timer"] == "FAIL"
+
+
+def test_ipc3_identity_ignores_failover_flag(monkeypatch, tmp_path):
+    vessel_info = tmp_path / "vessel.json"
+    vessel_info.write_text(
+        '{"vsl_name":"WH102","ipc":"IPC3","failover":true}', encoding="utf-8"
+    )
+    monkeypatch.setattr(hc, "VESSEL_INFO", vessel_info)
+    monkeypatch.setattr(hc, "LEGACY_FAILOVER_STATE", tmp_path / "absent.json")
+    monkeypatch.setattr(hc, "_COMPACT", True)
+    hc.RESULTS.clear()
+
+    vessel, role = hc.check_identity()
+
+    assert (vessel, role) == ("WH102", "ipc3")
+    takeover = next(c for c in hc.RESULTS if c.name == "接管狀態")
+    assert takeover.status == "WARN"
+    assert "忽略" in takeover.detail
+
+
+def test_ipc3_heartbeat_probe_is_skip_without_config(monkeypatch, tmp_path):
+    """IPC3 不需要 failover/config.json，更不應實際開 socket 探測。"""
+    monkeypatch.setattr(hc, "FAILOVER_DIR", tmp_path / "missing-failover")
+    monkeypatch.setattr(hc, "_COMPACT", True)
+    hc.RESULTS.clear()
+
+    hc.heartbeat_probe("ipc3")
+
+    check = next(c for c in hc.RESULTS if c.name == "角色探針")
+    assert check.status == "SKIP"
+    assert "不參與" in check.detail

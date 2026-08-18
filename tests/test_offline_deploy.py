@@ -231,6 +231,7 @@ class OfflineDeployTests(unittest.TestCase):
         fake_python.write_text(
             "#!/usr/bin/env bash\n"
             "case \"${2:-}\" in\n"
+            "  *base_prefix*) exit 0 ;;\n"
             "  *join*) printf '3.6.15\\n'; exit 0 ;;\n"
             "  *cp\\%d\\%d*) printf 'cp36\\n'; exit 0 ;;\n"
             "  *version_info\\[:2\\]*) printf '3.6\\n'; exit 0 ;;\n"
@@ -262,6 +263,34 @@ class OfflineDeployTests(unittest.TestCase):
         self.assertIn("cp36；船端預安裝", proc.stdout)
         self.assertNotIn("portable Python", proc.stdout)
         self.assertEqual(list(fake_home.iterdir()), [])
+
+    def test_virtualenv_bootstrap_rejects_an_active_venv_before_pip_user(self):
+        """WH102-3 的實際失敗：venv 內的 pip --user 必定不可見，應提早說明原因。"""
+        fake_python = self.temp_dir / "venv-python"
+        calls = self.temp_dir / "python.calls"
+        fake_python.write_text(
+            "#!/usr/bin/env bash\n"
+            "printf '%s\\n' \"$*\" >> \"${CALLS_FILE}\"\n"
+            "case \"$*\" in *base_prefix*) exit 1 ;; esac\n"
+            "exit 0\n",
+            encoding="utf-8",
+        )
+        fake_python.chmod(0o755)
+        env = dict(os.environ)
+        env.update({"PYTHON_BIN": str(fake_python), "CALLS_FILE": str(calls)})
+
+        proc = subprocess.run(
+            ["bash", str(DEPLOY_DIR / "install_virtualenv_offline.sh")],
+            cwd=str(PROJECT_DIR),
+            env=env,
+            universal_newlines=True,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.STDOUT,
+        )
+
+        self.assertEqual(proc.returncode, 1, proc.stdout)
+        self.assertIn("位於虛擬環境", proc.stdout)
+        self.assertNotIn("-m pip install", calls.read_text(encoding="utf-8"))
 
     def test_rejects_unsafe_venv_target_before_preflight(self):
         proc = subprocess.run(

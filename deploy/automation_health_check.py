@@ -65,19 +65,15 @@ TAKEOVER_WARN_HOURS = 24
 # reboot_launcher 的 OTA（SFTP 拉碼）與全相位起服務，船上慢網也該在十幾分鐘內收工。
 BOOT_ACTIVATING_FAIL_SECONDS = 900
 
-CORE_SERVICES = ("nssms-boot.service", "nssms-heartbeat.service")
-# nssms-download-photos 只在實體 IPC-2 上真的執行,閘門是 unit 的 ExecCondition。它仍然列在
-# 這裡而不開特例:timer 本身在三台都是 enabled + active/waiting,而被 ExecCondition 跳過的
-# service 是 inactive/dead + Result=exec-condition —— 兩者都落在 check_timers /
-# evaluate_service 既有的健康判定範圍內。
+# nssms-download-photos 只佈署在實體 IPC-2；device_monitor、shipboard upload 與 heartbeat
+# 只佈署在 IPC1/IPC2。適用範圍由 unit 內的 `# NSSMS-BaseIPC=...` 宣告，本巡檢與兩支
+# installer 共用該契約，IPC3 上的 N/A 不會被誤報成缺件。
 #
 # nssms-cleanup-old-files 兩台都跑、刻意沒有角色閘門（碟會滿是兩台各自的事）。它出貨時
 # 規則檔整份 enabled=false，所以正常一輪是「只預覽、零刪除」—— 對本巡檢而言仍是
 # active/waiting + Result=success，不需要特例。
 #
-# nssms-shipboard-alert-upload 同樣兩台都跑、刻意沒有角色閘門：UPLOAD_DATA_DIR 只在
-# 目前實際跑 web_server 的那台有內容，另一台 docker inspect 問不到容器就直接 exit 0。
-# 所以 standby 上「Result=success 但什麼都沒做」是正常現象，不是漏跑，不需要特例。
+# nssms-shipboard-alert-upload 在 IPC1/IPC2 都跑；有效角色不影響它，IPC3 則為 N/A。
 #
 # 【勿在下面的 tuple 內寫含括號的註解】device_monitor/tests/test_integration.sh 的涵蓋度斷言
 # 用 `^TIMERS = \((.*?)\)` 抓這個 tuple,非貪婪會停在**第一個**右括號:註解裡的括號會把清單
@@ -250,7 +246,7 @@ def check_identity():
         info = read_json(VESSEL_INFO)
         vessel = str(info.get("vsl_name", "")).strip() or "unknown"
         ipc = normalize_ipc(str(info.get("ipc", "")))
-        if ipc in {"ipc1", "ipc2"}:
+        if ipc in {"ipc1", "ipc2", "ipc3"}:
             role = ipc
             record("identity", "船舶／IPC 身分", "PASS", f"{vessel} / {ipc}")
         else:
@@ -286,6 +282,13 @@ def check_identity():
         else:
             record("identity", "接管狀態", "INFO",
                    f"{role}（接管 {peer}），已持續 {age_h:.1f} 小時，since={since_desc}")
+    elif role == "ipc3" and _failover_on(info.get("failover")):
+        # IPC3 不在接管拓撲內；不可把它推成 ipc3emer，也不可啟動 heartbeat。保留告警，
+        # 讓操作者知道身分檔有不應存在的殘留旗標，但後續仍以 ipc3 契約巡檢。
+        record(
+            "identity", "接管狀態", "WARN",
+            "IPC3 不參與 IPC1↔IPC2 failover；忽略身分檔的 failover=true（角色維持 ipc3）",
+        )
     elif info.get("failover") is not None:
         # 有欄位但不是真:白名單外的值一律視為未接管並告警(見 _failover_on)。
         record("identity", "接管狀態", "WARN",
@@ -388,7 +391,7 @@ def evaluate_service(
     return props
 
 
-def check_core_services() -> None:
+def check_core_services(role: str = "ipc1") -> None:
     heading("核心 services")
     boot = systemctl_show(
         "nssms-boot.service",
@@ -463,16 +466,29 @@ def check_core_services() -> None:
         and heartbeat.get("Result") == "success"
         and int(heartbeat.get("MainPID", "0") or "0") > 0
     )
-    record(
-        "units",
-        "nssms-heartbeat.service",
-        "PASS" if heartbeat_ok else "FAIL",
-        (
-            f"{heartbeat.get('ActiveState')}/{heartbeat.get('SubState')}, "
-            f"enabled={heartbeat.get('UnitFileState')}, "
-            f"pid={heartbeat.get('MainPID') or 'n/a'}"
-        ),
+    heartbeat_detail = (
+        f"{heartbeat.get('ActiveState')}/{heartbeat.get('SubState')}, "
+        f"enabled={heartbeat.get('UnitFileState')}, "
+        f"pid={heartbeat.get('MainPID') or 'n/a'}"
     )
+    if base_ipc(role) == "ipc3":
+        stale = (
+            heartbeat.get("UnitFileState") == "enabled"
+            or heartbeat.get("ActiveState") in {"active", "activating", "reloading"}
+        )
+        record(
+            "units",
+            "nssms-heartbeat.service",
+            "FAIL" if stale else "SKIP",
+            heartbeat_detail + ("；IPC3 不應啟用 heartbeat" if stale else "；IPC3 為 N/A"),
+        )
+    else:
+        record(
+            "units",
+            "nssms-heartbeat.service",
+            "PASS" if heartbeat_ok else "FAIL",
+            heartbeat_detail,
+        )
 
 
 def unit_source_path(unit):
@@ -488,7 +504,33 @@ def unit_source_path(unit):
     return None
 
 
-def check_unit_sources() -> None:
+def base_ipc(role: str) -> str:
+    return role[:-4] if role.endswith("emer") else role
+
+
+def unit_base_ipcs(source: Optional[Path]) -> Set[str]:
+    """讀取 installer 共用的 `# NSSMS-BaseIPC=...` 契約；空集合代表全 IPC 通用。"""
+    if source is None:
+        return set()
+    try:
+        lines = source.read_text(encoding="utf-8").splitlines()
+    except OSError:
+        return set()
+    prefix = "# NSSMS-BaseIPC="
+    for raw in reversed(lines):
+        if raw.startswith(prefix):
+            return {item.strip() for item in raw[len(prefix):].split(",") if item.strip()}
+    return set()
+
+
+def unit_applicable(unit: str, role: str) -> bool:
+    # timer 的適用性宣告放在同 stem 的 service，讓 service/timer 成對處理。
+    contract_unit = unit[:-5] + "service" if unit.endswith(".timer") else unit
+    allowed = unit_base_ipcs(unit_source_path(contract_unit))
+    return not allowed or base_ipc(role) in allowed
+
+
+def check_unit_sources(role: str = "ipc1") -> None:
     heading("unit 母體與實際安裝版本")
     # 常駐服務由 services/ 目錄列舉,不硬編碼名字 —— 新增一支就自動納入比對。
     units = sorted(p.name for p in SERVICES_DIR.glob("*.service")) if SERVICES_DIR.is_dir() else []
@@ -503,6 +545,18 @@ def check_unit_sources() -> None:
         if source is None or not source.exists():
             status = "SKIP" if unit.startswith(("nssms-wave-send", "nssms-wave-update")) else "FAIL"
             record("unit-sync", unit, status, "找不到 repo 母體")
+            continue
+        if not unit_applicable(unit, role):
+            allowed = ",".join(sorted(unit_base_ipcs(
+                unit_source_path(unit[:-5] + "service") if unit.endswith(".timer") else source
+            )))
+            record(
+                "unit-sync",
+                unit,
+                "FAIL" if installed.exists() else "SKIP",
+                (f"本機 {base_ipc(role)} 為 N/A（適用 {allowed}）；"
+                 + ("仍殘留已安裝 unit，請重跑對應安裝器" if installed.exists() else "未安裝，符合預期")),
+            )
             continue
         if not installed.exists():
             record("unit-sync", unit, "FAIL", f"尚未安裝至 {installed}")
@@ -537,7 +591,7 @@ def parse_execstart_targets(service_file):
     return targets
 
 
-def check_timers(strict_wave: bool) -> None:
+def check_timers(strict_wave: bool, role: str = "ipc2") -> None:
     heading("timers 與最近執行結果")
     for stem in TIMERS:
         optional = stem in OPTIONAL_WAVE
@@ -553,6 +607,28 @@ def check_timers(strict_wave: bool) -> None:
             "NextElapseUSecRealtime",
             "LastTriggerUSec",
         )
+        if not unit_applicable(service, role):
+            service_props = systemctl_show(
+                service, "LoadState", "UnitFileState", "ActiveState", "SubState"
+            )
+            installed = (USER_UNIT_DIR / timer).exists() or (USER_UNIT_DIR / service).exists()
+            live = (
+                timer_props.get("UnitFileState") == "enabled"
+                or timer_props.get("ActiveState") in {"active", "activating", "reloading"}
+                or service_props.get("ActiveState") in {"active", "activating", "reloading"}
+            )
+            stale = installed or live
+            allowed = ",".join(sorted(unit_base_ipcs(TIMERS_DIR / service)))
+            detail = f"本機 {base_ipc(role)} 為 N/A（適用 {allowed}）"
+            if stale:
+                detail += "；仍有已安裝或啟用的 unit，請重跑 install_timers.sh"
+            else:
+                detail += "；未安裝，符合預期"
+            status = "FAIL" if stale else "SKIP"
+            record("timers", timer, status, detail)
+            record("units", service, status, detail)
+            record("targets", f"{service} ExecStart", "SKIP", "本機 N/A，不檢查執行目標")
+            continue
         timer_ok = (
             timer_props.get("LoadState") == "loaded"
             and timer_props.get("UnitFileState") == "enabled"
@@ -694,6 +770,14 @@ def resolve_peer_addr(config: dict, peer: str) -> str:
 
 def heartbeat_probe(role: str) -> None:
     heading("heartbeat 實際探針")
+    base = base_ipc(role)
+    if base == "ipc3":
+        record("heartbeat", "角色探針", "SKIP", "IPC3 不參與 IPC1↔IPC2 failover")
+        return
+    if base not in {"ipc1", "ipc2"}:
+        record("heartbeat", "角色探針", "FAIL", f"未知角色：{role}")
+        return
+
     config_path = FAILOVER_DIR / "config.json"
     try:
         config = read_json(config_path)
@@ -701,11 +785,6 @@ def heartbeat_probe(role: str) -> None:
         timeout = min(float(config.get("timeout", 3)), 5.0)
     except Exception as exc:  # noqa: BLE001
         record("heartbeat", "設定檔", "FAIL", f"{config_path}: {exc}")
-        return
-
-    base = role[:-4] if role.endswith("emer") else role
-    if base not in {"ipc1", "ipc2"}:
-        record("heartbeat", "角色探針", "FAIL", f"未知角色：{role}")
         return
 
     # 心跳現在是雙向的:兩台都同時跑 responder 與 monitor,所以**每個角色**都要驗兩件事。
@@ -901,9 +980,9 @@ def main() -> int:
 
     vessel, role = check_identity()
     check_user_manager()
-    check_core_services()
-    check_unit_sources()
-    check_timers(args.strict_wave)
+    check_core_services(role)
+    check_unit_sources(role)
+    check_timers(args.strict_wave, role)
     check_failed_units(args.strict_wave)
     check_sudoers()
     heartbeat_probe(role)

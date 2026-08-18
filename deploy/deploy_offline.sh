@@ -19,7 +19,7 @@
 #         (start_web_docker.sh)跑在 systemd user session 裡、無法輸入 sudo 密碼,
 #         所以「免 sudo 使用 docker」是它能開機自啟的前提。群組變更需重開機才生效。
 #      5~7) 以下三步由**同一個問題**一併決定(它們是一個概念單位:週期排程與 ipc 接管):
-#         5) install_timers.sh      → 7 支週期排程 timer
+#         5) install_timers.sh      → 週期排程 timer（依實體 IPC 篩選）
 #         6) sudoers 白名單         → reboot / teamviewer 需要(這一步要輸入一次密碼)
 #         7) install_services.sh    → 4 支常駐服務:heartbeat(雙向心跳/接管)、
 #                                     alarm-controller / board-server / button(綁實體 IPC-1)
@@ -261,11 +261,19 @@ parse_args() {
   done
 
   if [ -z "$PYTHON_BIN" ]; then
-    if command -v python3.10 >/dev/null 2>&1; then
-      PYTHON_BIN="python3.10"
+    # 固定系統路徑優先，避免操作者從已啟用的 venv 內執行時，PATH 的 python3
+    # 污染 bootstrap，造成 pip --user 在 venv 內被拒絕。
+    if [ -x /usr/bin/python3.10 ]; then
+      PYTHON_BIN="/usr/bin/python3.10"
+    elif [ -x /usr/bin/python3 ]; then
+      PYTHON_BIN="/usr/bin/python3"
+    elif command -v python3.10 >/dev/null 2>&1; then
+      PYTHON_BIN="$(command -v python3.10)"
     else
-      PYTHON_BIN="python3"
+      PYTHON_BIN="$(command -v python3 2>/dev/null || true)"
     fi
+  elif command -v "$PYTHON_BIN" >/dev/null 2>&1; then
+    PYTHON_BIN="$(command -v "$PYTHON_BIN")"
   fi
 
   case "$VENV_DIR" in
@@ -343,6 +351,11 @@ banner_and_preflight() {
     err "找不到船端預安裝的 Python：$PYTHON_BIN"
     preflight_failures=$((preflight_failures + 1))
   else
+    if ! "$PYTHON_BIN" -c 'import sys; raise SystemExit(0 if getattr(sys, "base_prefix", sys.prefix) == sys.prefix and not hasattr(sys, "real_prefix") else 1)' >/dev/null 2>&1; then
+      err "基底直譯器位於虛擬環境中：$PYTHON_BIN"
+      err "請以 --python /usr/bin/python3 指定系統直譯器；尚未做任何持久變更。"
+      preflight_failures=$((preflight_failures + 1))
+    fi
     PY_VER="$("$PYTHON_BIN" -c 'import sys;print(".".join(map(str,sys.version_info[:3])))')"
     PY_TAG="$("$PYTHON_BIN" -c 'import sys;print("cp%d%d"%sys.version_info[:2])')"
     info "基底直譯器    : $PYTHON_BIN ($PY_VER, $PY_TAG；船端預安裝)"
@@ -899,7 +912,7 @@ stage_scheduler_units() {
     warn "如需設定，請手動執行：bash $TIMERS_INSTALLER"
     warn "reboot / teamviewer 需 sudo 白名單，見 $SUDOERS_SRC 檔頭安裝說明。"
     SCHED_STATUS="略過（非互動終端機）"
-  elif ask_yn "  是否設定週期排程與 ipc 接管（timer + 心跳/接管服務 + sudo 白名單）？[Y/n] " Y; then
+  elif ask_yn "  是否設定週期排程與 IPC1↔IPC2 接管（IPC3 只裝通用 timer，不啟用心跳/failover）？[Y/n] " Y; then
     # 三個動作(timer / sudoers / 常駐服務)刻意只問一題:它們是同一個概念單位,分開問只會
     # 讓操作者面對三個不知道能不能各自拒絕的問題。
     mutating "佈署 timer / sudoers / 常駐服務"
@@ -970,9 +983,9 @@ stage_scheduler_units() {
     fi
 
     # (3) 常駐服務（user 層,免 root）：
-    #     nssms-heartbeat（兩台都裝,角色自動分派）
+    #     nssms-heartbeat（僅實體 IPC1/IPC2 佈署，角色自動分派；IPC3 為 N/A）
     #     nssms-alarm-controller / nssms-board-server / nssms-button
-    #       （硬體實體綁 IPC-1,unit 內有 ExecCondition 自行判定,兩台裝同一份即可）
+    #       （硬體實體綁 IPC-1，由 install_services.sh 依 NSSMS-BaseIPC 判定）
     #
     #     舊 clink_* 的停用**必須排在這之前**（見上方一次性遷移段）：舊的 system unit 還
     #     活著時，新 unit 會撞 port。這裡只負責裝。
@@ -1233,9 +1246,9 @@ stage_wheelhouse_and_venv() {
     # VENV_WHEELS_DIR 讓 profile 專屬的 virtualenv_wheels/ 生效（見 resolve_wheelhouse）；
     # 空字串時不設，維持安裝器自己找同層目錄的既有行為。
     if [ -n "$VENV_WHEELS" ]; then
-      VENV_WHEELS_DIR="$VENV_WHEELS" bash "$VENV_INSTALLER"
+      PYTHON_BIN="$PYTHON_BIN" VENV_WHEELS_DIR="$VENV_WHEELS" bash "$VENV_INSTALLER"
     else
-      bash "$VENV_INSTALLER"
+      PYTHON_BIN="$PYTHON_BIN" bash "$VENV_INSTALLER"
     fi
     if ! "$PYTHON_BIN" -m virtualenv --version >/dev/null 2>&1; then
       err "virtualenv 離線安裝後，$PYTHON_BIN 仍無法使用（可能裝到了其他解譯器）。"
@@ -1348,6 +1361,28 @@ PY
 
   echo "-----------------------------------------------------------"
   ok "離線部署完成！專屬 venv：$VENV_DIR"
+}
+
+# systemd 設定的互動（含 sudoers 密碼）必須在階段 A 完成，但 shipboard upload 的
+# ExecStart 依賴階段 B 才建立的專屬 venv。venv 完成後無提示地再同步一次 timer：讓該 unit
+# 在首次部署也以完整環境收尾，並由 install_timers 清除 bootstrap 期間可能留下的 failed latch。
+stage_finalize_venv_dependent_units() {
+  case "${SCHED_STATUS:-}" in
+    已啟用|部分完成*) ;;
+    *) return 0 ;;
+  esac
+  [ -f "${TIMERS_INSTALLER:-}" ] || return 0
+
+  echo ""
+  info "專屬 venv 已完成，重新同步依賴 venv 的 timer 狀態 ..."
+  run_rc bash "$TIMERS_INSTALLER"
+  if [ "$RC" -eq 0 ]; then
+    ok "venv 相依 timer 已完成最終同步。"
+    SCHED_STATUS="已啟用"
+  else
+    warn "venv 完成後重同步 timer 仍有項目失敗（exit=$RC）。"
+    SCHED_STATUS="部分完成（venv 後重試 exit=$RC）"
+  fi
 }
 
 # --- 執行完整啟動流程（決定已在前面收集，這裡只執行） ----------------------
@@ -1589,6 +1624,7 @@ main() {
 
   # ---- 階段 B：sftp_transfer 專屬 venv（離線、無人干預）----
   stage_wheelhouse_and_venv
+  stage_finalize_venv_dependent_units
 
   # ---- 階段 C：完整啟動流程與驗證（無人干預）----
   stage_launch_exec                  # 刻意在 venv 之後（SFTP 下載要用它）

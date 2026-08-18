@@ -16,9 +16,66 @@ VESSEL_INFO_PATH = Path(__file__).resolve().parent.parent / ".env" / "vessel_bas
 
 _PLACEHOLDER = re.compile(r"\{([^{}]+)\}")
 
+# 本地端路徑欄位。這些值由本機的檔案系統解讀，**相對路徑相對於 CWD**，而所有
+# script/run_*.sh 都會先 `cd "$BASE_DIR"`（= share/sftp_transfer），所以寫相對路徑
+# 就是機器無關的。remote_path 刻意不在此列：那是 SFTP 伺服器上的路徑,不能用本機
+# 的家目錄去解讀它。
+_LOCAL_PATH_FIELDS = ("local_path", "ignore_file", "log_dir", "key_file")
+
+# 看起來像 shell 變數或家目錄縮寫的值。本模組**不做**任何展開（見 ConfigPathError）。
+_SHELLISH_PATH = re.compile(r"^~|\$\{|\$[A-Za-z_]")
+
 
 class PlaceholderError(ValueError):
     """設定檔中的佔位符無法解析（vessel 資訊檔不存在、壞掉或缺少對應 key）。"""
+
+
+class ConfigPathError(PlaceholderError):
+    """本地端路徑欄位寫了 shell 才看得懂的東西（~ 或 $VAR）。
+
+    為什麼要明確報錯，而不是展開、也不是默默接受
+    ----------------------------------------------
+    本模組只做 {name} 佔位符替換，從不呼叫 expanduser/expandvars。而 `~` 與
+    `$HOME` 都**不是**絕對路徑，於是會被當成相對路徑，相對於 CWD（= BASE_DIR）
+    解析成：
+
+        share/sftp_transfer/~/y
+        share/sftp_transfer/$HOME/Documents/x
+
+    也就是真的建出名字叫 `~` 或 `$HOME` 的目錄，然後把檔案下載進去。不會有任何
+    錯誤訊息，只是東西全放錯位置 —— 比直接失敗難查得多。所以這裡選擇當場拒絕。
+
+    不改成「幫忙展開」是刻意的：config/ 是**集中管理、由 SFTP OTA 發佈到全船隊**
+    的（見 .sftp_upload_manifest.json 與 sftp_download_ignore.txt —— config/ 不在
+    排除清單、duplicate_mode=overwrite）。一份共用的設定檔裡不該有任何需要「依這台
+    機器的環境變數才知道指到哪」的值；正確做法是寫相對路徑。
+
+    刻意繼承 PlaceholderError:main.py / gui.py / pack_upload.py 已經有「設定檔的值
+    不可用 → 印訊息並中止」的處理路徑,讓它們不必逐一改就能給出一樣的使用者體驗。
+    """
+
+
+def _check_local_paths(settings):
+    """本地端路徑欄位不得含 shell 語法。原地檢查，不修改值。"""
+    def check(field, value):
+        if isinstance(value, str) and _SHELLISH_PATH.search(value):
+            raise ConfigPathError(
+                f"設定檔欄位 {field} 的值 {value!r} 含 shell 語法（~ 或 $VAR），"
+                f"本工具不做展開，會被當成相對路徑而把檔案放到錯誤位置。"
+                f"請改用相對路徑（相對於 share/sftp_transfer，例如 local_path: \".\"、"
+                f"ignore_file: \"config/xxx_ignore.txt\"、log_dir: \"logs\"）"
+                f"或絕對路徑。"
+            )
+
+    for field in _LOCAL_PATH_FIELDS:
+        if field not in settings:
+            continue
+        value = settings[field]
+        if isinstance(value, list):
+            for item in value:
+                check(field, item)
+        else:
+            check(field, value)
 
 SETTINGS_TEMPLATE = {
     "mode": "download",
@@ -107,7 +164,10 @@ def load_settings(path=SETTINGS_PATH):
     except (json.JSONDecodeError, OSError) as e:
         print(f"警告：設定檔 {path} 讀取失敗，將忽略此檔案：{e}", file=sys.stderr)
         return {}
-    return resolve_placeholders(data)
+    resolved = resolve_placeholders(data)
+    # 佔位符替換**之後**才檢查:{home} 之類的替換結果也要納入判斷。
+    _check_local_paths(resolved)
+    return resolved
 
 
 def save_settings(path, data):

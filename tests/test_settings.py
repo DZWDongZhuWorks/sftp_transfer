@@ -7,7 +7,8 @@ from unittest.mock import MagicMock, patch
 
 import pytest
 
-sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
+PROJECT_ROOT = Path(__file__).resolve().parent.parent
+sys.path.insert(0, str(PROJECT_ROOT))
 
 import settings as settings_module
 
@@ -231,3 +232,83 @@ class TestOpenInDefaultApp:
              patch.object(settings_module, "subprocess") as mock_subprocess:
             settings_module.open_in_default_app("/tmp/settings.json")
             mock_subprocess.run.assert_called_once_with(["xdg-open", "/tmp/settings.json"])
+
+
+class TestLocalPathGuard:
+    """本地端路徑欄位不得含 shell 語法。
+
+    這一組守的是一個**靜默**的失敗:`~` 與 `$HOME` 都不是絕對路徑,settings.py 也從不
+    展開它們,於是會被當成相對路徑、相對於 CWD(= share/sftp_transfer)解析成
+    `share/sftp_transfer/$HOME/...` —— 真的建出名字叫 `$HOME` 的目錄並把檔案放進去,
+    沒有任何錯誤訊息。所以寧可當場拒絕。
+    """
+
+    def _load(self, tmp_path, cfg):
+        import json
+        p = tmp_path / "c.json"
+        p.write_text(json.dumps(cfg), encoding="utf-8")
+        return settings_module.load_settings(p)
+
+    @pytest.mark.parametrize("field, value", [
+        ("local_path", "$HOME/Documents/x"),
+        ("local_path", "~/x"),
+        ("ignore_file", "~/ig.txt"),
+        ("ignore_file", "$PROJECT/ig.txt"),
+        ("log_dir", "$HOME/logs"),
+        ("key_file", "$HOME/.ssh/id_rsa"),
+    ])
+    def test_rejects_shell_syntax(self, tmp_path, field, value):
+        with pytest.raises(settings_module.ConfigPathError, match="shell 語法"):
+            self._load(tmp_path, {field: value})
+
+    def test_rejects_shell_syntax_inside_list(self, tmp_path):
+        # local_path 可以是陣列(與 remote_path 逐一配對),每個元素都要檢查。
+        with pytest.raises(settings_module.ConfigPathError):
+            self._load(tmp_path, {"local_path": ["ok", "$HOME/bad"]})
+
+    @pytest.mark.parametrize("cfg", [
+        {"local_path": "."},
+        {"local_path": "../scheduler"},
+        {"ignore_file": "config/sftp_download_ignore.txt"},
+        {"log_dir": "logs"},
+        {"local_path": "/absolute/is/fine"},
+    ])
+    def test_accepts_relative_and_absolute(self, tmp_path, cfg):
+        assert self._load(tmp_path, cfg) == cfg
+
+    def test_remote_path_is_not_guarded(self, tmp_path):
+        """remote_path 是 SFTP **伺服器**上的路徑,不能用本機的家目錄去解讀它。"""
+        cfg = {"remote_path": "~/on-the-server"}
+        assert self._load(tmp_path, cfg) == cfg
+
+    def test_error_is_a_placeholder_error_subclass(self):
+        """刻意繼承 PlaceholderError:main.py / gui.py / pack_upload.py 已有
+        「設定檔的值不可用 → 印訊息並中止」的處理,不必逐一改就能一致。"""
+        assert issubclass(settings_module.ConfigPathError,
+                          settings_module.PlaceholderError)
+
+
+class TestRunScriptCwdContract:
+    """所有 script/run_*.sh 都必須 `cd "$BASE_DIR"`。
+
+    這是相對路徑得以成立的前提:config/ 是集中管理、由 SFTP OTA 發佈到全船隊的
+    (見 .sftp_upload_manifest.json;config/ 不在 sftp_download_ignore.txt 裡,而
+    duplicate_mode=overwrite),所以那些檔案裡不能有機器專屬的絕對路徑 —— 只能寫
+    相對於 share/sftp_transfer 的路徑。
+
+    少一支 `cd` 就會讓那支腳本用錯的 CWD 解析 local_path/ignore_file/log_dir,
+    而且是靜默放錯位置。新增腳本忘了 cd,這個測試會擋下來。
+    """
+
+    def test_every_run_script_cds_to_base_dir(self):
+        import re
+        script_dir = PROJECT_ROOT / "script"
+        scripts = sorted(script_dir.glob("run_*.sh"))
+        assert scripts, "找不到任何 script/run_*.sh"
+        pattern = re.compile(r'^\s*cd\s+"\$BASE_DIR"\s*$', re.MULTILINE)
+        missing = [p.name for p in scripts
+                   if not pattern.search(p.read_text(encoding="utf-8"))]
+        assert missing == [], (
+            "這些 run_*.sh 沒有 `cd \"$BASE_DIR\"`，相對路徑會相對於呼叫者的 CWD "
+            "而把檔案放到錯誤位置：" + ", ".join(missing)
+        )

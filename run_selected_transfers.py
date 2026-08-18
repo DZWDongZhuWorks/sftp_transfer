@@ -8,7 +8,7 @@
 設定檔可用 ``trans_type: telemetry`` 宣告自己是船到岸的資料回傳流，
 不受上述方向鎖管制（見 ``read_trans_type``）。
 """
-from __future__ import annotations
+from typing import List, Optional, Set, Tuple
 
 import argparse
 import curses
@@ -49,7 +49,7 @@ class TransferItem:
 
 @dataclass
 class SelectionState:
-    selected: set[Path] = field(default_factory=set)
+    selected: Set[Path] = field(default_factory=set)
     index: int = 0
     scroll: int = 0
     mode_filter: str = "all"
@@ -65,7 +65,7 @@ class TransferResult:
     failed: int
 
 
-def _run_transfer(item: TransferItem) -> tuple[int, tuple[int, int, int] | None]:
+def _run_transfer(item: TransferItem) -> Tuple[int, Optional[Tuple[int, int, int]]]:
     """執行單項傳輸、即時轉送輸出，並擷取核心程式印出的檔案統計。"""
     proc = subprocess.Popen(
         [
@@ -80,7 +80,8 @@ def _run_transfer(item: TransferItem) -> tuple[int, tuple[int, int, int] | None]
         cwd=str(BASE_DIR),
         stdout=subprocess.PIPE,
         stderr=subprocess.STDOUT,
-        text=True,
+        # text= 是 3.7 才有的別名;Bionic 的 venv 是 3.6,只認 universal_newlines=。
+        universal_newlines=True,
         bufsize=1,
     )
     counts = None
@@ -137,7 +138,7 @@ def read_trans_type(path: Path, mode: str) -> str:
     return TELEMETRY
 
 
-def scan_setting_files(config_dir: Path, mode: str = "all") -> list[TransferItem]:
+def scan_setting_files(config_dir: Path, mode: str = "all") -> List[TransferItem]:
     """依 run_all_* 的命名規則掃描設定檔。
 
     只讀取 trans_type 與 remote_path 兩個欄位判斷流類別，不觸碰其中的連線憑證。
@@ -157,7 +158,7 @@ def scan_setting_files(config_dir: Path, mode: str = "all") -> list[TransferItem
     return sorted(items, key=lambda item: (item.project.casefold(), MODE_ORDER[item.mode], item.path.name))
 
 
-def visible_items(items: list[TransferItem], mode_filter: str) -> list[TransferItem]:
+def visible_items(items: List[TransferItem], mode_filter: str) -> List[TransferItem]:
     if mode_filter == "all":
         return items
     return [item for item in items if item.mode == mode_filter]
@@ -194,7 +195,7 @@ def toggle_item(state: SelectionState, item: TransferItem, locked_mode: str) -> 
 
 def toggle_all_visible(
     state: SelectionState,
-    items: list[TransferItem],
+    items: List[TransferItem],
     locked_mode: str,
 ) -> None:
     paths = {item.path for item in items if is_selectable(item, locked_mode)}
@@ -205,7 +206,7 @@ def toggle_all_visible(
     state.message = ""
 
 
-def clamp_state(state: SelectionState, rows: list[TransferItem]) -> None:
+def clamp_state(state: SelectionState, rows: List[TransferItem]) -> None:
     if not rows:
         state.index = 0
         state.scroll = 0
@@ -214,7 +215,7 @@ def clamp_state(state: SelectionState, rows: list[TransferItem]) -> None:
     state.scroll = max(0, min(state.scroll, state.index))
 
 
-def key_action(ch: int) -> str | None:
+def key_action(ch: int) -> Optional[str]:
     if ch in (ord("q"), 27):
         return "quit"
     if ch in (curses.KEY_UP, ord("k")):
@@ -251,7 +252,7 @@ def _char_width(ch: str) -> int:
 def fit_display(text: str, cols: int) -> str:
     if cols <= 0:
         return ""
-    out: list[str] = []
+    out: List[str] = []
     width = 0
     for char in text:
         char_width = _char_width(char)
@@ -269,7 +270,7 @@ def _addstr(win, y: int, x: int, text: str, attr: int = 0) -> None:
         pass
 
 
-def _counts(items: list[TransferItem], selected: set[Path]) -> tuple[int, int]:
+def _counts(items: List[TransferItem], selected: Set[Path]) -> Tuple[int, int]:
     downloads = sum(item.mode == "download" and item.path in selected for item in items)
     uploads = sum(item.mode == "upload" and item.path in selected for item in items)
     return downloads, uploads
@@ -278,8 +279,8 @@ def _counts(items: list[TransferItem], selected: set[Path]) -> tuple[int, int]:
 def _draw(
     stdscr,
     state: SelectionState,
-    all_items: list[TransferItem],
-    rows: list[TransferItem],
+    all_items: List[TransferItem],
+    rows: List[TransferItem],
     locked_mode: str,
 ) -> None:
     stdscr.erase()
@@ -337,7 +338,7 @@ def _draw(
     stdscr.refresh()
 
 
-def _confirm(stdscr, selected: list[TransferItem]) -> bool:
+def _confirm(stdscr, selected: List[TransferItem]) -> bool:
     downloads, uploads = _counts(selected, {item.path for item in selected})
     while True:
         stdscr.erase()
@@ -429,7 +430,7 @@ def _main_loop(stdscr, config_dir: Path, scan_mode: str, locked_mode: str):
         clamp_state(state, rows)
 
 
-def execute_selected(items: list[TransferItem], locked_mode: str) -> int:
+def execute_selected(items: List[TransferItem], locked_mode: str) -> int:
     forbidden = [item for item in items if not is_selectable(item, locked_mode)]
     if forbidden:
         print(f"錯誤：{policy_message(locked_mode)}", file=sys.stderr)
@@ -437,7 +438,7 @@ def execute_selected(items: list[TransferItem], locked_mode: str) -> int:
             print(f"  [已阻擋] [{MODE_LABEL[item.mode]}] {item.path.name}", file=sys.stderr)
         return 3
 
-    results: list[TransferResult] = []
+    results: List[TransferResult] = []
     total = len(items)
     for index, item in enumerate(items, 1):
         print(f"\n===== [{index}/{total}] 開始{MODE_LABEL[item.mode]}：{item.path.name} =====", flush=True)
@@ -465,7 +466,7 @@ def execute_selected(items: list[TransferItem], locked_mode: str) -> int:
     return 0 if failed_projects == 0 else 1
 
 
-def parse_args(argv: list[str] | None = None):
+def parse_args(argv: Optional[List[str]] = None):
     parser = argparse.ArgumentParser(description="互動勾選本次要下載／上傳的 SFTP 專案")
     parser.add_argument("--config-dir", default=str(CONFIG_DIR), help="設定檔資料夾（預設 ./config）")
     parser.add_argument(
@@ -478,7 +479,7 @@ def parse_args(argv: list[str] | None = None):
     return parser.parse_args(argv)
 
 
-def main(argv: list[str] | None = None) -> int:
+def main(argv: Optional[List[str]] = None) -> int:
     args = parse_args(argv)
     config_dir = Path(args.config_dir).expanduser()
     items = scan_setting_files(config_dir, args.mode)

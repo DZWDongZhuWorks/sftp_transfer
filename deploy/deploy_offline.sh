@@ -203,6 +203,14 @@ usage() { awk 'NR == 1 { next } !/^#/ { exit } { sub(/^# ?/, ""); print }' "$0";
 RC=0
 run_rc() { RC=0; "$@" || RC=$?; }
 
+# wheelhouse 裡有沒有這個套件的輪子。wheel 檔名的 name 欄位用底線與大小寫變體,
+# 比對前一起正規化(PEP 503)。
+wheelhouse_has() {  # $1 = 套件名, $2 = wheelhouse 目錄
+  local norm; norm="$(printf '%s' "$1" | tr 'A-Z_.' 'a-z--')"
+  find "$2" -maxdepth 1 -name '*.whl' -printf '%f\n' 2>/dev/null \
+    | sed 's/-.*//' | tr 'A-Z_.' 'a-z--' | grep -qx "$norm"
+}
+
 # 是非題。提示文字（含 "[Y/n]" / "[y/N]"）由呼叫點自帶：它同時是給操作者看的說明**和**
 # 預設值的宣告，分開寫必然會有一天不一致。$2 是「直接按 Enter」與非互動時採用的預設。
 #
@@ -392,6 +400,29 @@ banner_and_preflight() {
         [ "$RC" -ne 6 ] || preflight_rc=6
         ;;
     esac
+  fi
+
+  # virtualenv bootstrap 輪子的完整性。**只在確定需要它時**才列為部署前提:已經有
+  # virtualenv 的機器不該因為這個目錄少一個檔而卡住(它那時根本用不到)。
+  #
+  # 為什麼要校驗:它是船上每一個 venv 的前提,而 OTA 走 SFTP —— 少送或截斷一個檔,失敗會
+  # 晚到 pip 解析相依那一刻才以「找不到相依」浮出來,而那時已經動過機器了。這裡讓它提早、
+  # 明確地失敗,與 tmux debs 用的是同一支校驗器。
+  if [ -n "$PYTHON_BIN" ] && command -v "$PYTHON_BIN" >/dev/null 2>&1 \
+     && ! "$PYTHON_BIN" -m virtualenv --version >/dev/null 2>&1; then
+    if [ -z "$VENV_WHEELS" ]; then
+      err "$PYTHON_BIN 沒有 virtualenv,而找不到 virtualenv bootstrap 輪子目錄。"
+      err "應位於 deploy/virtualenv_wheels/ 或 platforms/${NSSMS_PROFILE_ID}/virtualenv_wheels/。"
+      preflight_failures=$((preflight_failures + 1))
+    elif [ ! -f "$VENV_WHEELS/MANIFEST.txt" ]; then
+      # 舊離線包沒有這份 manifest。缺它只是少一道校驗,不該讓那些包一次全部失效。
+      warn "$VENV_WHEELS 沒有 MANIFEST.txt,略過完整性校驗(舊離線包可能沒有這份)。"
+    elif ! nssms_verify_flat_manifest "$VENV_WHEELS" "$VENV_WHEELS/MANIFEST.txt" \
+            '*.whl' "virtualenv bootstrap 輪子"; then
+      err "virtualenv bootstrap 輪子校驗未通過;尚未做任何持久變更。"
+      err "重建方式見 deploy/README.md 的「未來如何更新 / 重建 wheelhouse」。"
+      preflight_failures=$((preflight_failures + 1))
+    fi
   fi
 
   run_rc bash "$SCRIPT_DIR/install_tmux_offline.sh" --check-only --profile-dir "$PROFILE_DIR"
@@ -1298,8 +1329,32 @@ stage_wheelhouse_and_venv() {
   # --- 執行離線安裝 ----------------------------------------------------------
   RUNTIME_PKGS=(paramiko bcrypt cryptography pynacl cffi pycparser invoke typing-extensions)
   TEST_PKGS=(pytest pytest-cov coverage pluggy iniconfig packaging pygments tomli exceptiongroup)
+  # 只有舊平台才需要的標準庫 backport。dataclasses 是 3.7 才進標準庫,而
+  # monitor/log_monitor.py、monitor/tui.py、run_selected_transfers.py、pack_upload.py
+  # 都用 @dataclass —— Bionic 的 venv 是 3.6,少了它那四支人工工具一律
+  # ModuleNotFoundError(在 Bionic 開發機 192.168.6.230 實測確認)。
+  #
+  # 與 TEST_PKGS 同樣走「wheelhouse 有才裝」而**不是**放進 RUNTIME_PKGS:Jammy 的
+  # wheelhouse 刻意不放它(3.10 已內建,而 dataclasses==0.8 的 python_requires 是
+  # >=3.6,<3.7,pip 在 3.10 上本來就會拒絕)。放進 RUNTIME_PKGS 會讓 preflight 在
+  # Jammy 上把「正確地不存在」判成缺件。也刻意不受 --skip-tests 影響:那四支工具是
+  # 給人用的,不屬於測試堆疊。
+  BACKPORT_PKGS=(dataclasses)
 
   PKGS=("${RUNTIME_PKGS[@]}")
+  local missing_backports=()
+  for pkg in "${BACKPORT_PKGS[@]}"; do
+    if wheelhouse_has "$pkg" "$WHEELHOUSE"; then
+      PKGS+=("$pkg")
+    else
+      missing_backports+=("$pkg")
+    fi
+  done
+  if [ "${#missing_backports[@]}" -gt 0 ]; then
+    info "標準庫 backport: 本 profile 無 ${missing_backports[*]}（該版 Python 內建則屬正常）"
+  else
+    info "標準庫 backport: ${BACKPORT_PKGS[*]}（舊平台的 3.6 需要）"
+  fi
   if [ "$INSTALL_TESTS" -eq 1 ]; then
     # 執行期相依是**必須**的（preflight 的 wheel_compat.py 已經強制它們存在）；
     # 測試堆疊則按 wheelhouse 實際有什麼裝什麼。理由：同一份清單套到不同 Python 會有
@@ -1308,10 +1363,7 @@ stage_wheelhouse_and_venv() {
     # 為此讓整個部署失敗是不對的：測試堆疊不是船上跑服務的必要條件。
     local skipped=()
     for pkg in "${TEST_PKGS[@]}"; do
-      # wheel 檔名的 name 欄位用底線與大小寫變體，比對前一起正規化（PEP 503）。
-      local norm; norm="$(printf '%s' "$pkg" | tr 'A-Z_.' 'a-z--')"
-      if find "$WHEELHOUSE" -maxdepth 1 -name '*.whl' -printf '%f\n' 2>/dev/null \
-         | sed 's/-.*//' | tr 'A-Z_.' 'a-z--' | grep -qx "$norm"; then
+      if wheelhouse_has "$pkg" "$WHEELHOUSE"; then
         PKGS+=("$pkg")
       else
         skipped+=("$pkg")

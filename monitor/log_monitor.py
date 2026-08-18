@@ -18,7 +18,7 @@
 
 離開碼：一切正常 -> 0；有任何裝置處於異常（partial/aborted/incomplete）或過期 -> 1。
 """
-from __future__ import annotations
+from typing import Dict, List, Optional, Tuple
 
 import argparse
 import csv
@@ -70,17 +70,17 @@ class RunRecord:
     path: Path
     device_name: str
     mode: str  # 'download' | 'upload'
-    started_at: datetime | None = None
-    ended_at: datetime | None = None
-    file_count: int | None = None
-    success: int | None = None
-    skipped: int | None = None
-    failed: int | None = None
+    started_at: Optional[datetime] = None
+    ended_at: Optional[datetime] = None
+    file_count: Optional[int] = None
+    success: Optional[int] = None
+    skipped: Optional[int] = None
+    failed: Optional[int] = None
     status: str = "incomplete"  # success | partial | aborted | incomplete
     abort_reason: str = ""
-    failed_list: list[str] = field(default_factory=list)
-    warnings: list[str] = field(default_factory=list)
-    errors: list[str] = field(default_factory=list)
+    failed_list: List[str] = field(default_factory=list)
+    warnings: List[str] = field(default_factory=list)
+    errors: List[str] = field(default_factory=list)
 
 
 @dataclass
@@ -88,14 +88,14 @@ class DeviceStatus:
     """依 device_name 彙整後的單一裝置狀態。"""
 
     device_name: str
-    vessel: str | None
-    ipc: str | None
+    vessel: Optional[str]
+    ipc: Optional[str]
     component: str
     latest: RunRecord
     run_count: int
-    last_seen: datetime | None
+    last_seen: Optional[datetime]
     is_stale: bool
-    history: list[RunRecord] = field(default_factory=list)
+    history: List[RunRecord] = field(default_factory=list)
 
     @property
     def display_status(self) -> str:
@@ -108,7 +108,7 @@ class DeviceStatus:
 # ---------------------------------------------------------------------------
 # 解析
 # ---------------------------------------------------------------------------
-def parse_device_name(name: str) -> tuple[str | None, str | None, str]:
+def parse_device_name(name: str) -> Tuple[Optional[str], Optional[str], str]:
     """把 device_name 拆成 (vessel, ipc, component)，best-effort。
 
     主樣式 `{vsl}_{ipc}_{component}`（如 CLINK_IPC-1_ecdis）；不符者
@@ -120,7 +120,7 @@ def parse_device_name(name: str) -> tuple[str | None, str | None, str]:
     return None, None, (name or "unknown")
 
 
-def _detect_mode(filename: str, start_direction: str | None) -> str:
+def _detect_mode(filename: str, start_direction: Optional[str]) -> str:
     """判定傳輸方向：優先看起始行內容，其次看檔名前綴。"""
     if start_direction == "上傳":
         return "upload"
@@ -131,7 +131,7 @@ def _detect_mode(filename: str, start_direction: str | None) -> str:
     return "download"
 
 
-def parse_log_file(path) -> RunRecord | None:
+def parse_log_file(path) -> Optional[RunRecord]:
     """解析單一 CSV log 檔為 RunRecord；檔案損壞/非本工具格式回傳 None。"""
     path = Path(path)
     device_name = ""
@@ -140,9 +140,9 @@ def parse_log_file(path) -> RunRecord | None:
     file_count = None
     success = skipped = failed = None
     abort_reason = ""
-    failed_list: list[str] = []
-    warnings: list[str] = []
-    errors: list[str] = []
+    failed_list: List[str] = []
+    warnings: List[str] = []
+    errors: List[str] = []
     start_direction = None
     summary_direction = None
     saw_rows = False
@@ -226,7 +226,7 @@ def parse_log_file(path) -> RunRecord | None:
 _ROW_LIMIT = 5000
 
 
-def read_log_rows(path, max_rows: int = _ROW_LIMIT) -> tuple[list[list[str]], bool]:
+def read_log_rows(path, max_rows: int = _ROW_LIMIT) -> Tuple[List[List[str]], bool]:
     """讀單一 log CSV 的原始列，供 TUI 檢視「那一筆到底寫了什麼」。
 
     parse_log_file 只留彙整後的純量與 ERROR/WARNING 訊息，原始列全丟；要逐行回看
@@ -235,7 +235,7 @@ def read_log_rows(path, max_rows: int = _ROW_LIMIT) -> tuple[list[list[str]], bo
 
     讀不到／格式不符／空檔一律回傳空列表而非拋錯，讓 curses 端不必包 try。
     """
-    rows: list[list[str]] = []
+    rows: List[List[str]] = []
     truncated = False
     width = len(CSV_COLUMNS)
     try:
@@ -255,7 +255,7 @@ def read_log_rows(path, max_rows: int = _ROW_LIMIT) -> tuple[list[list[str]], bo
     return rows, truncated
 
 
-def _parse_ts(value: str) -> datetime | None:
+def _parse_ts(value: str) -> Optional[datetime]:
     try:
         return datetime.strptime(value.strip(), TS_FMT)
     except (ValueError, AttributeError):
@@ -273,14 +273,14 @@ def _device_from_filename(filename: str) -> str:
     return stem or "unknown"
 
 
-def collect_logs(log_dir, mode: str = "all") -> list[RunRecord]:
+def collect_logs(log_dir, mode: str = "all") -> List[RunRecord]:
     """遞迴掃描 log_dir 下所有 *.csv，解析成 RunRecord 清單並依 mode 過濾。
 
     用 rglob 是為了涵蓋遠端 sftp_logs 下載後的巢狀結構
     （download/{vsl}/{ipc}/{component}/*.csv）；平面目錄（如既有 logs/）同樣適用。
     """
     log_dir = Path(log_dir)
-    records: list[RunRecord] = []
+    records: List[RunRecord] = []
     for path in sorted(log_dir.rglob("*.csv")):
         rec = parse_log_file(path)
         if rec is None:
@@ -292,20 +292,20 @@ def collect_logs(log_dir, mode: str = "all") -> list[RunRecord]:
 
 
 def aggregate_by_device(
-    records: list[RunRecord], now: datetime, stale_hours: float
-) -> list[DeviceStatus]:
+    records: List[RunRecord], now: datetime, stale_hours: float
+) -> List[DeviceStatus]:
     """依 (device_name, mode) 分組，取最新一次執行為代表並計算過期與排序。
 
     以 (device_name, mode) 而非單純 device_name 為鍵：同名 project 的上傳與下載
     共用同一 device_name（如 ecdis_download / ecdis_upload 皆為 {vsl}_{ipc}_ecdis），
     合併會遺失其中一個方向；分開才能各自呈現與排查。
     """
-    groups: dict[tuple[str, str], list[RunRecord]] = {}
+    groups: Dict[Tuple[str, str], List[RunRecord]] = {}
     for rec in records:
         groups.setdefault((rec.device_name, rec.mode), []).append(rec)
 
     stale_delta = timedelta(hours=stale_hours)
-    devices: list[DeviceStatus] = []
+    devices: List[DeviceStatus] = []
     for (device_name, _mode), recs in groups.items():
         recs_sorted = sorted(
             recs, key=lambda r: r.started_at or datetime.min, reverse=True
@@ -362,24 +362,24 @@ class GroupSummary:
 class IpcGroup:
     name: str
     summary: GroupSummary
-    devices: list[DeviceStatus]
+    devices: List[DeviceStatus]
 
 
 @dataclass
 class VesselGroup:
     name: str
     summary: GroupSummary
-    ipcs: list[IpcGroup]
+    ipcs: List[IpcGroup]
 
 
 @dataclass
 class ModeGroup:
     mode: str
     summary: GroupSummary
-    vessels: list[VesselGroup]
+    vessels: List[VesselGroup]
 
 
-def _summarize(devices: list[DeviceStatus]) -> GroupSummary:
+def _summarize(devices: List[DeviceStatus]) -> GroupSummary:
     s = GroupSummary(total=len(devices))
     worst_sev = -1
     for d in devices:
@@ -407,22 +407,22 @@ def _group_sort_key(summary: GroupSummary, name: str):
     return (is_bucket, -_SEVERITY.get(summary.worst, 0), name)
 
 
-def build_tree(devices: list[DeviceStatus]) -> list[ModeGroup]:
+def build_tree(devices: List[DeviceStatus]) -> List[ModeGroup]:
     """把扁平 DeviceStatus 依 mode → vessel → ipc 建成階層樹並由下而上算 rollup。"""
-    tree: dict[str, dict[str, dict[str, list[DeviceStatus]]]] = {}
+    tree: Dict[str, Dict[str, Dict[str, List[DeviceStatus]]]] = {}
     for d in devices:
         mode = d.latest.mode
         vessel = d.vessel or _UNCLASSIFIED_VESSEL
         ipc = d.ipc or _UNKNOWN_IPC
         tree.setdefault(mode, {}).setdefault(vessel, {}).setdefault(ipc, []).append(d)
 
-    mode_groups: list[ModeGroup] = []
+    mode_groups: List[ModeGroup] = []
     for mode in sorted(tree, key=lambda m: _MODE_ORDER.get(m, 9)):
-        vessels: list[VesselGroup] = []
-        mode_devices: list[DeviceStatus] = []
+        vessels: List[VesselGroup] = []
+        mode_devices: List[DeviceStatus] = []
         for vessel, ipc_map in tree[mode].items():
-            ipcs: list[IpcGroup] = []
-            vessel_devices: list[DeviceStatus] = []
+            ipcs: List[IpcGroup] = []
+            vessel_devices: List[DeviceStatus] = []
             for ipc, devs in ipc_map.items():
                 devs_sorted = sorted(
                     devs, key=lambda d: (-_SEVERITY.get(d.display_status, 0), d.component)
@@ -457,7 +457,9 @@ def _run_with_output_callback(command, cwd, timeout, output_callback):
         cwd=cwd,
         stdout=subprocess.PIPE,
         stderr=subprocess.STDOUT,
-        text=True,
+        # text= 是 3.7 才有的別名;Bionic 的 venv 是 3.6,只認 universal_newlines=。
+        # 有給 encoding= 時 universal_newlines 的行為與 text=True 相同。
+        universal_newlines=True,
         encoding="utf-8",
         errors="replace",
         bufsize=1,
@@ -503,7 +505,7 @@ def _run_with_output_callback(command, cwd, timeout, output_callback):
 
 def sync_logs(
     sync_config,
-    timeout: float | None = 600,
+    timeout: Optional[float] = 600,
     quiet: bool = False,
     output_callback=None,
 ) -> bool:
@@ -581,7 +583,7 @@ def _color(code: str, text: str, use_color: bool) -> str:
     return f"\033[{code}m{text}\033[0m" if use_color else text
 
 
-def _humanize_age(last_seen: datetime | None, now: datetime) -> str:
+def _humanize_age(last_seen: Optional[datetime], now: datetime) -> str:
     if last_seen is None:
         return "—"
     secs = max(0, int((now - last_seen).total_seconds()))
@@ -611,10 +613,10 @@ def _detail_str(dev: DeviceStatus) -> str:
     return ""
 
 
-def device_detail_lines(dev: DeviceStatus) -> list[str]:
+def device_detail_lines(dev: DeviceStatus) -> List[str]:
     """該裝置最新一次執行的多行純文字明細（與 HTML 明細同源，供 TUI 彈窗/其他純文字用途）。"""
     rec = dev.latest
-    lines: list[str] = []
+    lines: List[str] = []
     lines.append(f"裝置：{dev.device_name}（{_MODE_LABEL.get(rec.mode, rec.mode)}）")
     lines.append(
         f"狀態：{_STATUS_LABEL.get(dev.display_status, dev.display_status)}"
@@ -641,9 +643,9 @@ def device_detail_lines(dev: DeviceStatus) -> list[str]:
     return lines
 
 
-def render_cli(devices: list[DeviceStatus], now: datetime, use_color: bool = True) -> str:
+def render_cli(devices: List[DeviceStatus], now: datetime, use_color: bool = True) -> str:
     """組出終端機彩色列表（回傳字串，方便測試）。"""
-    lines: list[str] = []
+    lines: List[str] = []
     total = len(devices)
     ok = sum(1 for d in devices if d.display_status == "success")
     stale = sum(1 for d in devices if d.display_status == "stale")
@@ -704,14 +706,14 @@ def _dot(status: str, use_color: bool) -> str:
 
 
 def render_cli_grouped(
-    mode_groups: list[ModeGroup], now: datetime, use_color: bool = True, expand: str = "auto"
+    mode_groups: List[ModeGroup], now: datetime, use_color: bool = True, expand: str = "auto"
 ) -> str:
     """階層分群的終端機輸出：方向 > vessel > IPC > project。
 
     expand: 'auto'（正常收合、異常展開）/ 'all'（全展開）/ 'none'（全收合）。
     收合的群組只印摘要行、不列出下層。
     """
-    lines: list[str] = []
+    lines: List[str] = []
     total = sum(m.summary.total for m in mode_groups)
     ok = sum(m.summary.ok for m in mode_groups)
     stale = sum(m.summary.stale for m in mode_groups)
@@ -894,7 +896,7 @@ def _esc(s) -> str:
 
 def _detail_html(dev: DeviceStatus) -> str:
     rec = dev.latest
-    parts: list[str] = []
+    parts: List[str] = []
     if rec.abort_reason:
         parts.append(f'<div class="err">中止原因：{_esc(rec.abort_reason)}</div>')
     if rec.failed_list:
@@ -959,7 +961,7 @@ def _leaf_row(d: DeviceStatus, generated_at: datetime) -> str:
 
 
 def render_html(
-    devices: list[DeviceStatus],
+    devices: List[DeviceStatus],
     out_path,
     generated_at: datetime,
     log_dir: str = "",
@@ -980,7 +982,7 @@ def render_html(
     ipc_opts = _opts({d.ipc or _UNKNOWN_IPC for d in devices})
     comp_opts = _opts({d.component for d in devices})
 
-    parts: list[str] = []
+    parts: List[str] = []
     for m in tree:
         parts.append(
             f'<section class="mode-sec"><div class="mode-h">'
@@ -1106,7 +1108,7 @@ def _apply_filters(devices, vessel=None, ipc=None, component=None, status="all")
 
 
 def write_html_report(devices: list, now: datetime, log_dir,
-                      stale_hours: float, html_path) -> Path | None:
+                      stale_hours: float, html_path) -> Optional[Path]:
     """依 `--html` 設定寫出目前快照，供靜態、`--watch` 與 TUI 共用。
 
     TUI 不走 _run_once，卻必須寫到同一個地方，所以產出點集中在這裡；兩邊各算一次路徑
@@ -1127,7 +1129,7 @@ def write_html_report(devices: list, now: datetime, log_dir,
     return target
 
 
-def _run_once(args, use_color: bool) -> tuple[str, list[DeviceStatus]]:
+def _run_once(args, use_color: bool) -> Tuple[str, List[DeviceStatus]]:
     if args.sync_config:
         sync_logs(args.sync_config)
     now = datetime.now()

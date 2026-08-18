@@ -2,11 +2,18 @@
 # Built for: Linux aarch64 / CPython 3.6 (cp36) / glibc >= 2.17 (Bionic 為 2.27)
 # Built on : 以 pip download --python-version 3.6 --abi cp36m
 #            --platform manylinux2014_aarch64 --only-binary=:all: 於有網路的建置機解析
-# Files    : 19 wheels
+# Files    : 20 wheels
 #
 # 為什麼版本比 Jammy 舊：Bionic 只有 python3.6，而 paramiko 5 需要 >=3.9、
 # cffi 2.x 需要 >=3.10、cryptography 49 需要 glibc>=2.34。這一組是「仍支援 3.6」
 # 的最後一批：paramiko 3.5.1 / cryptography 40.0.2 / pytest 7.0.1。
+#
+# 為什麼多了 dataclasses:它是 3.7 才進標準庫的,而 monitor/log_monitor.py、monitor/tui.py、
+# run_selected_transfers.py、pack_upload.py 都用 @dataclass。Bionic 的 venv 是 3.6,少了這個
+# backport 那四支人工工具一律 ModuleNotFoundError(在 Bionic 開發機 192.168.6.230 實測)。
+# Jammy 的 wheelhouse 刻意**不**放它:3.10 已內建,而 dataclasses==0.8 的 python_requires 是
+# >=3.6,<3.7,pip 在 3.10 上本來就會拒絕。deploy_offline.sh 走「wheelhouse 有才裝」那條路,
+# 所以同一份安裝清單在兩個 profile 上都正確。
 #
 # 注意：exceptiongroup 刻意不在此列 —— 它的 backport 需要 >=3.7，PyPI 上給 3.6 的
 # 只有一個 0.0.0a0 佔位套件（還會拖進 trio 一串）。deploy_offline.sh 會按實際存在
@@ -20,6 +27,7 @@
 e263d77ee3dd201c3a142934a086a4450861778baaeeb45db4591ef65550b0a6  cffi-1.15.1-cp36-cp36m-manylinux_2_17_aarch64.manylinux2014_aarch64.whl
 2641f803ee9f95b1f387f3e8f3bf28d83d9b69a39e9911e5bfee832bea75240d  coverage-6.2-cp36-cp36m-manylinux_2_17_aarch64.manylinux2014_aarch64.whl
 4df2af28d7bedc84fe45bd49bc35d710aede676e2a4cb7fc6d103a2adc8afe4d  cryptography-40.0.2-cp36-abi3-manylinux_2_17_aarch64.manylinux2014_aarch64.whl
+0201d89fa866f68c8ebd9d08ee6ff50c0b255f8ec63a71c16fda7af82bb887bf  dataclasses-0.8-py3-none-any.whl
 011e24c64b7f47f6ebd835bb12a743f2fbe9a26d4cecaa7f53bc4f35ee9da8b3  iniconfig-1.1.1-py2.py3-none-any.whl
 2413bc441b376e5cd3f55bb5d364f973ad8bdd7bf87e53c79de3c11bf3feecc8  invoke-2.2.1-py3-none-any.whl
 ef103e05f519cdc783ae24ea4e2e0f508a9c99b2d4969652eed6a2e1ea5bd522  packaging-21.3-py3-none-any.whl

@@ -2,7 +2,7 @@
 # -*- coding: utf-8 -*-
 """tui.py — log_monitor 的 curses 互動式終端機介面。
 
-以 stdlib `curses` 提供接近 HTML 報告的控制能力：鍵盤展開/收合、上下選取、
+以 stdlib `curses` 提供接近 HTML 報告的控制能力：鍵盤／滑鼠展開、收合與選取，
 搜尋、方向/狀態過濾、只看異常、看單一裝置明細、即時重載。
 
 由 `log_monitor.py --tui` 於互動式終端機呼叫 `run_app(args)`；非 TTY 或無 curses
@@ -50,6 +50,27 @@ _MODE_ARROW = {"download": "↓", "upload": "↑"}
 _FLAT_COLS = (1, 10, 6, 20, 11, 5, 9, 8)
 _FLAT_ALIGN = ("left", "left", "left", "left", "left", "right", "right", "left")
 _FLAT_GUTTER = "    "  # 對齊 _draw 的 depth-0 縮排("  ") + 狀態燈("●") + 空白
+_MOUSE_SCROLL_LINES = 3
+_MOUSE_INTERVAL_MS = 250
+
+
+def _mouse_bits(*names: str) -> int:
+    """合併目前 curses 實作有提供的滑鼠旗標（不同平台的按鈕數可能不同）。"""
+    mask = 0
+    for name in names:
+        mask |= getattr(curses, name, 0)
+    return mask
+
+
+# ncurses/xterm 的滾輪通常是 BUTTON4/5_PRESSED；也接受 CLICKED，兼容會合成 click 的終端機。
+_MOUSE_WHEEL_UP = _mouse_bits("BUTTON4_PRESSED", "BUTTON4_CLICKED")
+_MOUSE_WHEEL_DOWN = _mouse_bits("BUTTON5_PRESSED", "BUTTON5_CLICKED")
+_MOUSE_LEFT_ACTIVATE = _mouse_bits("BUTTON1_DOUBLE_CLICKED", "BUTTON1_TRIPLE_CLICKED")
+_MOUSE_LEFT_CLICK = _mouse_bits("BUTTON1_CLICKED", "BUTTON1_PRESSED")
+_MOUSE_RIGHT_CLICK = _mouse_bits(
+    "BUTTON3_CLICKED", "BUTTON3_PRESSED", "BUTTON3_DOUBLE_CLICKED", "BUTTON3_TRIPLE_CLICKED"
+)
+_MOUSE_SHIFT = getattr(curses, "BUTTON_SHIFT", 0)
 
 
 # --- 顯示寬度（CJK 全形字佔 2 欄）------------------------------------------
@@ -571,6 +592,21 @@ def key_action(ch: int) -> str | None:
     return None
 
 
+def mouse_event_kind(bstate: int) -> str | None:
+    """把 curses bstate 正規化；只處理本介面用得到的按鈕，不理會移動／放開事件。"""
+    if bstate & _MOUSE_WHEEL_UP:
+        return "wheel_up"
+    if bstate & _MOUSE_WHEEL_DOWN:
+        return "wheel_down"
+    if bstate & _MOUSE_LEFT_ACTIVATE:
+        return "activate"
+    if bstate & _MOUSE_LEFT_CLICK:
+        return "click"
+    if bstate & _MOUSE_RIGHT_CLICK:
+        return "close"
+    return None
+
+
 # --- CSV 原始資料檢視的版面（純函式）--------------------------------------
 _CSV_TS_COLS = 19
 _CSV_LEVEL_COLS = 7
@@ -686,12 +722,31 @@ def csv_key_action(ch: int) -> str | None:
     return None
 
 
+def csv_mouse_action(y: int, bstate: int, maxy: int) -> str | None:
+    """CSV 全畫面檢視的滑鼠映射：滾輪捲動，右鍵或點底列返回。
+
+    Shift+滾輪若終端機有傳遞修飾鍵，改為水平捲動；沒傳遞時仍是一般垂直捲動。
+    """
+    kind = mouse_event_kind(bstate)
+    if kind == "wheel_up":
+        return "left" if bstate & _MOUSE_SHIFT else "wheel_up"
+    if kind == "wheel_down":
+        return "right" if bstate & _MOUSE_SHIFT else "wheel_down"
+    if kind == "close" or (kind in ("click", "activate") and y == maxy - 1):
+        return "close"
+    return None
+
+
 def csv_apply(view: CsvView, action: str, *, total: int, view_h: int) -> None:
     """就地套用動作（純狀態轉移）；夾回合法範圍交給繪製前的 clamp_* 統一處理。"""
     if action == "up":
         view.off -= 1
     elif action == "down":
         view.off += 1
+    elif action == "wheel_up":
+        view.off -= _MOUSE_SCROLL_LINES
+    elif action == "wheel_down":
+        view.off += _MOUSE_SCROLL_LINES
     elif action == "pgup":
         view.off -= view_h
     elif action == "pgdn":
@@ -765,6 +820,8 @@ def write_html_snapshot(args, tree, now: datetime) -> str:
 
 
 _HELP_LINES = [
+    "滑鼠      單擊選取；雙擊開合/看明細；點群組箭頭開合；滾輪移動",
+    "          明細左鍵進 CSV、右鍵/點外側返回；CSV 滾輪捲動、Shift+滾輪橫移",
     "移動      ↑/↓ 或 k/j、PgUp/PgDn、Home/End",
     "展開收合  Enter/Space 開合群組；→/l 展開、←/h 收合（裝置列 ← 跳父群）",
     "看明細    在裝置列按 Enter；明細再按 Enter 看該筆 CSV 原始資料",
@@ -787,6 +844,28 @@ def _addstr(win, y, x, text, attr=0):
         win.addstr(y, x, text, attr)
     except curses.error:
         pass
+
+
+def _enable_mouse() -> bool:
+    """要求 curses 回報滑鼠事件；終端機不支援時維持原本的純鍵盤介面。"""
+    try:
+        available, _old = curses.mousemask(curses.ALL_MOUSE_EVENTS)
+    except (AttributeError, curses.error):
+        return False
+    try:
+        curses.mouseinterval(_MOUSE_INTERVAL_MS)
+    except (AttributeError, curses.error):
+        pass  # 少數 curses 沒有雙擊間隔 API；單擊與滾輪仍可用
+    return bool(available)
+
+
+def _read_mouse() -> tuple[int, int, int] | None:
+    """安全讀取目前滑鼠事件，回傳 (x, y, bstate)。佇列競態或無事件時忽略。"""
+    try:
+        _device_id, x, y, _z, bstate = curses.getmouse()
+    except (curses.error, ValueError):
+        return None
+    return x, y, bstate
 
 
 def _clean_sync_line(line: str) -> str:
@@ -853,6 +932,42 @@ def body_height(maxy: int, state: TuiState) -> int:
     return max(1, maxy - (4 if state.flat else 3))
 
 
+def body_top(maxy: int, state: TuiState) -> int:
+    """主列表第一筆資料所在的 y；平坦模式在空間足夠時多一行凍結欄名。"""
+    return 3 if state.flat and maxy > 3 else 2
+
+
+def mouse_row_index(y: int, *, maxy: int, state: TuiState,
+                    scroll: int, total: int) -> int | None:
+    """把螢幕 y 座標換成 rows 索引；表頭、欄名、底列及空白區都回傳 None。"""
+    top = body_top(maxy, state)
+    bottom = min(top + body_height(maxy, state), max(0, maxy - 1))
+    if y < top or y >= bottom:
+        return None
+    idx = scroll + y - top
+    return idx if 0 <= idx < total else None
+
+
+def main_mouse_action(x: int, y: int, bstate: int, rows: list[Row],
+                      state: TuiState, maxy: int) -> tuple[str | None, int | None]:
+    """主列表滑鼠事件 → (動作, 列索引)，供 curses 迴圈與純邏輯測試共用。"""
+    kind = mouse_event_kind(bstate)
+    if kind in ("wheel_up", "wheel_down"):
+        return kind, None
+    if kind not in ("click", "activate"):
+        return None, None
+
+    idx = mouse_row_index(
+        y, maxy=maxy, state=state, scroll=state.scroll, total=len(rows)
+    )
+    if idx is None:
+        return None, None
+    row = rows[idx]
+    # 群組箭頭本身採單擊開合；列的其他位置維持桌面介面的單擊選取、雙擊啟動。
+    arrow_clicked = row.kind != "device" and x == row.depth * 2
+    return ("enter" if kind == "activate" or arrow_clicked else "select"), idx
+
+
 def footer_hint(state: TuiState) -> str:
     """底部提示（純函式）：平坦模式沒有群組，展開收合的提示換成排序。"""
     if state.flat:
@@ -887,10 +1002,9 @@ def _draw(stdscr, state: TuiState, rows: list[Row], tree, watch: float) -> None:
     _addstr(stdscr, 1, 0, fit_display(head2, width)[0], curses.A_DIM)
     _addstr(stdscr, maxy - 1, 0, pad_display(footer_hint(state), width), curses.A_REVERSE)
 
-    top, height = 2, body_height(maxy, state)
+    top, height = body_top(maxy, state), body_height(maxy, state)
     if state.flat and maxy > 3:  # 平坦模式是表格，補一行凍結欄名
         _addstr(stdscr, 2, 0, fit_display(flat_header_line(), width)[0], curses.A_UNDERLINE)
-        top = 3
     if height < 1:
         stdscr.refresh()
         return
@@ -926,7 +1040,19 @@ def _draw(stdscr, state: TuiState, rows: list[Row], tree, watch: float) -> None:
     stdscr.refresh()
 
 
-def _popup(stdscr, lines, title="明細", hint=" 任意鍵關閉 "):
+def popup_mouse_action(x: int, y: int, bstate: int, *,
+                       x0: int, y0: int, w: int, h: int) -> str | None:
+    """彈窗滑鼠映射：滾輪瀏覽、內部左鍵啟動、外部左鍵或右鍵關閉。"""
+    kind = mouse_event_kind(bstate)
+    if kind in ("wheel_up", "wheel_down", "close"):
+        return kind
+    if kind in ("click", "activate"):
+        inside = x0 <= x < x0 + w and y0 <= y < y0 + h
+        return "activate" if inside else "close"
+    return None
+
+
+def _popup(stdscr, lines, title="明細", hint=" 點擊/任意鍵關閉 "):
     """置中彈窗；回傳關閉它的按鍵，讓呼叫端能據此再往下鑽一層。"""
     maxy, maxx = stdscr.getmaxyx()
     body = lines or ["（無明細）"]
@@ -937,14 +1063,54 @@ def _popup(stdscr, lines, title="明細", hint=" 任意鍵關閉 "):
             + [disp_width(x) for x in body]) + 4,
     )
     h = min(maxy - 2, len(body) + 4)
-    win = curses.newwin(h, w, max(0, (maxy - h) // 2), max(0, (maxx - w) // 2))
-    win.box()
-    _addstr(win, 0, 2, f" {title} ", curses.A_BOLD)
-    for i, ln in enumerate(body[: h - 4]):
-        _addstr(win, 2 + i, 2, fit_display(ln, w - 4)[0])
-    _addstr(win, h - 1, 2, fit_display(hint, w - 4)[0], curses.A_DIM)
-    win.refresh()
-    return win.getch()
+    y0, x0 = max(0, (maxy - h) // 2), max(0, (maxx - w) // 2)
+    win = curses.newwin(h, w, y0, x0)
+    win.keypad(True)  # wrapper 只替 stdscr 開 keypad；滑鼠/方向鍵也要讓子視窗解碼
+    view_h = max(1, h - 4)
+    off = 0
+
+    while True:
+        off = clamp_scroll(len(body), view_h, off)
+        win.erase()
+        win.box()
+        _addstr(win, 0, 2, f" {title} ", curses.A_BOLD)
+        for i, ln in enumerate(body[off: off + view_h]):
+            _addstr(win, 2 + i, 2, fit_display(ln, w - 4)[0])
+        shown = ""
+        if len(body) > view_h:
+            shown = f" {off + 1}-{min(off + view_h, len(body))}/{len(body)}"
+        _addstr(win, h - 1, 2, fit_display(hint.rstrip() + shown, w - 4)[0], curses.A_DIM)
+        win.refresh()
+
+        ch = win.getch()
+        if ch == curses.KEY_UP and len(body) > view_h:
+            off -= 1
+            continue
+        if ch == curses.KEY_DOWN and len(body) > view_h:
+            off += 1
+            continue
+        if ch == curses.KEY_PPAGE and len(body) > view_h:
+            off -= view_h
+            continue
+        if ch == curses.KEY_NPAGE and len(body) > view_h:
+            off += view_h
+            continue
+        if ch != curses.KEY_MOUSE:
+            return ch
+
+        event = _read_mouse()
+        if event is None:
+            continue
+        mx, my, bstate = event
+        act = popup_mouse_action(mx, my, bstate, x0=x0, y0=y0, w=w, h=h)
+        if act == "wheel_up":
+            off -= _MOUSE_SCROLL_LINES
+        elif act == "wheel_down":
+            off += _MOUSE_SCROLL_LINES
+        elif act == "activate":
+            return curses.KEY_ENTER
+        elif act == "close":
+            return 27
 
 
 def _level_attr(level: str):
@@ -1003,12 +1169,20 @@ def _csv_viewer(stdscr, rec, watch) -> None:
                 _addstr(stdscr, 2 + i, 0, csv_line(row, view.hoff, width),
                         _level_attr(row.level))
             shown = f"{view.off + 1}-{min(view.off + view_h, len(rows))}/{len(rows)}"
-            foot = (f" ↑↓捲動  ←→水平  PgUp/PgDn翻頁  g/G首末  0復位  s欄位/S升降"
-                    f"  q/Esc返回明細   {shown}")
+            foot = (f" 滾輪/↑↓捲動  Shift+滾輪/←→水平  PgUp/PgDn翻頁  g/G首末"
+                    f"  s/S排序  右鍵/q/Esc返回   {shown}")
             _addstr(stdscr, maxy - 1, 0, pad_display(foot, width), curses.A_REVERSE)
             stdscr.refresh()
 
-            act = csv_key_action(stdscr.getch())
+            ch = stdscr.getch()
+            if ch == curses.KEY_MOUSE:
+                event = _read_mouse()
+                if event is None:
+                    continue
+                _mx, my, bstate = event
+                act = csv_mouse_action(my, bstate, maxy)
+            else:
+                act = csv_key_action(ch)
             if act == "close":
                 return
             if act:
@@ -1021,7 +1195,7 @@ def _csv_viewer(stdscr, rec, watch) -> None:
 
 
 def _device_drilldown(stdscr, dev, watch, repaint) -> None:
-    """明細 ↔ CSV 原始資料：明細按 Enter 再往下鑽一層，其他鍵關閉回列表。
+    """明細 ↔ CSV 原始資料：明細按 Enter/左鍵往下鑽，其餘非捲動輸入回列表。
 
     每輪先 repaint()：CSV 檢視是畫滿 stdscr 的，較小的明細彈窗蓋不掉它，
     不先把主畫面重畫回來，第二次看明細就會疊在 CSV 殘影上。
@@ -1034,7 +1208,7 @@ def _device_drilldown(stdscr, dev, watch, repaint) -> None:
         ch = _popup(
             stdscr,
             device_detail_lines(dev),
-            hint=" Enter 看 CSV 原始資料｜其他鍵關閉 ",
+            hint=" Enter/左鍵 看 CSV｜右鍵/點外側返回｜滾輪瀏覽 ",
         )
         if ch not in _ENTER_KEYS:
             return
@@ -1072,6 +1246,7 @@ def _main_loop(stdscr, args):
     import time
 
     curses.curs_set(0)
+    _enable_mouse()
     if curses.has_colors():
         curses.start_color()
         try:
@@ -1115,13 +1290,30 @@ def _main_loop(stdscr, args):
                 tree = reload()
                 last = time.monotonic()
             continue
-        act = key_action(ch)
+        if ch == curses.KEY_MOUSE:
+            event = _read_mouse()
+            if event is None:
+                continue
+            mx, my, bstate = event
+            act, mouse_idx = main_mouse_action(
+                mx, my, bstate, rows, state, stdscr.getmaxyx()[0]
+            )
+            if mouse_idx is not None:
+                state.sel_key = rows[mouse_idx].key
+        else:
+            act = key_action(ch)
         if act == "quit":
             break
         elif act == "up":
             move_selection(rows, state, -1)
         elif act == "down":
             move_selection(rows, state, 1)
+        elif act == "wheel_up":
+            move_selection(rows, state, -_MOUSE_SCROLL_LINES)
+        elif act == "wheel_down":
+            move_selection(rows, state, _MOUSE_SCROLL_LINES)
+        elif act == "select":
+            pass  # 上面已依 mouse_idx 設定選取列
         elif act == "pgdn":
             move_selection(rows, state, body_height(stdscr.getmaxyx()[0], state))
         elif act == "pgup":

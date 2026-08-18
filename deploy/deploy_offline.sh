@@ -2,11 +2,9 @@
 #
 # deploy_offline.sh — 船機的唯一一次人工安裝入口
 # ---------------------------------------------------------------------------
-# ⚠ 這支腳本的職責早已超出檔名。它最初只做一件事:用 deploy/wheelhouse/ 內預先下載的
-#   wheel 為 sftp_transfer 建立專屬 venv(所以叫 offline —— 指的是**不從 PyPI 下載**,
-#   不是「機器沒有網路」;船上是連得到 SFTP 的 61.56.200.137 的,OTA 整套機制就靠它)。
-#   後來陸續被加上 timer、sudoers 白名單、心跳服務、存活巡檢(見 6fcbcad / 6192841 /
-#   708c781),於是實際上變成「船機唯一的一次性人工安裝流程」。檔頭照實寫,避免誤導。
+# 這支腳本是船機唯一的一次性人工安裝入口。雙平台相容層只負責以
+# deploy/platforms/<profile>/debs 離線補齊 tmux；Python 沿用船端既有預安裝，
+# 不攜帶、安裝或限制 Python runtime 版本。階段 C 的 SFTP OTA 只走內部網路。
 #
 # 三個階段:
 #
@@ -21,11 +19,11 @@
 #         (start_web_docker.sh)跑在 systemd user session 裡、無法輸入 sudo 密碼,
 #         所以「免 sudo 使用 docker」是它能開機自啟的前提。群組變更需重開機才生效。
 #      5~7) 以下三步由**同一個問題**一併決定(它們是一個概念單位:週期排程與 ipc 接管):
-#         5) install_timers.sh      → 7 支週期排程 timer
+#         5) install_timers.sh      → 週期排程 timer（依實體 IPC 篩選）
 #         6) sudoers 白名單         → reboot / teamviewer 需要(這一步要輸入一次密碼)
 #         7) install_services.sh    → 4 支常駐服務:heartbeat(雙向心跳/接管)、
 #                                     alarm-controller / board-server / button(綁實體 IPC-1)
-#      8) install_tmux_offline.sh → 以隨附的 debs/ 離線補齊 tmux(需密碼)。
+#      8) install_tmux_offline.sh → 以平台 profile 的 debs/ 離線補齊 tmux(需密碼)。
 #         **必須排在 10) 之前**:10) 的提示要據此警告「缺 tmux 時 session 型專案全起不來」。
 #         scheduler 的每一支 start_*.sh 都靠 tmux new-session,啟動器也靠 tmux has-session
 #         對帳 —— 少了它,啟動流程會一項一項 exit 2,而船上又沒有網路可以 apt install。
@@ -50,7 +48,7 @@
 #       那份巡檢才第一次真的有意義)
 #      可用 --no-launch 關閉;選 n 也不會壞,下次開機 nssms-boot 會跑同一支啟動器。
 #
-# 目標平台：Linux aarch64 / CPython 3.10 / glibc >= 2.34  (NVIDIA Tegra, mic-733ao)
+# tmux 離線安裝目標：Ubuntu 18.04 / 22.04 ARM64。Python 沿用主機預安裝。
 #
 # 用法：
 #   ./deploy_offline.sh                 # 建立/更新專屬 venv，安裝執行期相依 + 測試堆疊（預設）
@@ -59,28 +57,32 @@
 #   ./deploy_offline.sh --recreate      # 砍掉重建 venv（乾淨安裝）
 #   ./deploy_offline.sh --no-health-check # 部署後不自動執行能力／自動化健康檢查
 #   ./deploy_offline.sh --no-launch      # 部署後不執行啟動流程（不下載程式碼、不啟動服務）
-#   ./deploy_offline.sh --check-only    # 只驗證 wheel 完整性與環境，不安裝
+#   ./deploy_offline.sh --check-only    # 驗證平台與 tmux payload，不安裝、不修改 HOME/systemd/dpkg
 #   ./deploy_offline.sh --venv /path/to/venv        # 自訂 venv 路徑
-#   ./deploy_offline.sh --python /usr/bin/python3.10 # 指定建立 venv 用的直譯器
+#   ./deploy_offline.sh --python /path/python # 指定船端既有的 Python
 #
 # 特性：
 #   * venv 安裝全程 --no-index，永不連 PyPI（階段 C 的 SFTP 下載另當別論）。
-#   * 以 python3.10 -m virtualenv 建立 venv（與 radar / SHM 一致），不再依賴系統的
-#     python3-venv / ensurepip；若 python3.10 尚無 virtualenv，會用隨附的
-#     install_virtualenv_offline.sh + virtualenv_wheels/ 先離線補齊。
+#   * 優先使用船端 python3.10，沒有時沿用 python3；不安裝 Python runtime。
 #   * venv 與系統 site-packages 隔離。
-#   * 安裝前以 MANIFEST.txt 校驗 wheel sha256（可用 --skip-verify 跳過）。
+#   * 在任何系統變更前驗證平台、tmux deb 與其 sha256 manifest。
 #   * 安裝後在 venv 內驗證關鍵套件可正常匯入。
 #   * 全程輸出（stdout + stderr）逐字寫進 logs/deploy_offline_<時間>.log，與兩支巡檢器
 #     的 Markdown 報告放在同一個 logs/。報告記結果，這一份記過程；船上回報問題寄它。
-#   * tmux 同樣離線補齊：隨附 debs/ 內的 .deb 以 dpkg -i 安裝（見
-#     install_tmux_offline.sh），全程不連網。無 sudo 密碼可輸入時退回 ~/.local。
+#   * tmux 依平台選用 Bionic/Jammy deb；缺 sudo 時安全停止，不使用 rootless 解包。
 # ---------------------------------------------------------------------------
 set -euo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+PLATFORMS_ROOT="${SCRIPT_DIR}/platforms"
+# wheelhouse / virtualenv_wheels 與 debs 同構：各平台一份，放在自己的 profile 底下，
+# manifest 就放在該目錄**裡面**。理由與 debs 相同 —— 校驗的基準目錄是 wheelhouse 自己，
+# 混進一份共用 manifest 只會在換平台時對不上。實際路徑在 banner_and_preflight 裡由
+# 偵測到的 profile 決定（見 resolve_wheelhouse）；這裡的值只是「還沒偵測」的預設。
 WHEELHOUSE="${SCRIPT_DIR}/wheelhouse"
 MANIFEST="${SCRIPT_DIR}/MANIFEST.txt"
+VENV_WHEELS=""         # 空＝交給 install_virtualenv_offline.sh 自己找同層 virtualenv_wheels/
+WHEELHOUSE_LAYOUT=""   # profile / legacy —— 只用於訊息，讓記錄看得出走了哪一條
 PROJECT_DIR="$(cd "${SCRIPT_DIR}/.." && pwd)"
 SHARE_DIR="$(dirname "$PROJECT_DIR")"
 # 船舶基本資訊檔：供各設定檔的 {vsl_name}/{ipc} 佔位符替換使用（見 settings.py）。
@@ -88,7 +90,7 @@ VESSEL_INFO="${SHARE_DIR}/.env/vessel_basic_info.json"
 
 DEFAULT_VENV="${HOME}/venv/wanhai_nssms/share/sftp_transfer"
 VENV_DIR="${DEFAULT_VENV}"
-PYTHON_BIN=""          # 空字串＝自動偵測（優先 python3.10，與下游 install_env.sh 一致）
+PYTHON_BIN=""          # 空字串＝自動偵測（優先 python3.10，其次 python3）
 # 預設安裝測試堆疊（pytest 等），讓部署後的 health_check 預設就會實際跑單元測試。
 # 以 --skip-tests 關閉：不裝測試套件，且轉傳 --skip-tests 讓 health_check 略過。
 INSTALL_TESTS=1
@@ -258,18 +260,77 @@ parse_args() {
     shift
   done
 
-  # 未指定 --python 時自動選直譯器：優先 python3.10（下游 install_env.sh 與 wheelhouse
-  # 的 cp310 wheel 皆以此為準），退而求其次才用 python3。
   if [ -z "$PYTHON_BIN" ]; then
-    if command -v python3.10 >/dev/null 2>&1; then
-      PYTHON_BIN="python3.10"
+    # 固定系統路徑優先，避免操作者從已啟用的 venv 內執行時，PATH 的 python3
+    # 污染 bootstrap，造成 pip --user 在 venv 內被拒絕。
+    if [ -x /usr/bin/python3.10 ]; then
+      PYTHON_BIN="/usr/bin/python3.10"
+    elif [ -x /usr/bin/python3 ]; then
+      PYTHON_BIN="/usr/bin/python3"
+    elif command -v python3.10 >/dev/null 2>&1; then
+      PYTHON_BIN="$(command -v python3.10)"
     else
-      PYTHON_BIN="python3"
+      PYTHON_BIN="$(command -v python3 2>/dev/null || true)"
     fi
+  elif command -v "$PYTHON_BIN" >/dev/null 2>&1; then
+    PYTHON_BIN="$(command -v "$PYTHON_BIN")"
+  fi
+
+  case "$VENV_DIR" in
+    /*) ;;
+    *) err "--venv 必須使用絕對路徑：$VENV_DIR"; exit 2 ;;
+  esac
+  VENV_DIR="$(readlink -m -- "$VENV_DIR")"
+  case "$VENV_DIR" in
+    /|/bin|/boot|/dev|/etc|/home|/lib|/lib64|/opt|/proc|/root|/run|/sbin|/srv|/sys|/tmp|/usr|/var|\
+    "$HOME"|"$PROJECT_DIR"|"$SHARE_DIR")
+      err "拒絕把重要目錄當成 venv：$VENV_DIR"
+      exit 2
+      ;;
+  esac
+}
+
+# 依偵測到的 profile 決定 wheelhouse / virtualenv_wheels 的實際位置。
+# 必須在 nssms_detect_profile 之後呼叫（它要 $PROFILE_DIR）。
+#
+# 兩種佈局：
+#   profile — deploy/platforms/<profile>/wheelhouse/{*.whl,MANIFEST.txt}   ← 正規
+#   legacy  — deploy/wheelhouse/ + deploy/MANIFEST.txt                     ← 過渡
+#
+# legacy 留著是因為已經派送到船上的舊離線包就是那個形狀，換版不該讓它們一次全部失效。
+# 但 legacy 只有**單一**一份，換平台必然對不上 —— 所以走 legacy 時會 warn，並且
+# 相容性檢查照跑（那才是真正的守門，不是靠目錄名字）。
+resolve_wheelhouse() {
+  local prof_wh="${PROFILE_DIR}/wheelhouse"
+  local prof_vw="${PROFILE_DIR}/virtualenv_wheels"
+
+  if [ -d "$prof_wh" ]; then
+    WHEELHOUSE="$prof_wh"
+    MANIFEST="${prof_wh}/MANIFEST.txt"
+    WHEELHOUSE_LAYOUT="profile：${NSSMS_PROFILE_ID}"
+  else
+    WHEELHOUSE="${SCRIPT_DIR}/wheelhouse"
+    MANIFEST="${SCRIPT_DIR}/MANIFEST.txt"
+    WHEELHOUSE_LAYOUT="legacy 共用目錄"
+    warn "找不到 ${prof_wh}，退回共用的 deploy/wheelhouse/。"
+    warn "共用目錄只有一份，換平台一定對不上；請盡快改成 per-profile 佈局。"
+  fi
+
+  # virtualenv 的 bootstrap 輪子同理，但它可以共用：目前那一組全部宣告
+  # Requires-Python >=3.6，Bionic 與 Jammy 都吃得下。若哪天要為某個 profile 另備一份，
+  # 放 platforms/<profile>/virtualenv_wheels/ 就會自動被挑走。
+  if [ -d "$prof_vw" ]; then
+    VENV_WHEELS="$prof_vw"
+  elif [ -d "${SCRIPT_DIR}/virtualenv_wheels" ]; then
+    VENV_WHEELS="${SCRIPT_DIR}/virtualenv_wheels"
+  else
+    VENV_WHEELS=""
   fi
 }
 
 banner_and_preflight() {
+  local preflight_failures=0
+  local preflight_rc=4
   echo "==========================================================="
   echo " sftp_transfer 離線部署 (offline deploy — 專屬 venv)"
   echo "==========================================================="
@@ -277,18 +338,83 @@ banner_and_preflight() {
   # 而那些正是最需要「記錄在哪」的情況。這一行本身也會進記錄，等於檔案自帶檔名。
   [ -n "$TRANSCRIPT" ] && info "完整終端記錄：$TRANSCRIPT"
 
-  # --- 前置檢查 --------------------------------------------------------------
+  # --- 嚴格前置檢查：本函式完成前不得有任何持久變更 -------------------------
+  # shellcheck source=deploy/lib/offline_common.sh
+  . "${SCRIPT_DIR}/lib/offline_common.sh"
+  nssms_detect_profile "$PLATFORMS_ROOT" || exit $?
+  PROFILE_DIR="$NSSMS_PROFILE_DIR"
+  export NSSMS_PROFILE_ID NSSMS_PROFILE_DIR
+  info "平台 profile  : $NSSMS_PROFILE_ID"
+  info "系統版本      : $NSSMS_OS_ID $NSSMS_OS_VERSION / $NSSMS_ARCH"
+  info "glibc          : $NSSMS_GLIBC"
   if ! command -v "$PYTHON_BIN" >/dev/null 2>&1; then
-    err "找不到 Python 直譯器：$PYTHON_BIN"; exit 1
+    err "找不到船端預安裝的 Python：$PYTHON_BIN"
+    preflight_failures=$((preflight_failures + 1))
+  else
+    if ! "$PYTHON_BIN" -c 'import sys; raise SystemExit(0 if getattr(sys, "base_prefix", sys.prefix) == sys.prefix and not hasattr(sys, "real_prefix") else 1)' >/dev/null 2>&1; then
+      err "基底直譯器位於虛擬環境中：$PYTHON_BIN"
+      err "請以 --python /usr/bin/python3 指定系統直譯器；尚未做任何持久變更。"
+      preflight_failures=$((preflight_failures + 1))
+    fi
+    PY_VER="$("$PYTHON_BIN" -c 'import sys;print(".".join(map(str,sys.version_info[:3])))')"
+    PY_TAG="$("$PYTHON_BIN" -c 'import sys;print("cp%d%d"%sys.version_info[:2])')"
+    info "基底直譯器    : $PYTHON_BIN ($PY_VER, $PY_TAG；船端預安裝)"
   fi
-  PY_VER="$("$PYTHON_BIN" -c 'import sys;print(".".join(map(str,sys.version_info[:3])))')"
-  PY_TAG="$("$PYTHON_BIN" -c 'import sys;print("cp%d%d"%sys.version_info[:2])')"
-  info "基底直譯器    : $PYTHON_BIN ($PY_VER, $PY_TAG)"
-  info "系統架構      : $(uname -m) ($(uname -s) $(uname -r))"
-  info "Wheelhouse    : $WHEELHOUSE"
+  resolve_wheelhouse
+  info "Wheelhouse    : $WHEELHOUSE（$WHEELHOUSE_LAYOUT）"
   info "專案目錄      : $PROJECT_DIR"
   info "專屬 venv     : $VENV_DIR"
   info "船舶資訊檔    : $VESSEL_INFO"
+
+  # --- wheelhouse 與「這個」直譯器是否真的相容 ------------------------------
+  # 這一項刻意放在階段 A 之前。它擋的是「preflight 全綠、階段 B 才發現輪子根本
+  # 裝不上」——那個時序下 systemd/sudoers/tmux 已經改完，而沒裝完的 venv 會讓兩支
+  # OTA 腳本的 `[ -x $VENV_PY ]` 守門失效（venv 在、paramiko 不在），於是那條船
+  # 失去唯一的下載路徑。詳見 lib/wheel_compat.py 的檔頭。
+  if [ -z "${PY_VER:-}" ]; then
+    : # 直譯器都找不到，上面已經記過一筆，這裡不重複
+  else
+    WHEEL_REQUIRED=(paramiko bcrypt cryptography pynacl cffi pycparser)
+    PY_MM="$("$PYTHON_BIN" -c 'import sys;print("%d.%d"%sys.version_info[:2])')"
+    # 目標平台明確傳進去，不讓 checker 從「執行它的直譯器」去猜（見該檔 main() 的註解）。
+    run_rc "$PYTHON_BIN" "${SCRIPT_DIR}/lib/wheel_compat.py" \
+      --py "$PY_MM" --glibc "$NSSMS_GLIBC" --arch "$(uname -m)" \
+      "$WHEELHOUSE" "${WHEEL_REQUIRED[@]}"
+    case "$RC" in
+      0) ok "wheelhouse 與 $PY_TAG / glibc $NSSMS_GLIBC 相容。" ;;
+      *)
+        err "wheelhouse 與本機不相容（exit=$RC）；尚未做任何持久變更。"
+        err "本機需要的是 $PY_TAG / glibc $NSSMS_GLIBC 的輪子。"
+        err "正確做法是為這個 profile 另備一份 wheelhouse："
+        err "  deploy/platforms/${NSSMS_PROFILE_ID}/wheelhouse/"
+        err "重建方式見 deploy/README.md 的「未來如何更新 / 重建 wheelhouse」。"
+        preflight_failures=$((preflight_failures + 1))
+        [ "$RC" -ne 6 ] || preflight_rc=6
+        ;;
+    esac
+  fi
+
+  run_rc bash "$SCRIPT_DIR/install_tmux_offline.sh" --check-only --profile-dir "$PROFILE_DIR"
+  case "$RC" in
+    0|5) ok "tmux profile 與本機 ABI 驗證通過。" ;;
+    *)
+      err "tmux preflight 失敗（exit=$RC）；尚未執行 dpkg。"
+      preflight_failures=$((preflight_failures + 1))
+      [ "$RC" -ne 6 ] || preflight_rc=6
+      ;;
+  esac
+
+  if [ "$preflight_failures" -ne 0 ]; then
+    err "離線部署 preflight 共發現 $preflight_failures 個問題；未執行任何持久變更。"
+    exit "$preflight_rc"
+  fi
+  ok "雙平台 tmux 離線資產 preflight 通過。"
+
+  if [ "$CHECK_ONLY" -eq 1 ]; then
+    ok "--check-only 完成：未執行安裝或其他持久變更。"
+    exit 0
+  fi
+
 }
 
 # --- 船舶基本資訊檔（vessel_basic_info.json）檢查 / 互動建立 ----------------
@@ -786,7 +912,7 @@ stage_scheduler_units() {
     warn "如需設定，請手動執行：bash $TIMERS_INSTALLER"
     warn "reboot / teamviewer 需 sudo 白名單，見 $SUDOERS_SRC 檔頭安裝說明。"
     SCHED_STATUS="略過（非互動終端機）"
-  elif ask_yn "  是否設定週期排程與 ipc 接管（timer + 心跳/接管服務 + sudo 白名單）？[Y/n] " Y; then
+  elif ask_yn "  是否設定週期排程與 IPC1↔IPC2 接管（IPC3 只裝通用 timer，不啟用心跳/failover）？[Y/n] " Y; then
     # 三個動作(timer / sudoers / 常駐服務)刻意只問一題:它們是同一個概念單位,分開問只會
     # 讓操作者面對三個不知道能不能各自拒絕的問題。
     mutating "佈署 timer / sudoers / 常駐服務"
@@ -857,9 +983,9 @@ stage_scheduler_units() {
     fi
 
     # (3) 常駐服務（user 層,免 root）：
-    #     nssms-heartbeat（兩台都裝,角色自動分派）
+    #     nssms-heartbeat（僅實體 IPC1/IPC2 佈署，角色自動分派；IPC3 為 N/A）
     #     nssms-alarm-controller / nssms-board-server / nssms-button
-    #       （硬體實體綁 IPC-1,unit 內有 ExecCondition 自行判定,兩台裝同一份即可）
+    #       （硬體實體綁 IPC-1，由 install_services.sh 依 NSSMS-BaseIPC 判定）
     #
     #     舊 clink_* 的停用**必須排在這之前**（見上方一次性遷移段）：舊的 system unit 還
     #     活著時，新 unit 會撞 port。這裡只負責裝。
@@ -891,15 +1017,15 @@ stage_scheduler_units() {
 # 「有項目失敗」,要交叉三份 log 才會發現原因是缺一個指令。船上又沒有對外網路,
 # `apt install tmux` 不成立,所以這件事在船上原本**無法自救**。
 #
-# 語意與上面兩段的群組設定同一類:一次性、需要密碼、由專用安裝器負責、失敗只警告。
-# 差別是它有免 root 的後備路徑(解到 ~/.local),所以非互動終端機下也還能補齊。
+# 語意與上面兩段的群組設定同一類:一次性、需要密碼、由專用安裝器負責。tmux 是啟動
+# 前提，所以缺 sudo 或 dpkg 失敗時整份部署必須停止，不再留下「部署成功但全無 session」。
 #
 # **必須排在 stage_launch_decision 之前**:那一題的提示要據 TMUX_STATUS 警告操作者
 # 「現在按 Y 立刻啟動,session 型專案會全部起不來」。
 #
 # 冪等:tmux 已可用時安裝器自己會判斷並安靜跳過（rc=0），這裡不問任何問題。
-# 離開碼見 install_tmux_offline.sh 檔頭:0 就緒 / 3 免 root 裝好 / 4 離線包不完整 /
-# 5 (--check-only) 待安裝 / 1 失敗。
+# 離開碼見 install_tmux_offline.sh 檔頭:0 就緒 / 4 離線包不完整 /
+# 5 (--check-only) 待安裝 / 6 平台不相容 / 1 失敗。
 stage_tmux() {
   TMUX_INSTALLER="${SCRIPT_DIR}/install_tmux_offline.sh"
   TMUX_STATUS="未執行"
@@ -911,55 +1037,35 @@ stage_tmux() {
     TMUX_STATUS="略過（找不到安裝腳本）"
     return
   fi
-  # 先唯讀探一次:已就緒(rc=0)就什麼都不必問,這是絕大多數情況。
-  run_rc bash "$TMUX_INSTALLER" --check-only
+  # preflight 已做過全套 asset/ABI probe；這裡再判斷現有 tmux 能否保留。
+  run_rc bash "$TMUX_INSTALLER" --check-only --profile-dir "$PROFILE_DIR"
   TMUX_RC="$RC"
   if [ "$TMUX_RC" -eq 0 ]; then
     ok "tmux 已可用（$(tmux -V 2>/dev/null || echo '版本未知')）。"
     TMUX_STATUS="已就緒"
     return
   fi
-  # 以下都是「tmux 不能用」。--check-only 只回報,不安裝。
+  # main 的 --check-only 已在全域 preflight 結束；以下只可能是正式部署。
   warn "本機的 tmux 不可用 —— 所有 session 型專案（shm / radar / wave / ecdis / flag）都起不來。"
-  if [ "$CHECK_ONLY" -eq 1 ]; then
-    case "$TMUX_RC" in
-      5) TMUX_STATUS="待安裝（離線包齊備）$DRYRUN_NOTE" ;;
-      4) TMUX_STATUS="無法安裝（離線包缺 debs/）$DRYRUN_NOTE" ;;
-      *) TMUX_STATUS="狀態不明（rc=$TMUX_RC）$DRYRUN_NOTE" ;;
-    esac
-    return
-  fi
-  if [ "$TMUX_RC" -eq 4 ]; then
-    # 離線包不完整,問也沒用 —— 沒有東西可以裝。
-    warn "離線包內沒有可用的 debs/，無法離線補齊 tmux。"
-    warn "請從有網路的**同平台**機器蒐集 deb，見 $SCRIPT_DIR/README.md。"
-    TMUX_STATUS="無法安裝（離線包缺 debs/）"
-    return
+  if [ "$TMUX_RC" -ne 5 ]; then
+    err "tmux 狀態或離線資產異常（exit=$TMUX_RC），停止部署。"
+    exit "$TMUX_RC"
   fi
   if [ ! -t 0 ]; then
-    # 非互動:安裝器自己會退回免 root 路徑,不需要密碼。這與 gpio / docker 群組那兩步
-    # 不同（那兩步非互動時只能放棄），所以這裡照跑而不是略過。
-    warn "非互動終端機：以免 root 方式（~/.local）補齊 tmux。"
+    info "非互動終端機：只有 sudo 已預先授權時才能安裝 tmux。"
   elif ! ask_yn "  現在以隨附的 deb 離線安裝 tmux？（需輸入一次密碼）[Y/n] " Y; then
-    info "略過 tmux 安裝。日後可執行：bash $TMUX_INSTALLER"
-    warn "**在補齊之前，啟動流程的 session 型專案會全部失敗。**"
-    TMUX_STATUS="使用者略過（session 型專案會失敗）"
-    return
+    err "tmux 是完整部署的必要條件；使用者取消安裝，停止部署。"
+    exit 1
   fi
   mutating "以 dpkg 離線安裝 tmux"
-  run_rc bash "$TMUX_INSTALLER"
+  run_rc bash "$TMUX_INSTALLER" --profile-dir "$PROFILE_DIR"
   TMUX_RC="$RC"
-  case "$TMUX_RC" in
-    0) ok "tmux 已安裝並可用（dpkg）。"
-       TMUX_STATUS="已安裝（dpkg）" ;;
-    3) ok "tmux 已以免 root 方式安裝到 ~/.local/bin。"
-       info "systemd user manager 的預設 PATH 已含 ~/.local/bin，nssms-boot 找得到它。"
-       TMUX_STATUS="已安裝（~/.local，未登錄 dpkg）" ;;
-    4) warn "離線包不完整，未安裝 tmux。"
-       TMUX_STATUS="無法安裝（離線包缺 debs/）" ;;
-    *) warn "tmux 安裝失敗（exit=$TMUX_RC），session 型專案將無法啟動。"
-       TMUX_STATUS="安裝失敗（exit=$TMUX_RC）" ;;
-  esac
+  if [ "$TMUX_RC" -ne 0 ]; then
+    err "tmux 安裝失敗（exit=$TMUX_RC），停止部署。"
+    exit "$TMUX_RC"
+  fi
+  ok "tmux 已安裝並通過 session 能力測試（dpkg）。"
+  TMUX_STATUS="已安裝（dpkg / $NSSMS_PROFILE_ID）"
 }
 
 # --- 照片同步的 SSH 金鑰（scheduler/install_setup_ssh_key.sh）---------------
@@ -1137,7 +1243,13 @@ stage_wheelhouse_and_venv() {
     if [ ! -f "$VENV_INSTALLER" ]; then
       err "找不到離線安裝腳本：$VENV_INSTALLER"; exit 1
     fi
-    bash "$VENV_INSTALLER"
+    # VENV_WHEELS_DIR 讓 profile 專屬的 virtualenv_wheels/ 生效（見 resolve_wheelhouse）；
+    # 空字串時不設，維持安裝器自己找同層目錄的既有行為。
+    if [ -n "$VENV_WHEELS" ]; then
+      PYTHON_BIN="$PYTHON_BIN" VENV_WHEELS_DIR="$VENV_WHEELS" bash "$VENV_INSTALLER"
+    else
+      PYTHON_BIN="$PYTHON_BIN" bash "$VENV_INSTALLER"
+    fi
     if ! "$PYTHON_BIN" -m virtualenv --version >/dev/null 2>&1; then
       err "virtualenv 離線安裝後，$PYTHON_BIN 仍無法使用（可能裝到了其他解譯器）。"
       err "請確認 $PYTHON_BIN 與 install_virtualenv_offline.sh 選用的解譯器一致。"
@@ -1189,8 +1301,28 @@ stage_wheelhouse_and_venv() {
 
   PKGS=("${RUNTIME_PKGS[@]}")
   if [ "$INSTALL_TESTS" -eq 1 ]; then
-    PKGS+=("${TEST_PKGS[@]}")
-    info "安裝範圍      : 執行期相依 + 測試堆疊 (pytest；預設)"
+    # 執行期相依是**必須**的（preflight 的 wheel_compat.py 已經強制它們存在）；
+    # 測試堆疊則按 wheelhouse 實際有什麼裝什麼。理由：同一份清單套到不同 Python 會有
+    # 客觀上不存在的成員 —— 例如 exceptiongroup 的 backport 要 >=3.7，Bionic 的 py3.6
+    # 沒有任何真版本（PyPI 上只有一個 0.0.0a0 佔位套件，還會把 trio 一串拖進來）。
+    # 為此讓整個部署失敗是不對的：測試堆疊不是船上跑服務的必要條件。
+    local skipped=()
+    for pkg in "${TEST_PKGS[@]}"; do
+      # wheel 檔名的 name 欄位用底線與大小寫變體，比對前一起正規化（PEP 503）。
+      local norm; norm="$(printf '%s' "$pkg" | tr 'A-Z_.' 'a-z--')"
+      if find "$WHEELHOUSE" -maxdepth 1 -name '*.whl' -printf '%f\n' 2>/dev/null \
+         | sed 's/-.*//' | tr 'A-Z_.' 'a-z--' | grep -qx "$norm"; then
+        PKGS+=("$pkg")
+      else
+        skipped+=("$pkg")
+      fi
+    done
+    if [ "${#skipped[@]}" -gt 0 ]; then
+      info "安裝範圍      : 執行期相依 + 測試堆疊（本 profile 缺 ${skipped[*]}，略過）"
+      warn "此 profile 的 wheelhouse 沒有 ${skipped[*]}；health_check 的單元測試段會受限。"
+    else
+      info "安裝範圍      : 執行期相依 + 測試堆疊 (pytest；預設)"
+    fi
   else
     info "安裝範圍      : 執行期相依 (paramiko 堆疊；--skip-tests)"
   fi
@@ -1229,6 +1361,28 @@ PY
 
   echo "-----------------------------------------------------------"
   ok "離線部署完成！專屬 venv：$VENV_DIR"
+}
+
+# systemd 設定的互動（含 sudoers 密碼）必須在階段 A 完成，但 shipboard upload 的
+# ExecStart 依賴階段 B 才建立的專屬 venv。venv 完成後無提示地再同步一次 timer：讓該 unit
+# 在首次部署也以完整環境收尾，並由 install_timers 清除 bootstrap 期間可能留下的 failed latch。
+stage_finalize_venv_dependent_units() {
+  case "${SCHED_STATUS:-}" in
+    已啟用|部分完成*) ;;
+    *) return 0 ;;
+  esac
+  [ -f "${TIMERS_INSTALLER:-}" ] || return 0
+
+  echo ""
+  info "專屬 venv 已完成，重新同步依賴 venv 的 timer 狀態 ..."
+  run_rc bash "$TIMERS_INSTALLER"
+  if [ "$RC" -eq 0 ]; then
+    ok "venv 相依 timer 已完成最終同步。"
+    SCHED_STATUS="已啟用"
+  else
+    warn "venv 完成後重同步 timer 仍有項目失敗（exit=$RC）。"
+    SCHED_STATUS="部分完成（venv 後重試 exit=$RC）"
+  fi
 }
 
 # --- 執行完整啟動流程（決定已在前面收集，這裡只執行） ----------------------
@@ -1470,6 +1624,7 @@ main() {
 
   # ---- 階段 B：sftp_transfer 專屬 venv（離線、無人干預）----
   stage_wheelhouse_and_venv
+  stage_finalize_venv_dependent_units
 
   # ---- 階段 C：完整啟動流程與驗證（無人干預）----
   stage_launch_exec                  # 刻意在 venv 之後（SFTP 下載要用它）

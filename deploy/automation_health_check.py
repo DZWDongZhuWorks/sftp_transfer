@@ -13,23 +13,22 @@ systemd、sudoers、tmux 或 failover 狀態。
   1  至少一項 FAIL
   2  指定 --fail-on-warn 且至少一項 WARN（但沒有 FAIL）
 """
-from __future__ import annotations
-
 import argparse
 import getpass
 import grp
 import json
 import os
 import pwd
+import re
 import shlex
 import shutil
 import socket
 import stat
 import subprocess
 import sys
-from dataclasses import dataclass
 from datetime import datetime
 from pathlib import Path
+from typing import Dict, List, NamedTuple, Optional, Set, Tuple
 
 
 SCRIPT_DIR = Path(__file__).resolve().parent
@@ -55,6 +54,12 @@ LEGACY_FAILOVER_STATE = Path(
 )
 USER_UNIT_DIR = Path.home() / ".config" / "systemd" / "user"
 SUDOERS_FILE = Path("/etc/sudoers.d/nssms-scheduler")
+# 時區的兩個退路來源（Bionic 的 timedatectl 沒有 show 子命令，見 detect_timezone）。
+ETC_TIMEZONE = Path("/etc/timezone")
+ETC_LOCALTIME = Path("/etc/localtime")
+# 白名單舊拼法指向的路徑。它在本機存不存在，決定了「白名單還沒更新」是壞掉還是漂移
+# （見 check_sudoers）。
+LEGACY_SYSTEMCTL = Path("/usr/bin/systemctl")
 REPORT_DIR = PROJECT_DIR / "logs"
 
 # 接管持續超過這麼久就從 INFO 升為 WARN。真實接管撐過一天代表 ipc1 一直沒修好，
@@ -67,19 +72,15 @@ TAKEOVER_WARN_HOURS = 24
 # reboot_launcher 的 OTA（SFTP 拉碼）與全相位起服務，船上慢網也該在十幾分鐘內收工。
 BOOT_ACTIVATING_FAIL_SECONDS = 900
 
-CORE_SERVICES = ("nssms-boot.service", "nssms-heartbeat.service")
-# nssms-download-photos 只在實體 IPC-2 上真的執行,閘門是 unit 的 ExecCondition。它仍然列在
-# 這裡而不開特例:timer 本身在三台都是 enabled + active/waiting,而被 ExecCondition 跳過的
-# service 是 inactive/dead + Result=exec-condition —— 兩者都落在 check_timers /
-# evaluate_service 既有的健康判定範圍內。
+# nssms-download-photos 只佈署在實體 IPC-2；device_monitor、shipboard upload 與 heartbeat
+# 只佈署在 IPC1/IPC2。適用範圍由 unit 內的 `# NSSMS-BaseIPC=...` 宣告，本巡檢與兩支
+# installer 共用該契約，IPC3 上的 N/A 不會被誤報成缺件。
 #
 # nssms-cleanup-old-files 兩台都跑、刻意沒有角色閘門（碟會滿是兩台各自的事）。它出貨時
 # 規則檔整份 enabled=false，所以正常一輪是「只預覽、零刪除」—— 對本巡檢而言仍是
 # active/waiting + Result=success，不需要特例。
 #
-# nssms-shipboard-alert-upload 同樣兩台都跑、刻意沒有角色閘門：UPLOAD_DATA_DIR 只在
-# 目前實際跑 web_server 的那台有內容，另一台 docker inspect 問不到容器就直接 exit 0。
-# 所以 standby 上「Result=success 但什麼都沒做」是正常現象，不是漏跑，不需要特例。
+# nssms-shipboard-alert-upload 在 IPC1/IPC2 都跑；有效角色不影響它，IPC3 則為 N/A。
 #
 # 【勿在下面的 tuple 內寫含括號的註解】device_monitor/tests/test_integration.sh 的涵蓋度斷言
 # 用 `^TIMERS = \((.*?)\)` 抓這個 tuple,非貪婪會停在**第一個**右括號:註解裡的括號會把清單
@@ -122,15 +123,17 @@ _RESET = "\033[0m"
 _COMPACT = False
 
 
-@dataclass
-class Check:
+# NamedTuple 而不是 dataclass：dataclasses 是 3.7 才進標準庫，而本程式跑在
+# **系統 python3**（不是 venv），Bionic 的船端就是 3.6 —— 靠 wheelhouse 補 backport
+# 在這裡行不通。Check 全程只被建構與讀取，不改欄位，NamedTuple 語意上剛好等價。
+class Check(NamedTuple):
     section: str
     name: str
     status: str
     detail: str
 
 
-RESULTS: list[Check] = []
+RESULTS = []  # type: List[Check]
 
 
 def color(status: str) -> str:
@@ -150,7 +153,7 @@ def heading(title: str) -> None:
         print(f"\n=== {title} ===")
 
 
-def _takeover_age_hours(since) -> float | None:
+def _takeover_age_hours(since):
     """接管已持續幾小時。since 不是合法時間就回傳 None。
 
     負值（since 位於未來）同樣視為不合法——heartbeat.sanitize_since() 會把它
@@ -163,7 +166,7 @@ def _takeover_age_hours(since) -> float | None:
     return age if age >= 0 else None
 
 
-def _monotonic_age_seconds(value: str) -> float | None:
+def _monotonic_age_seconds(value):
     """systemd 的 *TimestampMonotonic（開機以來的微秒）→ 距今幾秒。
 
     刻意用 monotonic 而不是人類可讀的 *Timestamp：後者長成
@@ -187,12 +190,14 @@ def _monotonic_age_seconds(value: str) -> float | None:
     return age if age >= 0 else None
 
 
-def run(cmd: list[str], timeout: float = 15) -> subprocess.CompletedProcess[str]:
+def run(cmd, timeout=15):
     try:
         return subprocess.run(
             cmd,
-            text=True,
-            capture_output=True,
+            # text= / capture_output= 都是 3.7 才有；Bionic 的船端是 3.6。
+            universal_newlines=True,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
             timeout=timeout,
             check=False,
         )
@@ -200,12 +205,12 @@ def run(cmd: list[str], timeout: float = 15) -> subprocess.CompletedProcess[str]
         return subprocess.CompletedProcess(cmd, 127, "", str(exc))
 
 
-def systemctl_show(unit: str, *properties: str) -> dict[str, str]:
+def systemctl_show(unit, *properties):
     cmd = ["systemctl", "--user", "show", unit, "--no-pager"]
     for prop in properties:
         cmd.extend(["-p", prop])
     proc = run(cmd)
-    values: dict[str, str] = {"_returncode": str(proc.returncode)}
+    values = {"_returncode": str(proc.returncode)}  # type: Dict[str, str]
     for line in proc.stdout.splitlines():
         if "=" in line:
             key, value = line.split("=", 1)
@@ -239,7 +244,7 @@ def _failover_on(value) -> bool:
     return False
 
 
-def check_identity() -> tuple[str, str]:
+def check_identity():
     heading("身分與路徑")
     role = "unknown"
     vessel = "unknown"
@@ -248,7 +253,7 @@ def check_identity() -> tuple[str, str]:
         info = read_json(VESSEL_INFO)
         vessel = str(info.get("vsl_name", "")).strip() or "unknown"
         ipc = normalize_ipc(str(info.get("ipc", "")))
-        if ipc in {"ipc1", "ipc2"}:
+        if ipc in {"ipc1", "ipc2", "ipc3"}:
             role = ipc
             record("identity", "船舶／IPC 身分", "PASS", f"{vessel} / {ipc}")
         else:
@@ -284,6 +289,13 @@ def check_identity() -> tuple[str, str]:
         else:
             record("identity", "接管狀態", "INFO",
                    f"{role}（接管 {peer}），已持續 {age_h:.1f} 小時，since={since_desc}")
+    elif role == "ipc3" and _failover_on(info.get("failover")):
+        # IPC3 不在接管拓撲內；不可把它推成 ipc3emer，也不可啟動 heartbeat。保留告警，
+        # 讓操作者知道身分檔有不應存在的殘留旗標，但後續仍以 ipc3 契約巡檢。
+        record(
+            "identity", "接管狀態", "WARN",
+            "IPC3 不參與 IPC1↔IPC2 failover；忽略身分檔的 failover=true（角色維持 ipc3）",
+        )
     elif info.get("failover") is not None:
         # 有欄位但不是真:白名單外的值一律視為未接管並告警(見 _failover_on)。
         record("identity", "接管狀態", "WARN",
@@ -329,19 +341,43 @@ def check_user_manager() -> None:
         detail = linger.stdout.strip() or linger.stderr.strip() or "Linger!=yes"
         record("systemd", "linger", "FAIL", detail)
 
-    timezone = run(["timedatectl", "show", "-p", "Timezone", "--value"])
-    zone = timezone.stdout.strip() if timezone.returncode == 0 else "unknown"
-    record("systemd", "排程時區", "INFO", f"{zone}（OnCalendar 依此時區解讀）")
+    record("systemd", "排程時區", "INFO", f"{detect_timezone()}（OnCalendar 依此時區解讀）")
+
+
+def detect_timezone() -> str:
+    """本機時區；問不到才回 "unknown"。
+
+    `timedatectl show` 是 systemd 239 才有的子命令，Bionic 的 237 只有 `status` ——
+    在 IPC3 上這一項固定印 unknown，而 OnCalendar 全靠時區解讀，看報告的人反而最需要
+    這個值。所以問不到就退到 Ubuntu 自己的兩個權威來源。
+    """
+    proc = run(["timedatectl", "show", "-p", "Timezone", "--value"])
+    if proc.returncode == 0 and proc.stdout.strip():
+        return proc.stdout.strip()
+    try:
+        zone = ETC_TIMEZONE.read_text(encoding="utf-8").strip()
+    except OSError:
+        zone = ""
+    if zone:
+        return zone
+    # /etc/localtime 是指向 /usr/share/zoneinfo/<Area>/<City> 的符號連結。
+    try:
+        target = os.readlink(str(ETC_LOCALTIME))
+    except OSError:
+        return "unknown"
+    marker = "/zoneinfo/"
+    index = target.find(marker)
+    return target[index + len(marker):] if index >= 0 else "unknown"
 
 
 def evaluate_service(
     unit: str,
     *,
     expected_active: str,
-    expected_substates: set[str],
+    expected_substates,  # type: Set[str]
     optional: bool = False,
     strict_optional: bool = False,
-) -> dict[str, str]:
+) -> Dict[str, str]:
     props = systemctl_show(
         unit,
         "LoadState",
@@ -386,7 +422,7 @@ def evaluate_service(
     return props
 
 
-def check_core_services() -> None:
+def check_core_services(role: str = "ipc1") -> None:
     heading("核心 services")
     boot = systemctl_show(
         "nssms-boot.service",
@@ -461,19 +497,32 @@ def check_core_services() -> None:
         and heartbeat.get("Result") == "success"
         and int(heartbeat.get("MainPID", "0") or "0") > 0
     )
-    record(
-        "units",
-        "nssms-heartbeat.service",
-        "PASS" if heartbeat_ok else "FAIL",
-        (
-            f"{heartbeat.get('ActiveState')}/{heartbeat.get('SubState')}, "
-            f"enabled={heartbeat.get('UnitFileState')}, "
-            f"pid={heartbeat.get('MainPID') or 'n/a'}"
-        ),
+    heartbeat_detail = (
+        f"{heartbeat.get('ActiveState')}/{heartbeat.get('SubState')}, "
+        f"enabled={heartbeat.get('UnitFileState')}, "
+        f"pid={heartbeat.get('MainPID') or 'n/a'}"
     )
+    if base_ipc(role) == "ipc3":
+        stale = (
+            heartbeat.get("UnitFileState") == "enabled"
+            or heartbeat.get("ActiveState") in {"active", "activating", "reloading"}
+        )
+        record(
+            "units",
+            "nssms-heartbeat.service",
+            "FAIL" if stale else "SKIP",
+            heartbeat_detail + ("；IPC3 不應啟用 heartbeat" if stale else "；IPC3 為 N/A"),
+        )
+    else:
+        record(
+            "units",
+            "nssms-heartbeat.service",
+            "PASS" if heartbeat_ok else "FAIL",
+            heartbeat_detail,
+        )
 
 
-def unit_source_path(unit: str) -> Path | None:
+def unit_source_path(unit):
     """unit 檔名 → repo 母體路徑。
 
     刻意不再對 nssms-heartbeat.service 做特例:改成依序在 services/ 與 timers/ 找。
@@ -486,7 +535,47 @@ def unit_source_path(unit: str) -> Path | None:
     return None
 
 
-def check_unit_sources() -> None:
+# 實體 IPC 的合法值。與 check_identity 的判定、scheduler/services/require_base_ipc.sh
+# 的參數白名單是同一份契約。
+KNOWN_BASE_IPCS = frozenset({"ipc1", "ipc2", "ipc3"})
+
+
+def base_ipc(role: str) -> str:
+    return role[:-4] if role.endswith("emer") else role
+
+
+def unit_base_ipcs(source: Optional[Path]) -> Set[str]:
+    """讀取 installer 共用的 `# NSSMS-BaseIPC=...` 契約；空集合代表全 IPC 通用。"""
+    if source is None:
+        return set()
+    try:
+        lines = source.read_text(encoding="utf-8").splitlines()
+    except OSError:
+        return set()
+    prefix = "# NSSMS-BaseIPC="
+    for raw in reversed(lines):
+        if raw.startswith(prefix):
+            return {item.strip() for item in raw[len(prefix):].split(",") if item.strip()}
+    return set()
+
+
+def unit_applicable(unit: str, role: str) -> bool:
+    # timer 的適用性宣告放在同 stem 的 service，讓 service/timer 成對處理。
+    contract_unit = unit[:-5] + "service" if unit.endswith(".timer") else unit
+    allowed = unit_base_ipcs(unit_source_path(contract_unit))
+    if not allowed:
+        return True
+    base = base_ipc(role)
+    if base not in KNOWN_BASE_IPCS:
+        # 身分檔缺席/壞掉時 check_identity 會回 role="unknown"。這時**不能**把有宣告的
+        # unit 一律判成 N/A：一台裝好的 ipc1 會被報成「N/A 卻殘留 unit，請重跑安裝器」,
+        # 把操作者推去重裝正確的東西。身分本身的 FAIL 已由 check_identity 單獨記錄,
+        # 這裡照常檢查所有 unit,寧可多報也不要報錯方向。
+        return True
+    return base in allowed
+
+
+def check_unit_sources(role: str = "ipc1") -> None:
     heading("unit 母體與實際安裝版本")
     # 常駐服務由 services/ 目錄列舉,不硬編碼名字 —— 新增一支就自動納入比對。
     units = sorted(p.name for p in SERVICES_DIR.glob("*.service")) if SERVICES_DIR.is_dir() else []
@@ -501,6 +590,18 @@ def check_unit_sources() -> None:
         if source is None or not source.exists():
             status = "SKIP" if unit.startswith(("nssms-wave-send", "nssms-wave-update")) else "FAIL"
             record("unit-sync", unit, status, "找不到 repo 母體")
+            continue
+        if not unit_applicable(unit, role):
+            allowed = ",".join(sorted(unit_base_ipcs(
+                unit_source_path(unit[:-5] + "service") if unit.endswith(".timer") else source
+            )))
+            record(
+                "unit-sync",
+                unit,
+                "FAIL" if installed.exists() else "SKIP",
+                (f"本機 {base_ipc(role)} 為 N/A（適用 {allowed}）；"
+                 + ("仍殘留已安裝 unit，請重跑對應安裝器" if installed.exists() else "未安裝，符合預期")),
+            )
             continue
         if not installed.exists():
             record("unit-sync", unit, "FAIL", f"尚未安裝至 {installed}")
@@ -518,8 +619,8 @@ def check_unit_sources() -> None:
         )
 
 
-def parse_execstart_targets(service_file: Path) -> list[Path]:
-    targets: list[Path] = []
+def parse_execstart_targets(service_file):
+    targets = []  # type: List[Path]
     for raw in service_file.read_text(encoding="utf-8").splitlines():
         line = raw.strip()
         if not line.startswith("ExecStart="):
@@ -535,7 +636,7 @@ def parse_execstart_targets(service_file: Path) -> list[Path]:
     return targets
 
 
-def check_timers(strict_wave: bool) -> None:
+def check_timers(strict_wave: bool, role: str = "ipc2") -> None:
     heading("timers 與最近執行結果")
     for stem in TIMERS:
         optional = stem in OPTIONAL_WAVE
@@ -551,6 +652,28 @@ def check_timers(strict_wave: bool) -> None:
             "NextElapseUSecRealtime",
             "LastTriggerUSec",
         )
+        if not unit_applicable(service, role):
+            service_props = systemctl_show(
+                service, "LoadState", "UnitFileState", "ActiveState", "SubState"
+            )
+            installed = (USER_UNIT_DIR / timer).exists() or (USER_UNIT_DIR / service).exists()
+            live = (
+                timer_props.get("UnitFileState") == "enabled"
+                or timer_props.get("ActiveState") in {"active", "activating", "reloading"}
+                or service_props.get("ActiveState") in {"active", "activating", "reloading"}
+            )
+            stale = installed or live
+            allowed = ",".join(sorted(unit_base_ipcs(TIMERS_DIR / service)))
+            detail = f"本機 {base_ipc(role)} 為 N/A（適用 {allowed}）"
+            if stale:
+                detail += "；仍有已安裝或啟用的 unit，請重跑 install_timers.sh"
+            else:
+                detail += "；未安裝，符合預期"
+            status = "FAIL" if stale else "SKIP"
+            record("timers", timer, status, detail)
+            record("units", service, status, detail)
+            record("targets", f"{service} ExecStart", "SKIP", "本機 N/A，不檢查執行目標")
+            continue
         timer_ok = (
             timer_props.get("LoadState") == "loaded"
             and timer_props.get("UnitFileState") == "enabled"
@@ -640,6 +763,18 @@ def check_failed_units(strict_wave: bool) -> None:
         record("failed-units", unit, status, detail)
 
 
+def whitelist_has(text: str, command: str) -> bool:
+    """白名單裡有沒有這一條指令 —— 比對整段路徑，不是子字串。
+
+    子字串比對會被前綴吃掉：`/usr/bin/systemctl reboot` **含有**
+    `/bin/systemctl reboot`，於是舊白名單（路徑在 Bionic 上不存在、sudo 永遠比對不到）
+    也會被判成通過 —— 而那正是這一項要抓的東西。所以要求前面是行首或分隔符
+    （空白 / `:` / `,`），後面不能再接非分隔字元。
+    """
+    pattern = r"(?:^|[\s:,])" + re.escape(command) + r"(?![^\s,])"
+    return re.search(pattern, text, re.M) is not None
+
+
 def check_sudoers() -> None:
     heading("sudoers 最小權限")
     if not SUDOERS_FILE.exists():
@@ -662,20 +797,37 @@ def check_sudoers() -> None:
 
     proc = run(["sudo", "-n", "-l"])
     text = f"{proc.stdout}\n{proc.stderr}"
+    # 逐字比對 nssms-reboot.service / nssms-teamviewer.service 實際呼叫的指令。
+    # systemctl 是 /bin/ 而不是 /usr/bin/：Bionic 沒有 usr-merge，只有 /bin/systemctl
+    # （Jammy 的 /bin 是符號連結，兩個平台都在）。
     expected = (
-        "/usr/bin/systemctl reboot",
+        "/bin/systemctl reboot",
         "/usr/bin/teamviewer daemon restart",
     )
-    if proc.returncode == 0 and all(item in text for item in expected):
+    if proc.returncode == 0 and all(whitelist_has(text, item) for item in expected):
         record("sudoers", "NOPASSWD 白名單", "PASS", "reboot 與 teamviewer 精確命令皆存在")
     else:
-        missing = [item for item in expected if item not in text]
-        record(
-            "sudoers",
-            "NOPASSWD 白名單",
-            "FAIL",
-            "缺少：" + ", ".join(missing) if missing else f"sudo -n -l exit={proc.returncode}",
-        )
+        missing = [item for item in expected if not whitelist_has(text, item)]
+        status = "FAIL"
+        if missing:
+            detail = "缺少：" + ", ".join(missing)
+            if whitelist_has(text, "/usr/bin/systemctl reboot"):
+                # 白名單還是舊拼法。它是「壞掉」還是「漂移」取決於本機有沒有那個路徑：
+                #   * Jammy（usr-merge）：/usr/bin/systemctl 在，sudo 比對前會解符號連結，
+                #     所以 unit 呼叫的 /bin/systemctl 仍然放行得了 —— 實測 sudo 1.9.9 確認。
+                #     報 FAIL 會讓每台只吃 OTA 的機器固定紅一條，把真正的故障蓋掉。
+                #   * Bionic（無 usr-merge）：那個路徑根本不存在，sudo 無從比對 → 排程重開機
+                #     每 5 天靜靜失敗一次（WH102-3 的巡檢實際抓到「缺少 /usr/bin/systemctl」）。
+                if LEGACY_SYSTEMCTL.exists():
+                    status = "WARN"
+                    detail += "；白名單是舊拼法 /usr/bin/systemctl，本機有該路徑（sudo 會解"
+                    detail += "符號連結，仍可運作）；重跑 deploy_offline.sh 會以內容比對更新它"
+                else:
+                    detail += "；白名單是舊拼法 /usr/bin/systemctl，而本機沒有這個路徑 →"
+                    detail += " sudo 比對不到，排程重開機不會執行；請重跑 deploy_offline.sh"
+        else:
+            detail = f"sudo -n -l exit={proc.returncode}"
+        record("sudoers", "NOPASSWD 白名單", status, detail)
 
 
 DEFAULT_PEERS = {"ipc1": "192.168.8.115", "ipc2": "192.168.8.220"}
@@ -692,6 +844,14 @@ def resolve_peer_addr(config: dict, peer: str) -> str:
 
 def heartbeat_probe(role: str) -> None:
     heading("heartbeat 實際探針")
+    base = base_ipc(role)
+    if base == "ipc3":
+        record("heartbeat", "角色探針", "SKIP", "IPC3 不參與 IPC1↔IPC2 failover")
+        return
+    if base not in {"ipc1", "ipc2"}:
+        record("heartbeat", "角色探針", "FAIL", f"未知角色：{role}")
+        return
+
     config_path = FAILOVER_DIR / "config.json"
     try:
         config = read_json(config_path)
@@ -699,11 +859,6 @@ def heartbeat_probe(role: str) -> None:
         timeout = min(float(config.get("timeout", 3)), 5.0)
     except Exception as exc:  # noqa: BLE001
         record("heartbeat", "設定檔", "FAIL", f"{config_path}: {exc}")
-        return
-
-    base = role[:-4] if role.endswith("emer") else role
-    if base not in {"ipc1", "ipc2"}:
-        record("heartbeat", "角色探針", "FAIL", f"未知角色：{role}")
         return
 
     # 心跳現在是雙向的:兩台都同時跑 responder 與 monitor,所以**每個角色**都要驗兩件事。
@@ -737,7 +892,7 @@ def heartbeat_probe(role: str) -> None:
         )
 
 
-def load_expected_tmux() -> dict[str, set[str]]:
+def load_expected_tmux():
     """從 scheduler/reboot_script/roles.conf 推導「角色 → 預期的 tmux session」。
 
     取 kind=session 且相位含 run 的專案。@inherit <role> from <parent> 會展開。
@@ -752,8 +907,8 @@ def load_expected_tmux() -> dict[str, set[str]]:
                f"{ROLES_CONF}: {exc}；改用內建保底清單比對")
         return dict(FALLBACK_EXPECTED_TMUX)
 
-    expected: dict[str, set[str]] = {}
-    inherits: list[tuple[str, str]] = []
+    expected = {}  # type: Dict[str, Set[str]]
+    inherits = []  # type: List[Tuple[str, str]]
     for line in text.splitlines():
         line = line.strip()
         if not line or line.startswith("#"):
@@ -899,9 +1054,9 @@ def main() -> int:
 
     vessel, role = check_identity()
     check_user_manager()
-    check_core_services()
-    check_unit_sources()
-    check_timers(args.strict_wave)
+    check_core_services(role)
+    check_unit_sources(role)
+    check_timers(args.strict_wave, role)
     check_failed_units(args.strict_wave)
     check_sudoers()
     heartbeat_probe(role)

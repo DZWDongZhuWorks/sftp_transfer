@@ -166,6 +166,15 @@ stamp_lines() {
 
 start_transcript() {
   local dir="${PROJECT_DIR}/logs"
+  # 測試會真的把這支腳本跑起來(--check-only),而記錄檔預設寫進**專案的** logs/ ——
+  # 那個目錄會被 fleet log 收走上傳。WH102-2 就出現過這個形狀:船上的 logs/ 躺著一份
+  # 平台寫著 ubuntu-18.04 的部署記錄,實際上是 tests/test_offline_deploy.py 用
+  # NSSMS_TEST_OVERRIDES 假造 Bionic 跑出來的產物 —— 但操作者讀到的是「這台 Jammy 被
+  # 認成 Bionic 了」。偵測 override 只有測試會開(offline_common.sh 在非測試模式直接
+  # 拒絕它),所以用它來把記錄改寫到暫存目錄,不必每支新測試都記得改設定。
+  if [ "${NSSMS_TEST_OVERRIDES:-0}" = "1" ]; then
+    dir="${TMPDIR:-/tmp}/nssms-deploy-transcripts"
+  fi
   local path="${dir}/deploy_offline_$(date '+%Y%m%d_%H%M%S').log"
   # 寫不進去不是中止部署的理由（唯讀掛載、權限不對都可能）——少一份記錄而已。
   # 兩處的 2>/dev/null 都寫在失敗的重導向**之前**：重導向錯誤是由 shell 自己印的，
@@ -1313,6 +1322,9 @@ stage_wheelhouse_and_venv() {
     rm -rf "$VENV_DIR"
   fi
 
+  # 記住這個 venv 是不是本次才建立的:安裝失敗時只能收掉自己建的那一個(見下方 pip 失敗
+  # 的處理)。沿用既有 venv 時它可能是上一次成功部署留下、正在跑服務的環境,不能碰。
+  local venv_created=0
   if [ -x "$VENV_PY" ]; then
     ok "沿用既有 venv：$VENV_DIR"
   else
@@ -1322,6 +1334,7 @@ stage_wheelhouse_and_venv() {
     if [ ! -x "$VENV_PY" ]; then
       err "venv 建立失敗：找不到 $VENV_PY"; exit 1
     fi
+    venv_created=1
     ok "venv 建立完成"
   fi
   info "venv pip 版本 : $("$VENV_PY" -m pip --version 2>/dev/null | awk '{print $2}')"
@@ -1355,6 +1368,8 @@ stage_wheelhouse_and_venv() {
   else
     info "標準庫 backport: ${BACKPORT_PKGS[*]}（舊平台的 3.6 需要）"
   fi
+  # 測試堆疊裝在**第二次** pip 呼叫,所以收在自己的陣列裡而不是併進 PKGS(理由見下方)。
+  local test_pkgs=()
   if [ "$INSTALL_TESTS" -eq 1 ]; then
     # 執行期相依是**必須**的（preflight 的 wheel_compat.py 已經強制它們存在）；
     # 測試堆疊則按 wheelhouse 實際有什麼裝什麼。理由：同一份清單套到不同 Python 會有
@@ -1364,7 +1379,7 @@ stage_wheelhouse_and_venv() {
     local skipped=()
     for pkg in "${TEST_PKGS[@]}"; do
       if wheelhouse_has "$pkg" "$WHEELHOUSE"; then
-        PKGS+=("$pkg")
+        test_pkgs+=("$pkg")
       else
         skipped+=("$pkg")
       fi
@@ -1379,6 +1394,19 @@ stage_wheelhouse_and_venv() {
     info "安裝範圍      : 執行期相依 (paramiko 堆疊；--skip-tests)"
   fi
 
+  # 為什麼拆成兩次 pip 呼叫,而不是把兩組名字併成一次:pip 的相依解析是全有全無的 ——
+  # 任何一顆**間接**相依缺席,整批都不會裝,連 paramiko 都不會。而這兩組的份量完全不同:
+  #
+  #   執行期相依裝不起來 = 這條船沒有 OTA(唯一的程式碼下載路徑)  → 必須中止部署
+  #   測試堆疊裝不起來   = 船上少了 pytest,health_check 少一段   → 不該中止部署
+  #
+  # WHA03 IPC-3 的首次部署就是被「併成一次」害的:Bionic 的 wheelhouse 少了
+  # importlib-metadata(pytest 7.0.1 與 pluggy 1.0.0 在 python_version < "3.8" 的間接相依),
+  #     ERROR: No matching distribution found for importlib-metadata>=0.12
+  # 一行帶走整批,paramiko 一顆都沒裝到,而那之前 systemd / sudoers / tmux 都已經改完了。
+  # 上面那道「wheelhouse 有才裝」的過濾看的是清單上的名字,看不見間接相依;真正擋得住
+  # 這個形狀的是 tests/test_offline_deploy.py 的相依閉包測試(WheelhouseClosureTests),
+  # 拆開安裝是第二道:就算閉包又破了,壞的也只會是測試堆疊。
   info "開始離線安裝到 venv（--no-index，不連外網）..."
   run_rc "$VENV_PY" -m pip install \
     --no-index \
@@ -1387,7 +1415,36 @@ stage_wheelhouse_and_venv() {
     "${PKGS[@]}"
   PIP_RC="$RC"
   if [ "$PIP_RC" -ne 0 ]; then
-    err "pip 安裝失敗（exit=$PIP_RC）。"; exit "$PIP_RC"
+    # 這裡是全腳本最需要「說清楚」的失敗:階段 A 已經動過機器(systemd / sudoers / tmux),
+    # 而這一步沒完成。原本只印一行 exit code 就結束,操作者看到的是「安裝突然跳出」。
+    err "pip 安裝失敗（exit=$PIP_RC）—— 執行期相依沒有裝完,部署到此為止。"
+    err "wheelhouse：$WHEELHOUSE"
+    err "缺哪一顆寫在上面 pip 的最後幾行;那通常是**間接**相依(安裝清單上沒有它的名字)。"
+    err "補齊該 profile 的 wheelhouse(連同 MANIFEST.txt)後重跑本腳本即可 ——"
+    err "階段 A 已完成的設定會被沿用,不需要從頭來過。"
+    if [ "$venv_created" -eq 1 ]; then
+      rm -rf "$VENV_DIR"
+      warn "已移除本次建立的半成品 venv：$VENV_DIR"
+      warn "留著它比沒有更危險:script/run_sftp_self_update.sh 只檢查 bin/python 在不在,"
+      warn "「venv 在、paramiko 不在」會通過那道守門,拖到 OTA 當下才 ImportError。"
+    fi
+    exit "$PIP_RC"
+  fi
+  ok "執行期相依安裝完成"
+
+  if [ "${#test_pkgs[@]}" -gt 0 ]; then
+    info "安裝測試堆疊（失敗不中止部署）..."
+    run_rc "$VENV_PY" -m pip install \
+      --no-index \
+      --find-links "$WHEELHOUSE" \
+      --upgrade \
+      "${test_pkgs[@]}"
+    if [ "$RC" -ne 0 ]; then
+      warn "測試堆疊安裝失敗（exit=$RC）；執行期相依已就緒,部署繼續。"
+      warn "後果只有一個:health_check 的單元測試段跑不了。補齊 wheelhouse 後重跑即可。"
+    else
+      ok "測試堆疊安裝完成"
+    fi
   fi
   ok "套件安裝完成"
 

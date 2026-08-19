@@ -1,10 +1,28 @@
 import hashlib
+import io
 import os
+import re
+import tokenize
 import shutil
 import subprocess
 import tempfile
 import unittest
+import zipfile
+from email.parser import Parser
 from pathlib import Path
+
+# packaging 隨測試堆疊一起進 venv（兩個 profile 的 wheelhouse 都帶了它）。缺席時
+# WheelhouseClosureTests 會 skip 而不是 error —— 沒裝測試堆疊的機器本來就跑不了 pytest。
+try:
+    from packaging.requirements import Requirement
+    from packaging.specifiers import SpecifierSet
+    from packaging.utils import canonicalize_name
+    from packaging.version import Version
+except ImportError:  # pragma: no cover
+    Requirement = None
+    SpecifierSet = None
+    canonicalize_name = None
+    Version = None
 
 
 PROJECT_DIR = Path(__file__).resolve().parents[1]
@@ -220,14 +238,15 @@ class OfflineDeployTests(unittest.TestCase):
         self.assertEqual(proc.returncode, 2, proc.stdout)
         self.assertEqual(list(fake_home.iterdir()), [])
 
-    def test_deploy_check_only_accepts_preinstalled_python36_and_is_read_only(self):
-        fake_home = self.temp_dir / "home"
-        fake_home.mkdir()
+    def _fake_python36(self):
+        """假的船端 3.6 直譯器。
+
+        版本查詢一律回答 3.6，其餘（例如 lib/wheel_compat.py 這種真的要執行的腳本）
+        轉交給真實的 python3。preflight 現在會拿 wheelhouse 去比對直譯器版本，
+        只會回答版本的殼子已經不夠用了 —— 但「假裝是 3.6」這個測試意圖不變：
+        目標版本是由 --py 明確傳給 checker 的，不是由執行它的直譯器決定。
+        """
         fake_python = self.temp_dir / "python3"
-        # 版本查詢一律回答 3.6，其餘（例如 lib/wheel_compat.py 這種真的要執行的腳本）
-        # 轉交給真實的 python3。preflight 現在會拿 wheelhouse 去比對直譯器版本，
-        # 只會回答版本的殼子已經不夠用了 —— 但「假裝是 3.6」這個測試意圖不變：
-        # 目標版本是由 --py 明確傳給 checker 的，不是由執行它的直譯器決定。
         fake_python.write_text(
             "#!/usr/bin/env bash\n"
             "case \"${2:-}\" in\n"
@@ -243,15 +262,19 @@ class OfflineDeployTests(unittest.TestCase):
             encoding="utf-8",
         )
         fake_python.chmod(0o755)
+        return fake_python
+
+    def _check_only_as_bionic(self, fake_home):
+        """以假的 3.6 直譯器 + 假造的 Bionic 身分跑一次唯讀 --check-only。"""
         env = dict(os.environ, **self.platform_env())
         env["HOME"] = str(fake_home)
-        proc = subprocess.run(
+        return subprocess.run(
             [
                 "bash",
                 str(DEPLOY_DIR / "deploy_offline.sh"),
                 "--check-only",
                 "--python",
-                str(fake_python),
+                str(self._fake_python36()),
             ],
             cwd=str(PROJECT_DIR),
             env=env,
@@ -259,6 +282,11 @@ class OfflineDeployTests(unittest.TestCase):
             stdout=subprocess.PIPE,
             stderr=subprocess.STDOUT,
         )
+
+    def test_deploy_check_only_accepts_preinstalled_python36_and_is_read_only(self):
+        fake_home = self.temp_dir / "home"
+        fake_home.mkdir()
+        proc = self._check_only_as_bionic(fake_home)
         self.assertEqual(proc.returncode, 0, proc.stdout)
         self.assertIn("cp36；船端預安裝", proc.stdout)
         self.assertNotIn("portable Python", proc.stdout)
@@ -309,6 +337,26 @@ class OfflineDeployTests(unittest.TestCase):
         )
         self.assertEqual(proc.returncode, 2)
         self.assertIn("拒絕把重要目錄當成 venv", proc.stdout)
+
+    def test_test_runs_do_not_write_transcripts_into_project_logs(self):
+        """測試跑的 deploy_offline.sh 不可以把記錄留在專案的 logs/。
+
+        WH102-2 的實際困擾：船上的 logs/ 出現一份平台寫著 ubuntu-18.04 的部署記錄，
+        看起來像是「Jammy 被認成 Bionic」，其實是這支測試用 NSSMS_TEST_OVERRIDES 假造
+        Bionic 跑出來的產物 —— 而那個目錄會被 fleet log 收走上傳。
+        """
+        logs_dir = PROJECT_DIR / "logs"
+        before = set(logs_dir.glob("deploy_offline_*.log")) if logs_dir.is_dir() else set()
+        fake_home = self.temp_dir / "home"
+        fake_home.mkdir()
+        proc = self._check_only_as_bionic(fake_home)
+        self.assertEqual(proc.returncode, 0, proc.stdout)
+        # 這一條路徑確實會開記錄檔（船上那份就是這樣來的），所以它真的在測東西。
+        self.assertIn("完整終端記錄", proc.stdout)
+        after = set(logs_dir.glob("deploy_offline_*.log")) if logs_dir.is_dir() else set()
+        self.assertEqual(
+            set(), after - before,
+            "測試留下了 {}；記錄應該寫到暫存目錄".format(sorted(p.name for p in after - before)))
 
     def test_release_has_no_portable_python_payload_contract(self):
         source = (DEPLOY_DIR / "deploy_offline.sh").read_text(encoding="utf-8")
@@ -528,7 +576,7 @@ class ShipInterpreterCompatTests(unittest.TestCase):
     # run_selected_transfers.py、pack_upload.py 全部是 3.7+，而清單上那三個檔一路綠燈。
     # 在 Bionic 開發機（192.168.6.230）上實測才發現那四支一個都 import 不起來。
     # 反過來以「船側目錄全掃、例外要具名並寫理由」為預設。
-    VENV_PYTHON_DIRS = (".", "monitor", "deploy", "deploy/lib")
+    VENV_PYTHON_DIRS = (".", "monitor", "deploy", "deploy/lib", "tests")
 
     # 由**系統 python3** 執行的檔：它不在任何 venv 裡，wheelhouse 補不到它身上，所以連
     # 「有 backport 就能用」的東西也不行（README 明示 automation_health_check.py 用系統
@@ -566,6 +614,15 @@ class ShipInterpreterCompatTests(unittest.TestCase):
         # /usr/share/zoneinfo/ 這種路徑(automation_health_check 的時區退路就用到)。
         ("import zoneinfo", "zoneinfo 是 3.9", "3.9"),
         ("from zoneinfo import", "zoneinfo 是 3.9", "3.9"),
+        # mock 的 Call.args / Call.kwargs 是 3.8。3.6 上不會 AttributeError ——
+        # Call.__getattr__ 會回一個名叫 args 的**子 Call**,於是斷言比較的是兩個不相干
+        # 的東西(靜默假通過),或是拿字串去索引 tuple 而 TypeError。兩種都在 230 上實測過。
+        (".call_args.args", "mock 的 Call.args 是 3.8（用 call_args[0]）", "3.8"),
+        (".call_args.kwargs", "mock 的 Call.kwargs 是 3.8（用 call_args[1]）", "3.8"),
+        ("].args[", "mock 的 Call.args 是 3.8（用 call_args_list[n][0]）", "3.8"),
+        # 不是 Python 版本而是 ncurses:18.04 的 mouse v1 沒有 BUTTON5_*,
+        # 3.6 的 curses 因此不匯出它。tui.py 用 getattr 取值,測試也必須跟著退讓。
+        ("curses.BUTTON5_", "Bionic 的 curses 沒有 BUTTON5_*（用 getattr 取）", "ncurses v2"),
     )
 
     PEP585_BUILTINS = {"list", "dict", "tuple", "set", "frozenset", "type"}
@@ -649,11 +706,35 @@ class ShipInterpreterCompatTests(unittest.TestCase):
                 )
 
     def _code_lines(self, path):
-        """去掉整行註解 —— 檔頭常把這些寫法列成「不要用」的清單。"""
+        """只留下**會被求值的程式**：去掉註解，也把字串字面值挖空。
+
+        兩者都是「寫得出禁用寫法、但 3.6 不會因此爆炸」的地方，而檔案裡偏偏都有：
+        檔頭把禁用清單寫成註解，tests/ 底下的守門本身還把同一批 token 寫成斷言字串
+        （FORBIDDEN 那張表、`self.assertNotIn("from __future__ import annotations", ...)`）。
+        不挖空的話，把 tests/ 納入掃描範圍的第一件事就是守門判自己有罪。
+
+        位置保留式的挖空（同長度空白覆蓋）而不是丟掉 token：底下比對的是
+        `"text=True"`、`"from dataclasses import"` 這種**跨 token** 的子字串，
+        重新組裝 token 會把它們拆散。
+        """
         raw = (PROJECT_DIR / path).read_text(encoding="utf-8")
-        return "\n".join(
-            line for line in raw.splitlines() if not line.lstrip().startswith("#")
-        )
+        lines = raw.splitlines(True)
+        blankable = set([tokenize.STRING, tokenize.COMMENT])
+        # 3.12 起 f-string 會拆成 FSTRING_START/MIDDLE/END，中段才是內容。
+        middle = getattr(tokenize, "FSTRING_MIDDLE", None)
+        if middle is not None:
+            blankable.add(middle)
+        for token in tokenize.generate_tokens(io.StringIO(raw).readline):
+            if token.type not in blankable:
+                continue
+            (start_row, start_col), (end_row, end_col) = token.start, token.end
+            for row in range(start_row, end_row + 1):
+                line = lines[row - 1]
+                body = line.rstrip("\r\n")
+                begin = start_col if row == start_row else 0
+                finish = end_col if row == end_row else len(body)
+                lines[row - 1] = line[:begin] + " " * (finish - begin) + line[finish:]
+        return "".join(lines)
 
     def _annotations(self, path):
         """走訪所有註解節點。
@@ -726,6 +807,200 @@ class ShipInterpreterCompatTests(unittest.TestCase):
             compile(full.read_text(encoding="utf-8"), str(full), "exec")
 
 
+class WheelhouseClosureTests(unittest.TestCase):
+    """離線 wheelhouse 的相依閉包契約：pip 會去找的每一顆，離線包裡都必須有。
+
+    WHA03 IPC-3 首次部署的真實失敗（2026-08-19）：Bionic 的 wheelhouse 帶了 pytest 7.0.1，
+    卻沒帶 importlib-metadata —— 那是 pytest 與 pluggy 在 python_version < "3.8" 才宣告的
+    **間接**相依。deploy_offline.sh 的「wheelhouse 有才裝」過濾看的是安裝清單上的名字，
+    看不見它；wheel_compat.py 檢查的是 tag 與 glibc，也看不見它。於是 --check-only 全綠、
+    preflight 全綠，真的跑 pip 才爆，而那時 systemd / sudoers / tmux 都已經改完：
+
+        ERROR: Could not find a version that satisfies the requirement
+               importlib-metadata>=0.12; python_version < "3.8" (from pytest)
+
+    這一組把 pip 的相依解析在**開發機**上先做一次：讀每個 wheel 的 METADATA，用該 profile
+    的 Python 版本評估 environment marker，一路展開到不動點。
+
+    為什麼版本要明寫而不是用執行中的直譯器：開發機是 3.10，用它評估
+    `python_version < "3.8"` 會直接得到「不需要」，整個缺件就看不見了。`pip download
+    --python-version 3.6` 也有同樣的坑（它只改 tag 比對，不改 marker），所以那條路也不能
+    當成驗證 —— 真正的驗證只有這裡的明寫版本，以及 Bionic 開發機上的實裝。
+    """
+
+    # (profile 目錄名, 該平台預裝的 python 完整版本)。版本取自實機：Bionic 3.6.9 /
+    # Jammy 3.10.12，與 WheelCompatTests 的 (3, 6) / (3, 10) 是同一組事實。
+    PROFILES = (
+        ("ubuntu-18.04-arm64", "3.6.9"),
+        ("ubuntu-22.04-arm64", "3.10.12"),
+    )
+
+    def setUp(self):
+        if Requirement is None:
+            self.skipTest("環境沒有 packaging（測試堆疊未安裝）")
+
+    # --- 來源：安裝清單讀 deploy_offline.sh，檔案清單讀 MANIFEST ------------
+    def _installer_list(self, name):
+        """從 deploy_offline.sh 讀出一個 bash 陣列的內容。
+
+        刻意不在測試裡另抄一份清單：抄一份就會有一天與安裝器不一致，而不一致的那一天
+        正好就是這道守門該說話的時候。
+        """
+        source = (DEPLOY_DIR / "deploy_offline.sh").read_text(encoding="utf-8")
+        match = re.search(r"^\s*{}=\(([^)]*)\)".format(name), source, re.M)
+        self.assertIsNotNone(
+            match, "deploy_offline.sh 讀不到 {} 陣列（改名了？）".format(name))
+        return [canonicalize_name(item) for item in match.group(1).split()]
+
+    def _manifest_wheels(self, profile):
+        """MANIFEST.txt 列出的 wheel 檔名（版控過的事實；*.whl 本身不進 git）。"""
+        manifest = DEPLOY_DIR / "platforms" / profile / "wheelhouse" / "MANIFEST.txt"
+        names = []
+        for line in manifest.read_text(encoding="utf-8").splitlines():
+            if line.startswith("#") or not line.strip():
+                continue
+            names.append(line.split(None, 1)[1].strip())
+        return names
+
+    def _index(self, profile):
+        """canonical 套件名 -> (Version, 檔名)。同名多版取最新，比照 pip。"""
+        index = {}
+        for filename in self._manifest_wheels(profile):
+            parts = filename.split("-")
+            name, version = canonicalize_name(parts[0]), Version(parts[1])
+            if name not in index or version > index[name][0]:
+                index[name] = (version, filename)
+        return index
+
+    def _marker_env(self, python_full_version):
+        """PEP 508 的 environment。船上兩個平台都是 aarch64 Linux / CPython。"""
+        return {
+            "python_version": ".".join(python_full_version.split(".")[:2]),
+            "python_full_version": python_full_version,
+            "implementation_version": python_full_version,
+            "implementation_name": "cpython",
+            "platform_python_implementation": "CPython",
+            "platform_machine": "aarch64",
+            "platform_system": "Linux",
+            "sys_platform": "linux",
+            "os_name": "posix",
+            "extra": "",
+        }
+
+    def _requirements(self, wheel_path, environment):
+        """一個 wheel 在這個 environment 下真正需要的相依（已濾掉 extra 與不成立的 marker）。"""
+        with zipfile.ZipFile(str(wheel_path)) as archive:
+            metadata_name = None
+            for entry in archive.namelist():
+                if re.match(r"[^/]+\.dist-info/METADATA$", entry):
+                    metadata_name = entry
+                    break
+            self.assertIsNotNone(
+                metadata_name, "{} 裡沒有 METADATA（檔案壞了？）".format(wheel_path.name))
+            raw = archive.read(metadata_name).decode("utf-8", "replace")
+        metadata = Parser().parsestr(raw)
+        needed = []
+        for line in metadata.get_all("Requires-Dist") or []:
+            requirement = Requirement(line)
+            if requirement.marker is not None \
+                    and not requirement.marker.evaluate(environment):
+                continue
+            needed.append(requirement)
+        return metadata.get("Requires-Python"), needed
+
+    def _roots(self, profile, index):
+        """deploy_offline.sh 這一輪實際會丟給 pip 的名字（含它自己的過濾規則）。"""
+        roots = list(self._installer_list("RUNTIME_PKGS"))
+        for name in self._installer_list("BACKPORT_PKGS") + self._installer_list("TEST_PKGS"):
+            if name in index:          # 對應 wheelhouse_has：有才裝
+                roots.append(name)
+        return roots
+
+    def _walk(self, profile, python_full_version):
+        """展開閉包。回傳 (用到的 canonical 名集合, 問題描述清單)。"""
+        wheelhouse = DEPLOY_DIR / "platforms" / profile / "wheelhouse"
+        index = self._index(profile)
+        environment = self._marker_env(python_full_version)
+        pending = list(self._roots(profile, index))
+        used, problems = set(), []
+        while pending:
+            name = pending.pop(0)
+            if name in used:
+                continue
+            used.add(name)
+            if name not in index:
+                continue           # 缺件由呼叫端比對 used - index 找出，這裡不重複記
+            version, filename = index[name]
+            requires_python, needed = self._requirements(wheelhouse / filename, environment)
+            if requires_python and not SpecifierSet(requires_python).contains(
+                    python_full_version, prereleases=True):
+                problems.append(
+                    "{}：Requires-Python {} 不接受 {}".format(
+                        filename, requires_python, python_full_version))
+            for requirement in needed:
+                child = canonicalize_name(requirement.name)
+                pending.append(child)
+                if child in index and not requirement.specifier.contains(
+                        str(index[child][0]), prereleases=True):
+                    problems.append(
+                        "{} 要 {}，但離線包只有 {} {}".format(
+                            filename, requirement, child, index[child][0]))
+        return used, index, problems
+
+    # --- 契約 ----------------------------------------------------------------
+    def test_installer_package_lists_are_readable(self):
+        """解析壞掉時清單會變空，而空清單會讓底下每一項都「通過」。"""
+        runtime = self._installer_list("RUNTIME_PKGS")
+        self.assertIn("paramiko", runtime)
+        self.assertIn("pytest", self._installer_list("TEST_PKGS"))
+        self.assertEqual(["dataclasses"], self._installer_list("BACKPORT_PKGS"))
+
+    def test_every_profile_wheelhouse_is_dependency_complete(self):
+        """每個 profile 的離線包都要能自給自足地完成安裝（--no-index 沒有第二個來源）。"""
+        for profile, python_full_version in self.PROFILES:
+            wheelhouse = DEPLOY_DIR / "platforms" / profile / "wheelhouse"
+            if not any(wheelhouse.glob("*.whl")):
+                continue           # 乾淨 clone：*.whl 不納入版控（見 .gitignore）
+            used, index, problems = self._walk(profile, python_full_version)
+            missing = sorted(name for name in used if name not in index)
+            self.assertEqual(
+                [], missing,
+                "{}（python {}）的 wheelhouse 缺少間接相依：{}。"
+                "pip --no-index 會整批安裝失敗（連 paramiko 都不會裝），"
+                "請補上輪子並更新 MANIFEST.txt。".format(
+                    profile, python_full_version, ", ".join(missing)),
+            )
+            self.assertEqual([], problems, "\n".join(problems))
+
+    def test_no_wheel_is_dead_weight(self):
+        """離線包不該帶閉包用不到的輪子 —— 多半代表清單改了而檔案沒跟著整理。"""
+        for profile, python_full_version in self.PROFILES:
+            wheelhouse = DEPLOY_DIR / "platforms" / profile / "wheelhouse"
+            if not any(wheelhouse.glob("*.whl")):
+                continue
+            used, index, _problems = self._walk(profile, python_full_version)
+            unused = sorted(name for name in index if name not in used)
+            self.assertEqual(
+                [], unused,
+                "{} 的 MANIFEST 列了閉包用不到的輪子：{}".format(profile, ", ".join(unused)),
+            )
+
+    def test_bionic_carries_importlib_metadata_for_pytest(self):
+        """回歸：pytest 7.0.1 在 3.6 上的 importlib-metadata 必須留在 Bionic 的清單裡。
+
+        對 MANIFEST 斷言而不是對目錄，這樣乾淨 clone 上也守得住（*.whl 不進版控）。
+        """
+        names = set()
+        for filename in self._manifest_wheels("ubuntu-18.04-arm64"):
+            names.add(canonicalize_name(filename.split("-")[0]))
+        for required in ("importlib-metadata", "zipp"):
+            self.assertIn(
+                required, names,
+                "Bionic 的 wheelhouse 少了 {} —— pytest / pluggy 在 python<3.8 需要它，"
+                "少了就會在船上跑 pip 時整批失敗".format(required),
+            )
+
+
 class WheelhouseLayoutTests(unittest.TestCase):
     """per-profile wheelhouse 的佈局契約。"""
 
@@ -769,6 +1044,48 @@ class WheelhouseLayoutTests(unittest.TestCase):
                 listed, actual,
                 "{} 的 MANIFEST.txt 與實際檔案不一致".format(wh),
             )
+
+    def test_runtime_and_test_stack_are_installed_by_separate_pip_calls(self):
+        """兩組相依必須分兩次 pip 呼叫。
+
+        pip 的相依解析是全有全無的：併成一次時，測試堆疊少一顆**間接**相依就會連
+        paramiko 一起不裝 —— WHA03 IPC-3 首次部署就是這個形狀（Bionic 的 wheelhouse 少了
+        importlib-metadata）。執行期相依裝不起來必須中止；測試堆疊裝不起來只能警告。
+        """
+        source = (DEPLOY_DIR / "deploy_offline.sh").read_text(encoding="utf-8")
+        self.assertEqual(
+            2, source.count("-m pip install \\"),
+            "stage_venv 應該有兩次 pip install（執行期相依一次、測試堆疊一次）")
+        # 測試堆疊不能再併進 PKGS —— 併進去就等於回到「一次呼叫」。
+        self.assertIn('test_pkgs+=("$pkg")', source)
+        self.assertNotIn('PKGS+=("$pkg")\n      else\n        skipped', source)
+
+        runtime_fail = source.index('err "pip 安裝失敗')
+        test_stack = source.index('"${test_pkgs[@]}"')
+        done = source.index('ok "套件安裝完成"')
+        self.assertLess(runtime_fail, test_stack, "執行期相依的失敗處理應在測試堆疊之前")
+        self.assertIn('exit "$PIP_RC"', source[runtime_fail:test_stack])
+        # 測試堆疊那一段只能 warn，不能有任何 exit / err。
+        tail = source[test_stack:done]
+        self.assertIn("測試堆疊安裝失敗", tail)
+        self.assertNotIn("exit ", tail)
+        self.assertNotIn("err ", tail)
+
+    def test_failed_runtime_install_removes_the_half_built_venv(self):
+        """半成品 venv 比沒有 venv 更危險：OTA 腳本只檢查 bin/python 在不在。
+
+        script/run_sftp_self_update.sh 的守門是 `[[ ! -x "$VENV_PY" ]]`，「venv 在、
+        paramiko 不在」會通過它，然後在 OTA 當下才 ImportError —— 那時船已經在海上。
+        只收自己這一輪建立的（venv_created），沿用既有 venv 時不能碰。
+        """
+        source = (DEPLOY_DIR / "deploy_offline.sh").read_text(encoding="utf-8")
+        self.assertIn("local venv_created=0", source)
+        self.assertIn("venv_created=1", source)
+        cleanup = source.index('if [ "$venv_created" -eq 1 ]; then')
+        self.assertIn('rm -rf "$VENV_DIR"', source[cleanup:cleanup + 400])
+        self.assertLess(
+            source.index('err "pip 安裝失敗'), cleanup,
+            "清掉半成品 venv 應該發生在 pip 失敗的處理裡")
 
     def test_test_stack_is_filtered_by_availability(self):
         """測試堆疊要按 wheelhouse 實際有什麼裝什麼。

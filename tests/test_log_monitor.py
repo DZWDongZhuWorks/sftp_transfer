@@ -315,8 +315,10 @@ def test_sync_logs_success(tmp_path):
         assert sync_logs(cfg) is True
     args = m.call_args[0][0]
     assert "--cli" in args and "download" in args and str(cfg) in args
-    assert "stdout" not in m.call_args.kwargs
-    assert "stderr" not in m.call_args.kwargs
+    # call_args[1] 而不是 .kwargs：後者是 3.8 才有的存取器，而船上的 venv 是 3.6
+    # —— 在 3.6 上 .kwargs 會回傳一個空的 Call，於是這兩行永遠成立（假通過）。
+    assert "stdout" not in m.call_args[1]
+    assert "stderr" not in m.call_args[1]
 
 
 def test_sync_logs_quiet_suppresses_child_output(tmp_path):
@@ -325,8 +327,8 @@ def test_sync_logs_quiet_suppresses_child_output(tmp_path):
     with mock.patch("monitor.log_monitor.subprocess.run") as m:
         m.return_value = mock.Mock(returncode=0)
         assert sync_logs(cfg, quiet=True) is True
-    assert m.call_args.kwargs["stdout"] is subprocess.DEVNULL
-    assert m.call_args.kwargs["stderr"] is subprocess.DEVNULL
+    assert m.call_args[1]["stdout"] is subprocess.DEVNULL
+    assert m.call_args[1]["stderr"] is subprocess.DEVNULL
 
 
 def test_sync_logs_streams_combined_output(tmp_path):
@@ -351,8 +353,8 @@ def test_sync_logs_streams_combined_output(tmp_path):
     ) as popen:
         assert sync_logs(cfg, quiet=True, output_callback=lines.append) is True
     assert lines == ["first", "second"]
-    assert popen.call_args.kwargs["stdout"] is subprocess.PIPE
-    assert popen.call_args.kwargs["stderr"] is subprocess.STDOUT
+    assert popen.call_args[1]["stdout"] is subprocess.PIPE
+    assert popen.call_args[1]["stderr"] is subprocess.STDOUT
 
 
 def test_sync_logs_nonzero_returns_false(tmp_path):

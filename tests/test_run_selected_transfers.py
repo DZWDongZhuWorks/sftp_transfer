@@ -94,8 +94,10 @@ def test_execute_selected_continues_and_summarizes_failures(tmp_path):
         assert selected.execute_selected(items, locked_mode="upload") == 1
 
     assert run.call_count == 2
-    assert run.call_args_list[0].args[0] == items[0]
-    assert run.call_args_list[1].args[0] == items[1]
+    # [0][0] 而不是 .args[0]：Call.args 是 3.8 才有，3.6 上會取到一個名為 args 的
+    # 子 Call（斷言因此比較的是兩個不相干的東西）。船上的 venv 是 3.6。
+    assert run.call_args_list[0][0][0] == items[0]
+    assert run.call_args_list[1][0][0] == items[1]
 
 
 def test_execute_selected_prints_file_counts_for_each_item(tmp_path, capsys):

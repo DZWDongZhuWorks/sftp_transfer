@@ -16,6 +16,10 @@ OPTIONAL_UNITS 刻意是「佈署 unit 檔但不 enable」—— 早期它們被
 import subprocess
 import sys
 from pathlib import Path
+# typing.Dict 而不是 PEP 585 的 dict[...]：這支測試會在船上跑（health_check 會執行整個
+# 測試套件），而 Bionic 的 venv 是 3.6 —— dict[str, str] 在 def 求值時就 TypeError，
+# 那會讓**整份**測試套件收集失敗（1 error），健康檢查因此永遠是紅的。
+from typing import Dict
 
 import pytest
 
@@ -70,9 +74,9 @@ def fake_systemd(monkeypatch):
 
     預設所有 timer 健康、所有 service 正常結束;測試只覆寫它關心的那幾支。
     """
-    states: dict[str, dict[str, str]] = {}
+    states = {}  # type: Dict[str, Dict[str, str]]
 
-    def fake_show(unit: str, *properties: str) -> dict[str, str]:
+    def fake_show(unit, *properties):
         if unit in states:
             return dict(states[unit], _returncode="0")
         base = HEALTHY_TIMER if unit.endswith(".timer") else HEALTHY_ONESHOT
@@ -85,7 +89,7 @@ def fake_systemd(monkeypatch):
     return states
 
 
-def timer_checks() -> dict[str, str]:
+def timer_checks():
     """只取 section == "timers" 的結果 → {unit: status}。"""
     return {c.name: c.status for c in hc.RESULTS if c.section == "timers"}
 

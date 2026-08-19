@@ -17,6 +17,12 @@ from monitor.log_monitor import (
 )
 from monitor import tui
 
+# Bionic(18.04)的 ncurses 是 mouse v1，Python 3.6 的 curses 因此**沒有** BUTTON5_*。
+# tui.py 本來就用 getattr 取這些常數（_mouse_bits），取不到就只是沒有「滾輪向下」，
+# 不是錯誤。測試跟著用同一個 fallback：常數不存在時那幾條斷言沒有意義，略過它 ——
+# 讓它 AttributeError 只會把整條船的健康檢查染紅（health_check 會跑這整套測試）。
+BUTTON5_PRESSED = getattr(curses, "BUTTON5_PRESSED", None)
+
 NOW = datetime(2026, 7, 27, 12, 0, 0)
 RECENT = "2026-07-27 11:00:00"  # 1 小時前（未過期）
 OLD = "2026-07-20 11:00:00"     # 7 天前（過期）
@@ -328,7 +334,8 @@ def test_mouse_event_kind_and_safe_initialisation():
     assert tui.mouse_event_kind(curses.BUTTON1_DOUBLE_CLICKED) == "activate"
     assert tui.mouse_event_kind(curses.BUTTON3_CLICKED) == "close"
     assert tui.mouse_event_kind(curses.BUTTON4_PRESSED) == "wheel_up"
-    assert tui.mouse_event_kind(curses.BUTTON5_PRESSED) == "wheel_down"
+    if BUTTON5_PRESSED is not None:
+        assert tui.mouse_event_kind(BUTTON5_PRESSED) == "wheel_down"
     assert tui.mouse_event_kind(curses.BUTTON1_RELEASED) is None
 
     with mock.patch.object(curses, "mousemask", return_value=(curses.ALL_MOUSE_EVENTS, 0)) as mask, \
@@ -670,13 +677,14 @@ def test_csv_key_action():
 
 def test_csv_mouse_action():
     assert tui.csv_mouse_action(5, curses.BUTTON4_PRESSED, 20) == "wheel_up"
-    assert tui.csv_mouse_action(5, curses.BUTTON5_PRESSED, 20) == "wheel_down"
     assert tui.csv_mouse_action(
         5, curses.BUTTON_SHIFT | curses.BUTTON4_PRESSED, 20
     ) == "left"
-    assert tui.csv_mouse_action(
-        5, curses.BUTTON_SHIFT | curses.BUTTON5_PRESSED, 20
-    ) == "right"
+    if BUTTON5_PRESSED is not None:
+        assert tui.csv_mouse_action(5, BUTTON5_PRESSED, 20) == "wheel_down"
+        assert tui.csv_mouse_action(
+            5, curses.BUTTON_SHIFT | BUTTON5_PRESSED, 20
+        ) == "right"
     assert tui.csv_mouse_action(5, curses.BUTTON3_CLICKED, 20) == "close"
     assert tui.csv_mouse_action(19, curses.BUTTON1_CLICKED, 20) == "close"
     assert tui.csv_mouse_action(5, curses.BUTTON1_CLICKED, 20) is None

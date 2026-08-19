@@ -289,6 +289,36 @@ python3 deploy/lib/wheel_compat.py --py 3.6 --glibc 2.27 --arch aarch64 \
 # rc=0 相容／4 缺漏或缺必要套件／6 有輪子與目標平台不相容
 ```
 
+> ⚠️ **`--python-version` 不會改變 environment marker 的求值** —— 這是 Bionic 那份
+> wheelhouse 少掉 `importlib-metadata` 的真正原因（WHA03 IPC-3，2026-08-19）。
+> `pip download --python-version 3.6` 只換掉「挑 wheel 的 tag」，相依的 marker 仍然用
+> **執行 pip 的那個直譯器**去算：建置機是 3.10，於是
+>
+> ```
+> importlib-metadata>=0.12 ; python_version < "3.8"      ← pytest 7.0.1 / pluggy 1.0.0
+> ```
+>
+> 這一條被判成「不需要」，整包就這樣少了兩顆（`importlib-metadata`、它要的 `zipp`）。
+> 在建置機上完全看不出來，一路要到船上真的跑 `pip install` 才爆，而那時階段 A 已經改完
+> systemd / sudoers / tmux。（實測：pip 22.0.2；`pip download --no-index` 對著**已經帶了**
+> `importlib_metadata` 的 wheelhouse 解 3.6 的相依，仍然不會挑它。）
+>
+> 所以 Bionic 那份**必須**明列這兩顆（版本是各自最後支援 3.6 的）：
+>
+> ```bash
+> pip download 'importlib-metadata==4.8.3' 'zipp==3.6.0' --no-deps \
+>   --only-binary=:all: --python-version 36 -d "$PROF"
+> ```
+>
+> 驗收不要只靠 `wheel_compat.py`（它看的是 tag 與 glibc，看不見缺哪一顆間接相依）：
+>
+> ```bash
+> python3 -m pytest tests/test_offline_deploy.py::WheelhouseClosureTests -q
+> ```
+>
+> 那一組會把每個 wheel 的 `METADATA` 讀出來、用該 profile 的 Python 版本評估 marker、
+> 一路展開到不動點，缺件與版本不合都會紅。它是唯一在**開發機上**就能看見這個形狀的檢查。
+
 > ⚠️ Bionic 那份**不要**用 `pip download exceptiongroup`。真正的 backport 需要 `>=3.7`，
 > pip 在 3.6 下會挑到一個 `0.0.0a0` 佔位套件，還會把 trio / outcome / sniffio 一整串
 > 拖進 wheelhouse。它本來就不該在 Bionic 的清單裡。

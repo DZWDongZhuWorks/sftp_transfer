@@ -45,7 +45,11 @@ class TestFormatException:
         assert dl.format_exception(TimeoutError()) == "TimeoutError: TimeoutError()"
 
     def test_includes_type_and_message(self):
-        assert dl.format_exception(OSError("connection reset")) == "OSError: OSError('connection reset')"
+        # 不寫死 repr 的長相：3.6 印的是 OSError('connection reset',)（尾逗號），
+        # 3.7+ 才是 OSError('connection reset')。要測的是「型別: repr」這個格式，
+        # 不是各版本的 repr —— 船上的 venv 在 Bionic 是 3.6。
+        error = OSError("connection reset")
+        assert dl.format_exception(error) == "OSError: {}".format(repr(error))
 
 
 # ---------------------------------------------------------------------------

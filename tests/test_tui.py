@@ -752,17 +752,17 @@ def test_flat_rows_use_tree_group_names(tmp_path):
 
 
 def test_flat_default_is_global_vessel_order(tmp_path):
-    """平坦模式預設＝全域船隻名稱遞減，樹的順序當 tiebreak。"""
+    """平坦模式預設＝全域船隻名稱遞增，樹的順序當 tiebreak。"""
     tree = _sorted_tree(tmp_path)
     devs = [it.dev for it in tui.tree_devices(tree)]
     flat = tui.flatten_flat(tree, tui.TuiState(flat=True), NOW)
-    assert [r.ref for r in flat] == tui.sort_devices(devs, "船隻名稱", True)
+    assert [r.ref for r in flat] == tui.sort_devices(devs, "船隻名稱", False)
     vessels = [r.ref.vessel or "（未分類）" for r in flat]
-    assert vessels == sorted(vessels, key=str.casefold, reverse=True)
+    assert vessels == sorted(vessels, key=str.casefold)
 
 
 def test_grouped_default_keeps_device_order_within_ipc(tmp_path):
-    """預設（船隻名稱↓）不動 IPC 底下的裝置列：那一層仍是 build_tree 的 (-嚴重度, 元件)。
+    """預設（船隻名稱↑）不動 IPC 底下的裝置列：那一層仍是 build_tree 的 (-嚴重度, 元件)。
 
     船名對整個 IPC 群組是常數，作用在裝置列上必然是 no-op——它排的是船群那一層。
     """
@@ -932,7 +932,7 @@ def test_collapse_or_parent_does_not_jump_in_flat(tmp_path):
 
 def test_sort_reducers_and_defaults():
     st = tui.TuiState()
-    assert (st.flat, st.sort_key, st.sort_desc) == (False, "船隻名稱", True)
+    assert (st.flat, st.sort_key, st.sort_desc) == (False, "船隻名稱", False)
     assert tui._SORT_CYCLE == ["船隻名稱", "更新時間", "嚴重度", "裝置名稱"]
 
     tui.cycle_sort(st); assert st.sort_key == "更新時間"
@@ -942,8 +942,8 @@ def test_sort_reducers_and_defaults():
     st.sort_key = "亂填"
     tui.cycle_sort(st); assert st.sort_key == "更新時間"     # 不在循環內也不炸
 
-    tui.toggle_sort_dir(st); assert st.sort_desc is False
     tui.toggle_sort_dir(st); assert st.sort_desc is True
+    tui.toggle_sort_dir(st); assert st.sort_desc is False
 
     st.scroll = 9
     tui.toggle_flat(st)
@@ -1043,22 +1043,25 @@ def test_key_press_reorders_flat_list(tmp_path):
         return [r.ref.device_name for r in tui.visible_rows(tree, st, NOW)
                 if r.kind == "device"]
 
-    order_vessel = press(ord("f"))              # → 平坦，船隻名稱↓
+    order_vessel = press(ord("f"))              # → 平坦，船隻名稱↑（預設升冪）
     assert st.flat is True
     assert len(order_vessel) == 4               # 4 台裝置全部單層列出
 
-    order_time = press(ord("o"))                # → 更新時間↓
+    order_time = press(ord("o"))                # → 更新時間↑
     assert st.sort_key == "更新時間"
     assert order_time != order_vessel           # 真的重排了
-    assert order_time[-1] == "CLINK_IPC-2_share"     # OLD＝最舊，降冪排最後
+    assert order_time[0] == "CLINK_IPC-2_share"      # OLD＝最久未更新，升冪排最前
     # ecdis / radar / RADAR_UPLOADER 的時間戳都是 RECENT（平手）→ 穩定排序沿用樹序
-    assert set(order_time[:3]) == {
+    assert set(order_time[1:]) == {
         "CLINK_IPC-1_radar", "CLINK_IPC-1_ecdis", "RADAR_UPLOADER"
     }
 
-    order_time_asc = press(ord("O"))            # → 更新時間↑
+    order_time_desc = press(ord("O"))           # → 更新時間↓
+    assert st.sort_desc is True
+    assert order_time_desc[-1] == "CLINK_IPC-2_share"  # OLD＝最舊，降冪排最後
+
+    press(ord("O"))                             # → 切回升冪，後續欄位都在升冪下比對
     assert st.sort_desc is False
-    assert order_time_asc[0] == "CLINK_IPC-2_share"  # OLD＝最久未更新，升冪排最前
 
     order_severity = press(ord("o"))            # → 嚴重度↑
     assert st.sort_key == "嚴重度"

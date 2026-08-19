@@ -152,7 +152,7 @@ class TuiState:
     now: Optional[datetime] = None
     flat: bool = False                 # True＝平坦模式（不分群，全船隊一張表）
     sort_key: str = _SORT_CYCLE[0]      # 見 _SORT_CYCLE
-    sort_desc: bool = True             # 預設由 _SORT_CYCLE 首欄位降冪排序
+    sort_desc: bool = False            # 預設由 _SORT_CYCLE 首欄位升冪排序
     html_note: str = ""                # --html 每輪寫出的結果，顯示在第二行（""＝未啟用）
 
 

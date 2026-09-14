@@ -26,9 +26,9 @@ jobs:
     # 18.04 runner,真機驗證仍在 Bionic 開發機上做。
     runs-on: ubuntu-22.04-arm
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
 
-      - uses: actions/setup-python@v5
+      - uses: actions/setup-python@v7
         with:
           # 船端 venv 是 3.10.12;測試裡的 py3.6 守門是靜態掃描,不需要 3.6 直譯器。
           python-version: '3.10'

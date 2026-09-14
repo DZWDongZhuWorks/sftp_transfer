@@ -1,7 +1,7 @@
 {
-  "version": "0.15.0",
+  "version": "0.15.1",
   "date": "2026-09-14",
-  "notes": "monitor TUI 的兩件事。(1) 左鍵每一次都遲到 250ms:mouseinterval > 0 的意思是「ncurses 幫你合成 click」,而合成的前提是先扣住那個 press —— 它得等滿這段時間,才知道接下來該送 CLICKED 還是 DOUBLE_CLICKED。滾輪不會被扣住(BUTTON4/5 只有 press、湊不成一對,沒有東西要等),所以症狀是「滾輪很跟手、左鍵頓一下」。而那段等待對這個介面沒有價值:單擊與雙擊的第一步是同一件事(選取那一列),差別只在雙擊要再多做一件(啟動)。改成 mouseinterval = 0,press 一到就選取,再由 TuiState.last_click 記住「上一次點了哪一列、什麼時候」,同一列在 _DOUBLE_CLICK_SEC(250ms)內再點一次才算雙擊(純函式 is_repeat_click)。比對用 row.key 而不是列索引 —— --watch 每幾秒重載一次,比索引的話使用者對同一個位置點兩下,開到的會是另一台裝置;時間用 time.monotonic,校時往回跳不會讓接下來每一次點擊都變成雙擊。ncurses 自己合成的 DOUBLE_CLICKED 仍然採信(有些建置即使 interval = 0 也會合成,而在那些建置上 press 不會單獨出現)。姊妹專案 scheduler/dashboard 實測:單擊延遲從一律 >=252ms 降到中位數 6ms。(2) q 在最外層會直接關掉整個監視畫面:子畫面(明細彈窗、CSV 檢視)也用 q 關掉,而連按 q 退好幾層之後,多出來的那一下會落在最外層 —— 代價是重開再等一輪掃描。改成 q 只關窗格、最外層什麼都不做,離開只留給 Esc(沒有人會連按它);右鍵等效於 q。這個介面沒有狀態列,所以最外層的 q/右鍵會在底部那一行說「已經在最外層(離開請按 Esc)」—— 否則「按了 q 卻沒反應」沒有人能解釋。提示的壽命到下一個有作用的輸入為止:interval = 0 之後一次實體點擊會送來 press 與 release 兩個事件,而 release 不對應任何動作,讓它清掉提示的話 press 剛寫上的字會在幾十毫秒後消失,使用者只看得到一閃。底部提示與說明的「q離開」一併改成「Esc離開」。這與 scheduler/dashboard 是同一套規則,四個 TUI 不該各有一套。pytest 569 條全過(新增 7 條純邏輯測試,並修正兩條釘住舊規則的既有測試);另以 pty 實際跑起 TUI 驗證:q 與右鍵都不離開且留下提示,Esc 才離開。",
+  "notes": "接續 0.15.0:解不開的跳脫序列不再被當成 Esc 而關掉程式。0.15.0 把 Esc 變成唯一的離開路徑,而**滑鼠回報與方向鍵本身就是 ESC 開頭的序列** —— 終端送出的編碼與 terminfo 的 kmous 對不上時(tmux 的 default-terminal 就常常對不上),ncurses 解不出來會把那些位元組原樣交出來,第一個正是裸 ESC。於是使用者按一次右鍵,整個監視畫面直接關掉。實測:TERM=xterm-256color(app 要求 SGR)而終端送 X10 編碼時,一次右鍵就結束程式;TERM=screen 反向也一樣。0.15.0 之前 Esc 不做事,所以裸 ESC 外漏是無害的 —— 這個缺陷是跟著「Esc 成為離開鍵」一起出現的。修法沿用姊妹專案 scheduler/dashboard 的 _swallow_escape_sequence:收到 ESC 先用 nodelay 探讀一次,後面還有位元組就把整段吃掉(最多 8 個,免得壞掉的輸入卡住迴圈)並在底部提示「未識別的按鍵序列(已忽略)」;真正的 Esc 鍵後面不會有東西(ncurses 已經等過 ESCDELAY),所以一次探讀就分得出來。探讀完一定要還原 nodelay 與 timeout,否則主迴圈的 getch 會變成忙迴圈。pytest 571 條全過(新增 2 條:_swallow_escape_sequence 的行為與 nodelay 還原、主迴圈餵入「ESC [ C」後不得離開);另以 pty 實測兩種 TERM 下對不上的右鍵與方向鍵都不再關掉程式,而單獨的 Esc 仍然離開。",
   "stamp_exclude": [
     "*.whl"
   ]

@@ -965,6 +965,36 @@ def _read_mouse() -> Optional[Tuple[int, int, int]]:
     return x, y, bstate
 
 
+def _swallow_escape_sequence(stdscr) -> bool:
+    """ESC 之後緊接著還有位元組嗎？有就把整段吃掉，回傳 True。
+
+    【為什麼一定要有這個】Esc 現在是唯一的離開路徑，而**滑鼠回報與方向鍵本身就是
+    ESC 開頭的序列**。終端送出的編碼與 terminfo 的 kmous 對不上時（tmux 的
+    default-terminal 常常對不上），ncurses 解不出來就會把那些位元組原樣交出來 ——
+    第一個就是裸 ESC。於是使用者按一次右鍵，整個監視畫面直接關掉。實測踩過：
+    app 要求 SGR 而終端送 X10 時，一次右鍵就結束程式。
+
+    真正的 Esc 鍵按下時後面不會有東西（ncurses 已經等過 ESCDELAY），所以 nodelay
+    的一次探讀就足以分辨。最多吃 8 個位元組，免得壞掉的輸入把迴圈卡住。
+    """
+    stdscr.nodelay(True)
+    try:
+        first = stdscr.getch()
+        if first == -1:
+            return False                      # 單獨的 Esc＝使用者真的要離開
+        for _ in range(8):
+            # CSI/SS3 的終止字元是 @-~（'[' 與 'O' 是引入字元，不算結束）
+            if 0x40 <= first <= 0x7E and first not in (ord("["), ord("O")):
+                break
+            nxt = stdscr.getch()
+            if nxt == -1:
+                break
+            first = nxt
+        return True
+    finally:
+        stdscr.nodelay(False)
+
+
 def _clean_sync_line(line: str) -> str:
     """移除會干擾 curses 游標位置的 ANSI 與控制字元。"""
     line = _ANSI_ESCAPE.sub("", line).replace("\t", "    ")
@@ -1420,6 +1450,12 @@ def _main_loop(stdscr, args):
             if watch and (time.monotonic() - last) >= watch:
                 tree = reload()
                 last = time.monotonic()
+            continue
+        if ch == 27 and _swallow_escape_sequence(stdscr):
+            # 【不是真的 Esc】是一段解不出來的序列（多半是滑鼠回報或方向鍵）。
+            # 當成離開的話,使用者按一次右鍵程式就沒了。
+            stdscr.timeout(1000 if watch else -1)   # nodelay 探讀之後要還原讀鍵設定
+            state.notice = "未識別的按鍵序列（已忽略）"
             continue
         if ch == curses.KEY_MOUSE:
             event = _read_mouse()

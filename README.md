@@ -574,3 +574,18 @@ SFTP 連線，並把 `.part` 的**精確位元組數、SHA-256、遠端 size/mti
    產生的報告在 `htmlcov/index.html`，用瀏覽器開啟即可依檔案、行數檢視覆蓋狀況。
 
 只想跑單一檔案或單一測試時，可以用 `python -m pytest tests/test_downloader.py`，或加上 `-k 關鍵字` 只跑名稱符合的測試（例如 `python -m pytest -k duplicate_mode`）。
+
+### CI（GitHub Actions）
+
+`.github/workflows/ci.yml`：push 到 `main` 與每個 PR 都會在 `ubuntu-22.04`（對齊船上 IPC1/IPC2 的 Jammy）+ Python 3.10（對齊船端 venv 的 3.10.12）跑一次 `python -m pytest -q`。不需要任何 secret。
+
+CI 是**乾淨 clone**，所以有 9 項會 skip，這是預期狀態而非缺陷：
+
+- 5 項要離線輪子（`*.whl` 不納入版控，見 `.gitignore`）——`deploy/` 的 preflight 與兩個 profile 的 wheelhouse 校驗。
+- 4 項要 `share/scheduler`（另一個由 SFTP 獨立下載的專案）出貨的 unit 檔與 sudoers 白名單。
+
+輪子與 scheduler 都在場的開發機（與船上的 `health_check`）則一條都不 skip，全部照跑——守門強度只跟環境有沒有把料備齊有關，不跟 CI 有關。
+
+Bionic（18.04）的 Python 3.6 相容性不靠 CI 的直譯器驗證：GitHub 已經沒有 18.04 runner，那一道由 `tests/test_offline_deploy.py` 的靜態掃描守門，真機驗證仍在 Bionic 開發機上做。
+
+CI 檔案不隨鏡像上船——`config/sftp_upload_ignore.txt` 有排除 `.github/`。

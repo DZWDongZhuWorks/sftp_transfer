@@ -42,3 +42,22 @@ jobs:
         # 乾淨 clone 上有 5 項會 skip:3 項要 share/scheduler(另一個 repo),
         # 2 項要離線輪子(*.whl 不納入版控)。兩者都在開發機上照常跑。
         run: python -m pytest -q
+
+  shellcheck:
+    # 與 pytest 分開跑:兩者互不相依,分開的話一眼看得出是「程式碼紅了」還是「腳本紅了」。
+    runs-on: ubuntu-22.04-arm
+    steps:
+      - uses: actions/checkout@v7
+
+      - name: shellcheck
+        # -x:跟進 source 進去的檔(script/_dev_guard.sh 才會被一起檢查)。
+        # 檔案清單用 git ls-files,新增的 .sh 自動納入,不必回來改這裡。
+        #
+        # 版本:Jammy 的 apt 是 0.8.0。這份程式碼在 0.8.0 與 0.10.0 上都是零 findings,
+        # 之後若因為升版冒出新規則而變紅,請照既有做法處理 —— 該修的修,故意的寫
+        # `# shellcheck disable=SCxxxx  # 理由`,不要無理由地整批關掉。
+        run: |
+          command -v shellcheck >/dev/null 2>&1 \
+            || { sudo apt-get update -qq && sudo apt-get install -y -qq shellcheck; }
+          shellcheck --version
+          git ls-files '*.sh' | xargs shellcheck -x

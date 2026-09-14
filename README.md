@@ -590,4 +590,9 @@ CI 是**乾淨 clone**，所以有 9 項會 skip，這是預期狀態而非缺�
 
 Bionic（18.04）的 Python 3.6 相容性不靠 CI 的直譯器驗證：GitHub 已經沒有 18.04 runner，那一道由 `tests/test_offline_deploy.py` 的靜態掃描守門，真機驗證仍在 Bionic 開發機上做。
 
+另一個 job 跑 `shellcheck -x $(git ls-files '*.sh')`，涵蓋 `script/` 與 `deploy/` 全部 25 支腳本，目前零 findings。兩件事值得知道：
+
+- `-x` 會跟進 `source` 進去的檔，所以 `script/_dev_guard.sh` 也在檢查範圍內——代價是各腳本 `source` 那行上面要有 `# shellcheck source=script/_dev_guard.sh`（路徑是變數，靜態解析不到）。
+- 少數幾處是**故意**違反規則的（把空白分隔的套件清單分詞、`case` pattern 當 glob 用），一律寫成 `# shellcheck disable=SCxxxx  # 理由`。照建議「修好」反而會壞掉，別看到 disable 就順手拿掉。
+
 CI 檔案不隨鏡像上船——`config/sftp_upload_ignore.txt` 有排除 `.github/`。

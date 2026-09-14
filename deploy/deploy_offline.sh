@@ -179,7 +179,8 @@ start_transcript() {
   if [ "${NSSMS_TEST_OVERRIDES:-0}" = "1" ]; then
     dir="${TMPDIR:-/tmp}/nssms-deploy-transcripts"
   fi
-  local path="${dir}/deploy_offline_$(date '+%Y%m%d_%H%M%S').log"
+  local path
+  path="${dir}/deploy_offline_$(date '+%Y%m%d_%H%M%S').log"
   # 寫不進去不是中止部署的理由（唯讀掛載、權限不對都可能）——少一份記錄而已。
   # 兩處的 2>/dev/null 都寫在失敗的重導向**之前**：重導向錯誤是由 shell 自己印的，
   # 寫在後面就來不及擋（`: >>path 2>/dev/null` 會漏出一行 Permission denied）。
@@ -196,6 +197,7 @@ start_transcript() {
   trap stop_transcript EXIT
 }
 
+# shellcheck disable=SC2317  # 由上面的 trap ... EXIT 呼叫,shellcheck 看不到那條路徑
 stop_transcript() {
   [ -n "$TRANSCRIPT_TEE_PID" ] || return 0
   exec 1>&3 2>&4          # 先放掉寫入端，tee 才看得到 EOF
@@ -834,8 +836,11 @@ stage_clink_migration() {
           sudo rm -f "/etc/systemd/system/${u}.service" || MIGRATE_RC=1
         done
         sudo systemctl daemon-reload || MIGRATE_RC=1
-        [ "$MIGRATE_RC" -eq 0 ] && ok "已停用並移除舊 clink_* 系統服務。" \
-                                || warn "舊 clink_* 移除時有項目失敗，請檢視上方訊息。"
+        if [ "$MIGRATE_RC" -eq 0 ]; then
+          ok "已停用並移除舊 clink_* 系統服務。"
+        else
+          warn "舊 clink_* 移除時有項目失敗，請檢視上方訊息。"
+        fi
       fi
       if gpio_needed; then
         run_rc sudo usermod -aG gpio "$(id -un)"

@@ -30,9 +30,11 @@ cleanup() { case "$STAGING" in /tmp/nssms-tmux-debs.*) rm -rf -- "$STAGING" ;; e
 trap cleanup EXIT
 
 info "從建置機目前設定的 Ubuntu repository 下載 $PROFILE_ID 套件 ..."
+# shellcheck disable=SC2086  # 空白分隔的套件清單,這裡就是要分詞成多個引數
 (cd "$STAGING" && apt-get download $TMUX_EXPECTED_PACKAGES)
 
 count="$(find "$STAGING" -maxdepth 1 -type f -name '*.deb' | wc -l | tr -d ' ')"
+# shellcheck disable=SC2086  # 同上:要一行一個套件名才數得出數量
 expected_count="$(printf '%s\n' $TMUX_EXPECTED_PACKAGES | wc -l | tr -d ' ')"
 if [ "$count" -ne "$expected_count" ]; then
   err "下載數量不符：預期 $expected_count，實際 $count"
@@ -52,6 +54,7 @@ for deb in "$STAGING"/*.deb; do
 done
 
 actual_packages="$(printf '%s\n' "${DOWNLOADED_PACKAGES[@]}" | sort | paste -sd' ' -)"
+# shellcheck disable=SC2086  # 同上:要一行一個套件名才排得了序
 expected_packages="$(printf '%s\n' $TMUX_EXPECTED_PACKAGES | sort | paste -sd' ' -)"
 if [ "$actual_packages" != "$expected_packages" ]; then
   err "下載的 package set 不符：預期 $expected_packages；實際 $actual_packages"

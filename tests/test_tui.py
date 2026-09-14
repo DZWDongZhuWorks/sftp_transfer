@@ -321,7 +321,11 @@ def test_parent_key():
 
 
 def test_key_action():
-    assert tui.key_action(ord("q")) == "quit"
+    # 【q 只關窗格，離開只走 Esc】連按 q 退好幾層之後，多出來的那一下會落在最外層；
+    # q 若在那裡等於離開，整個監視畫面就這樣沒了。與 scheduler/dashboard 同一套規則。
+    assert tui.key_action(27) == "quit"
+    assert tui.key_action(ord("q")) == "close"
+    assert tui.key_action(ord("Q")) == "close"
     assert tui.key_action(curses.KEY_UP) == "up"
     assert tui.key_action(ord("j")) == "down"
     assert tui.key_action(ord(" ")) == "enter"
@@ -391,6 +395,84 @@ def test_main_mouse_row_mapping_and_actions():
     assert tui.mouse_row_index(3, maxy=10, state=state, scroll=1, total=3) == 1
 
 
+def test_single_click_selects_and_a_quick_second_click_activates():
+    """單擊立刻選取，同一列在時窗內再點一次才是雙擊。
+
+    【為什麼不交給 ncurses】交給它就得設 mouseinterval > 0，而那會讓每一次左鍵都先被
+    扣住 250ms 等「說不定是雙擊」。單擊與雙擊的第一步本來就一樣（選取那一列），
+    沒有什麼需要先等清楚 —— 所以 press 一到就選取，雙擊用時間戳補判。
+    """
+    rows = [
+        tui.Row("mode", 0, ("M", "download"), "下載", "success", object()),
+        tui.Row("vessel", 1, ("V", "download", "CLINK"), "CLINK", "success", object()),
+    ]
+    state = tui.TuiState()
+
+    assert tui.main_mouse_action(8, 3, curses.BUTTON1_CLICKED, rows, state, 10,
+                                 now=100.0) == ("select", 1)
+    # 同一列、0.2 秒內：第二次點擊＝啟動
+    assert tui.main_mouse_action(8, 3, curses.BUTTON1_CLICKED, rows, state, 10,
+                                 now=100.2) == ("enter", 1)
+    # 【三連擊不該再啟動一次】使用者連點常常只是想確定「我有沒有點到」。
+    assert tui.main_mouse_action(8, 3, curses.BUTTON1_CLICKED, rows, state, 10,
+                                 now=100.3) == ("select", 1)
+
+
+def test_slow_second_click_is_just_another_single_click():
+    rows = [tui.Row("mode", 0, ("M", "download"), "下載", "success", object())]
+    state = tui.TuiState()
+    assert tui.main_mouse_action(8, 2, curses.BUTTON1_CLICKED, rows, state, 10,
+                                 now=100.0) == ("select", 0)
+    assert tui.main_mouse_action(8, 2, curses.BUTTON1_CLICKED, rows, state, 10,
+                                 now=100.9) == ("select", 0)
+
+
+def test_second_click_on_a_different_row_is_never_a_double():
+    """--watch 會讓清單重排，所以比對的是「哪一列」而不是「第幾列」。"""
+    rows = [
+        tui.Row("mode", 0, ("M", "download"), "下載", "success", object()),
+        tui.Row("vessel", 1, ("V", "download", "CLINK"), "CLINK", "success", object()),
+    ]
+    state = tui.TuiState()
+    assert tui.main_mouse_action(8, 2, curses.BUTTON1_CLICKED, rows, state, 10,
+                                 now=100.0) == ("select", 0)
+    assert tui.main_mouse_action(8, 3, curses.BUTTON1_CLICKED, rows, state, 10,
+                                 now=100.05) == ("select", 1)
+
+
+def test_release_event_does_nothing():
+    """mouseinterval = 0 之後 release 會單獨送來一次 —— 認成點擊的話每次都會多動作一次。"""
+    rows = [tui.Row("mode", 0, ("M", "download"), "下載", "success", object())]
+    state = tui.TuiState()
+    assert tui.main_mouse_action(8, 2, curses.BUTTON1_RELEASED, rows, state, 10,
+                                 now=100.0) == (None, None)
+
+
+def test_right_click_on_the_main_list_is_close_not_quit():
+    """右鍵＝q：主列表是最外層，所以什麼都不做（絕不能等於離開）。"""
+    rows = [tui.Row("mode", 0, ("M", "download"), "下載", "success", object())]
+    state = tui.TuiState()
+    assert tui.main_mouse_action(8, 2, curses.BUTTON3_CLICKED, rows, state, 10,
+                                 now=100.0) == ("close", None)
+
+
+def test_repeat_click_is_pure_and_monotonic():
+    assert tui.is_repeat_click((("V", "a"), 100.0), ("V", "a"), 100.2) is True
+    assert tui.is_repeat_click((("V", "a"), 100.0), ("V", "a"), 100.9) is False
+    assert tui.is_repeat_click((("V", "a"), 100.0), ("V", "b"), 100.05) is False
+    assert tui.is_repeat_click(None, ("V", "a"), 100.0) is False
+    # 校時往回跳不該讓接下來的每一次點擊都變成雙擊
+    assert tui.is_repeat_click((("V", "a"), 100.0), ("V", "a"), 99.0) is False
+
+
+def test_footer_shows_the_notice_and_points_at_esc():
+    state = tui.TuiState()
+    assert "Esc離開" in tui.footer_hint(state)
+    assert "q離開" not in tui.footer_hint(state)
+    state.notice = "已經在最外層（離開請按 Esc）"
+    assert tui.footer_hint(state).strip() == "已經在最外層（離開請按 Esc）"
+
+
 def test_popup_mouse_actions():
     bounds = dict(x0=10, y0=5, w=30, h=8)
     assert tui.popup_mouse_action(12, 7, curses.BUTTON1_CLICKED, **bounds) == "activate"
@@ -408,7 +490,7 @@ def test_main_loop_routes_mouse_click_to_selection():
 
     class FakeScreen:
         def __init__(self):
-            self.keys = iter([curses.KEY_MOUSE, ord("q")])
+            self.keys = iter([curses.KEY_MOUSE, 27])   # Esc＝離開（q 已改成只關窗格）
 
         def timeout(self, _delay):
             pass

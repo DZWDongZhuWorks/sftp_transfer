@@ -178,6 +178,7 @@ nssms_verify_flat_manifest() {
         return 4
         ;;
     esac
+    # shellcheck disable=SC2254  # $payload_pattern 是 *.deb / *.whl,**就是**要當 glob 比對;加引號會變成字面比對而永遠不符
     case "$filename" in
       $payload_pattern) ;;
       *)

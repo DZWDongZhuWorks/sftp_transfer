@@ -10,8 +10,12 @@
 # 船隊永遠不會因為守門而被誤關。上傳（dev → STANDARD 發佈）不受此守門影響。
 #
 # 用法（各腳本 cd 到 BASE_DIR 後）：
+#   # shellcheck source=script/_dev_guard.sh
 #   source "$SCRIPT_DIR/_dev_guard.sh"
 #   dev_guard "$BASE_DIR"
+#
+# 那行 shellcheck 指示不是裝飾：路徑是變數，shellcheck 靜態解析不到就會報 SC1091，
+# 而明講之後它會連這支檔案一起檢查（CI 跑的是 shellcheck -x）。
 
 dev_guard() {
     local base="$1"

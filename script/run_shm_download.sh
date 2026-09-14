@@ -11,6 +11,7 @@ cd "$BASE_DIR"
 
 # 開發機 (CLINK) 守門：見 _dev_guard.sh。shm 下載會 overwrite 覆蓋開發端工作區，
 # 在 CLINK 上一律略過，避免覆蓋未提交的修改。
+# shellcheck source=script/_dev_guard.sh  # 路徑是變數,靜態解析不到,明講給它
 source "$SCRIPT_DIR/_dev_guard.sh"
 dev_guard "$BASE_DIR"
 

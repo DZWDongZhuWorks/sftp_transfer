@@ -13,6 +13,7 @@ cd "$BASE_DIR"
 
 # 開發機 (CLINK) 守門：在發佈源頭上執行下載會把 STANDARD 覆蓋回本機、
 # 清掉尚未發佈的開發修改，因此一律略過。
+# shellcheck source=script/_dev_guard.sh  # 路徑是變數,靜態解析不到,明講給它
 source "$SCRIPT_DIR/_dev_guard.sh"
 dev_guard "$BASE_DIR"
 

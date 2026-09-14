@@ -16,6 +16,7 @@ cd "$BASE_DIR"
 
 # 開發機 (CLINK) 守門：見 _dev_guard.sh。nsms 下載是 overwrite，會覆蓋開發端工作區
 # （bridge_video_analysis_module 底下還有自己的 .git），在 CLINK 上一律略過。
+# shellcheck source=script/_dev_guard.sh  # 路徑是變數,靜態解析不到,明講給它
 source "$SCRIPT_DIR/_dev_guard.sh"
 dev_guard "$BASE_DIR"
 

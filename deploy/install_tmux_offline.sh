@@ -78,7 +78,7 @@ else
   fi
 fi
 
-# shellcheck disable=SC1090
+# shellcheck source=/dev/null  # profile.env 在哪一個 platforms/<profile>/ 底下是執行期才決定的
 . "$PROFILE_DIR/profile.env"
 DEBS_DIR="$PROFILE_DIR/debs"
 MANIFEST="$DEBS_DIR/MANIFEST.txt"
@@ -119,6 +119,7 @@ for deb in "${DEBS[@]}"; do
 done
 
 actual_packages="$(printf '%s\n' "${PACKAGE_NAMES[@]}" | sort | paste -sd' ' -)"
+# shellcheck disable=SC2086  # TMUX_EXPECTED_PACKAGES 是空白分隔的套件清單,這裡**就是**要分詞
 expected_packages="$(printf '%s\n' $TMUX_EXPECTED_PACKAGES | sort | paste -sd' ' -)"
 if [ "$actual_packages" != "$expected_packages" ]; then
   err "deb package set 不完整或含多餘套件"

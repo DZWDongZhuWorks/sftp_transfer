@@ -577,7 +577,9 @@ SFTP 連線，並把 `.part` 的**精確位元組數、SHA-256、遠端 size/mti
 
 ### CI（GitHub Actions）
 
-`.github/workflows/ci.yml`：push 到 `main` 與每個 PR 都會在 `ubuntu-22.04`（對齊船上 IPC1/IPC2 的 Jammy）+ Python 3.10（對齊船端 venv 的 3.10.12）跑一次 `python -m pytest -q`。不需要任何 secret。
+`.github/workflows/ci.yml`：push 到 `main` 與每個 PR 都會在 `ubuntu-22.04-arm`（對齊船上 IPC1/IPC2 的 Jammy **與 aarch64**）+ Python 3.10（對齊船端 venv 的 3.10.12）跑一次 `python -m pytest -q`，整趟約 40 秒。不需要任何 secret。
+
+架構不是可有可無的：`deploy/platforms/*/debs` 裡是 arm64 的 tmux，而 `install_tmux_offline.sh --check-only` 會把它解包後**真的執行一次**做 ABI 探測；在 x86 runner 上那支 binary 跑不起來，`test_missing_tmux_returns_5_when_bionic_payload_is_installable` 會因此紅掉（實測過）。wheelhouse 的輪子同樣是 aarch64 的。
 
 CI 是**乾淨 clone**，所以有 9 項會 skip，這是預期狀態而非缺陷：
 

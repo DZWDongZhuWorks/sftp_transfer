@@ -28,6 +28,15 @@ sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "deploy"))
 import automation_health_check as hc  # noqa: E402
 
 
+# 需要 scheduler/timers/*.service 才問得出答案的測試用這個標記。角色限制(ExecCondition
+# 允許哪些 base IPC)只寫在 scheduler 出貨的 unit 檔裡,scheduler 不在場時 unit_applicable
+# 一律回答「適用」,判成 FAIL 的是缺件而不是被測邏輯 —— 與 test_timers_list_covers_every
+# _scheduler_timer 同一個理由:三個專案各自獨立下載,別人沒下載好不該讓這裡變紅。
+requires_scheduler_units = pytest.mark.skipif(
+    not hc.TIMERS_DIR.is_dir(), reason="scheduler 不在場:{}".format(hc.TIMERS_DIR)
+)
+
+
 # 一支健康的 timer 該有的屬性。
 HEALTHY_TIMER = {
     "LoadState": "loaded",
@@ -117,7 +126,12 @@ def test_wave_deployed_but_not_enabled_is_skip_not_fail(fake_systemd):
     assert checks["nssms-cleanup-old-files.timer"] == "PASS"
     assert checks["nssms-warm-env.timer"] == "PASS"
     # 整體不得因為 wave 而變成有 FAIL。
-    assert not [c for c in hc.RESULTS if c.status == "FAIL"]
+    fails = [c for c in hc.RESULTS if c.status == "FAIL"]
+    if not hc.TIMERS_DIR.is_dir():
+        # scheduler 不在場(乾淨 clone / CI)時,targets 這一節會因為找不到 unit 母體
+        # 而整片 FAIL —— 那是缺件,不是 wave 降級失效,不該讓這支核心回歸測試變紅。
+        fails = [c for c in fails if c.section != "targets"]
+    assert not fails
 
 
 def test_skip_detail_explains_why(fake_systemd):
@@ -179,6 +193,7 @@ def test_timers_list_covers_every_scheduler_timer(fake_systemd):
     assert not missing, f"TIMERS 沒涵蓋:{sorted(missing)}"
 
 
+@requires_scheduler_units
 def test_ipc3_n_a_timer_is_skip_when_absent(fake_systemd, monkeypatch, tmp_path):
     """IPC3 沒有 failover/web 工作負載；未安裝限制型 timer 是正確狀態。"""
     monkeypatch.setattr(hc, "USER_UNIT_DIR", tmp_path / "units")
@@ -198,6 +213,7 @@ def test_ipc3_n_a_timer_is_skip_when_absent(fake_systemd, monkeypatch, tmp_path)
     assert timer_checks()["nssms-warm-env.timer"] == "PASS"
 
 
+@requires_scheduler_units
 def test_ipc3_n_a_timer_fails_if_still_active(fake_systemd, monkeypatch, tmp_path):
     """Bionic 曾忽略 ExecCondition；IPC3 上殘留且 active 的 timer 必須浮成 FAIL。"""
     monkeypatch.setattr(hc, "USER_UNIT_DIR", tmp_path / "units")

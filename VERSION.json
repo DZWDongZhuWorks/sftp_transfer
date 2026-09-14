@@ -1,7 +1,7 @@
 {
-  "version": "0.15.1",
+  "version": "0.15.2",
   "date": "2026-09-14",
-  "notes": "接續 0.15.0:解不開的跳脫序列不再被當成 Esc 而關掉程式。0.15.0 把 Esc 變成唯一的離開路徑,而**滑鼠回報與方向鍵本身就是 ESC 開頭的序列** —— 終端送出的編碼與 terminfo 的 kmous 對不上時(tmux 的 default-terminal 就常常對不上),ncurses 解不出來會把那些位元組原樣交出來,第一個正是裸 ESC。於是使用者按一次右鍵,整個監視畫面直接關掉。實測:TERM=xterm-256color(app 要求 SGR)而終端送 X10 編碼時,一次右鍵就結束程式;TERM=screen 反向也一樣。0.15.0 之前 Esc 不做事,所以裸 ESC 外漏是無害的 —— 這個缺陷是跟著「Esc 成為離開鍵」一起出現的。修法沿用姊妹專案 scheduler/dashboard 的 _swallow_escape_sequence:收到 ESC 先用 nodelay 探讀一次,後面還有位元組就把整段吃掉(最多 8 個,免得壞掉的輸入卡住迴圈)並在底部提示「未識別的按鍵序列(已忽略)」;真正的 Esc 鍵後面不會有東西(ncurses 已經等過 ESCDELAY),所以一次探讀就分得出來。探讀完一定要還原 nodelay 與 timeout,否則主迴圈的 getch 會變成忙迴圈。pytest 571 條全過(新增 2 條:_swallow_escape_sequence 的行為與 nodelay 還原、主迴圈餵入「ESC [ C」後不得離開);另以 pty 實測兩種 TERM 下對不上的右鍵與方向鍵都不再關掉程式,而單獨的 Esc 仍然離開。",
+  "notes": "加上 GitHub Actions CI(.github/workflows/ci.yml:push to main / PR 時在 ubuntu-22.04-arm + Python 3.10 上跑整份 pytest),並把 5 項「缺件時該 skip 卻寫成 FAIL」的測試補上 repo 既有的慣例。為什麼要先改測試:乾淨 clone 上這 5 項必紅 —— 其中 2 項(deploy 的 --check-only)會跑真的 preflight,而離線輪子 *.whl 不納入版控;另外 3 項(automation_health_check 的 wave / ipc3)要讀 scheduler 出貨的 unit 檔,scheduler 是另一個由 SFTP 獨立下載的專案。兩種缺件在同一份測試檔裡本來就已經有 skip 的先例(test_real_*_wheelhouse_* 與 test_timers_list_covers_every_scheduler_timer),這次只是讓其餘幾項跟上,不是放寬守門:輪子與 scheduler 都在場的開發機與船上,571 條仍然一條不 skip 全部照跑。wave 那支核心回歸測試沒有整支 skip,只在 scheduler 缺席時把 targets 那一節(找不到 unit 母體)排除在「整體無 FAIL」之外,被測的降級邏輯本身仍然全跑。實測:開發機 571 passed / 0 skipped;乾淨 clone 562 passed / 9 skipped。CI 不需要任何 secret —— 本 repo 是 public,而 scheduler 是 private,刻意不把可讀私有 repo 的 token 放進來。3.6 相容仍由 test_offline_deploy.py 的靜態掃描守門(GitHub 已無 18.04 runner,真機驗證仍在 192.168.6.230)。CI runner 用 aarch64 而不是 x86:deploy/platforms/*/debs 是 arm64 的 tmux,install_tmux_offline.sh 的 --check-only 會把它解包後真的執行一次做 ABI 探測 —— 在 x86 上跑不起來,rc 會是 6 而不是 5(第一次 CI 實跑抓到的,x86 上唯一紅的一項)。",
   "stamp_exclude": [
     "*.whl"
   ]

@@ -264,8 +264,25 @@ class OfflineDeployTests(unittest.TestCase):
         fake_python.chmod(0o755)
         return fake_python
 
+    def _require_offline_wheels(self):
+        """輪子不在場就 skip —— 乾淨 clone / CI 上 preflight 必定缺件。
+
+        與同檔 test_real_*_wheelhouse_matches_* 同一條規則:*.whl 不納入版控(見
+        .gitignore),沒被 SFTP 派送到本機是正常狀態,不該變成測試失敗。輪子在場的
+        開發機與船上照樣跑完整的 preflight,守門強度不變。
+        """
+        needed = (
+            DEPLOY_DIR / "platforms" / "ubuntu-18.04-arm64" / "wheelhouse",
+            DEPLOY_DIR / "virtualenv_wheels",
+        )
+        missing = [d for d in needed if not any(d.glob("*.whl"))]
+        if missing:
+            self.skipTest("離線輪子未派送到本機(*.whl 不納入版控):{}".format(
+                ", ".join(str(d) for d in missing)))
+
     def _check_only_as_bionic(self, fake_home):
         """以假的 3.6 直譯器 + 假造的 Bionic 身分跑一次唯讀 --check-only。"""
+        self._require_offline_wheels()
         env = dict(os.environ, **self.platform_env())
         env["HOME"] = str(fake_home)
         return subprocess.run(

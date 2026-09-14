@@ -1,7 +1,7 @@
 {
-  "version": "0.14.0",
-  "date": "2026-09-09",
-  "notes": "_load_ignore_spec 找不到 ignore_file 時,診斷事件 IGNORE_FILE_MISSING 從 info 升為 warning。原本的 docstring 寫「未設定或檔案不存在代表無需忽略」—— 那個「或」把 bug 講成了規格:「刻意不忽略」走的是 ignore_file 沒設定時那條 return None,根本到不了 exists() 檢查;走到 exists() 表示有人寫了路徑卻找不到檔,那必然是設定錯字或漏放檔案,零誤報,而後果是該排除的東西全被靜默傳出去。config/ 整包 gitignored(裡面有密碼)、沒有版控、由離線部署與 SFTP OTA 散佈全船隊 —— 不會有 code review 抓到設定檔的錯字,這行 log 是唯一的守門。實際事故:config/ecdis_upload_settings.json 的 ignore_file 寫成 config/ecdis_upload_settings.txt(正確是 config/ecdis_upload_ignore.txt),於是那份 ignore 完全沒生效 —— 155 個 __pycache__/*.pyc、rt_enc_ias/logs/,以及船特定的 rt_enc_ias/config/vessel_basic_info/ 全被推上 STANDARD/ecdis(全船隊基準),而唯一的徵兆是 VERSION.stamp.json 印出 836 MB manifest 的體積警告,沿著那條線才追到錯字。掃過 config/ 全部 20 份設定,ecdis 是唯一一份寫錯的。_load_ignore_spec 定義在 SFTPBase,SFTPDownloader / SFTPUploader / pack_upload._LocalUploadPlanner 三者都繼承,所以上傳、下載、manifest 計算三條路徑同時生效。測試改名為 test_missing_ignore_file_means_no_ignore_and_warns 並加上 levelno == WARNING 的斷言:原本只斷言訊息存在,守門日後被改回 info 也不會有人知道。pytest 562 條全過。",
+  "version": "0.15.1",
+  "date": "2026-09-14",
+  "notes": "接續 0.15.0:解不開的跳脫序列不再被當成 Esc 而關掉程式。0.15.0 把 Esc 變成唯一的離開路徑,而**滑鼠回報與方向鍵本身就是 ESC 開頭的序列** —— 終端送出的編碼與 terminfo 的 kmous 對不上時(tmux 的 default-terminal 就常常對不上),ncurses 解不出來會把那些位元組原樣交出來,第一個正是裸 ESC。於是使用者按一次右鍵,整個監視畫面直接關掉。實測:TERM=xterm-256color(app 要求 SGR)而終端送 X10 編碼時,一次右鍵就結束程式;TERM=screen 反向也一樣。0.15.0 之前 Esc 不做事,所以裸 ESC 外漏是無害的 —— 這個缺陷是跟著「Esc 成為離開鍵」一起出現的。修法沿用姊妹專案 scheduler/dashboard 的 _swallow_escape_sequence:收到 ESC 先用 nodelay 探讀一次,後面還有位元組就把整段吃掉(最多 8 個,免得壞掉的輸入卡住迴圈)並在底部提示「未識別的按鍵序列(已忽略)」;真正的 Esc 鍵後面不會有東西(ncurses 已經等過 ESCDELAY),所以一次探讀就分得出來。探讀完一定要還原 nodelay 與 timeout,否則主迴圈的 getch 會變成忙迴圈。pytest 571 條全過(新增 2 條:_swallow_escape_sequence 的行為與 nodelay 還原、主迴圈餵入「ESC [ C」後不得離開);另以 pty 實測兩種 TERM 下對不上的右鍵與方向鍵都不再關掉程式,而單獨的 Esc 仍然離開。",
   "stamp_exclude": [
     "*.whl"
   ]

@@ -15,6 +15,7 @@ from typing import List, Optional, Tuple
 
 import curses
 import re
+import time
 import unicodedata
 from collections import deque
 from dataclasses import dataclass, field
@@ -54,7 +55,19 @@ _FLAT_COLS = (1, 10, 6, 20, 11, 5, 9, 8)
 _FLAT_ALIGN = ("left", "left", "left", "left", "left", "right", "right", "left")
 _FLAT_GUTTER = "    "  # 對齊 _draw 的 depth-0 縮排("  ") + 狀態燈("●") + 空白
 _MOUSE_SCROLL_LINES = 3
-_MOUSE_INTERVAL_MS = 250
+# 【設 0：讓 press 立刻出來，雙擊改由自己判】
+# mouseinterval > 0 的意思是「ncurses 幫你合成 click」，而合成的前提是**先扣住那個
+# press** —— 它得等滿這段時間，才知道接下來該送 CLICKED 還是 DOUBLE_CLICKED，於是
+# 每一次左鍵都遲到 250ms。滾輪不會：BUTTON4/5 只有 press、湊不成一對，ncurses 沒有
+# 東西要等就直接放行 —— 「滾輪很跟手、左鍵頓一下」就是這麼來的。
+#
+# 而那段等待在這裡沒有價值：**單擊與雙擊的第一步是同一件事**（選取那一列），差別只在
+# 雙擊要再多做一件（啟動）。所以改成 0，press 一到就選取，再由 TuiState.last_click
+# 記住「上一次點了哪一列、什麼時候」，同一列在 _DOUBLE_CLICK_SEC 內再點一次才算雙擊。
+_MOUSE_INTERVAL_MS = 0
+# 兩次點擊算同一組雙擊的上限（秒）。沿用原本交給 ncurses 的 250ms —— 船上是
+# TeamViewer + tmux，連線抖動會把兩次點擊之間的間隔拉長，再短會讓雙擊變難按。
+_DOUBLE_CLICK_SEC = 0.25
 
 
 def _mouse_bits(*names: str) -> int:
@@ -160,6 +173,11 @@ class TuiState:
     sort_key: str = _SORT_CYCLE[0]      # 見 _SORT_CYCLE
     sort_desc: bool = False            # 預設由 _SORT_CYCLE 首欄位升冪排序
     html_note: str = ""                # --html 每輪寫出的結果，顯示在第二行（""＝未啟用）
+    # 上一次左鍵點在**哪一列**、什麼時候（單調時鐘）。單擊立刻選取，同一列在
+    # _DOUBLE_CLICK_SEC 內再點一次才是雙擊 —— 見 is_repeat_click。
+    last_click: Optional[tuple] = None
+    # 底部那一行的臨時提示（例如「已經在最外層」）。壽命到下一個有作用的輸入為止。
+    notice: str = ""
 
 
 def _badge(s) -> str:
@@ -590,9 +608,18 @@ def collapse_or_parent(state: TuiState, row: Optional[Row]) -> None:
 
 
 def key_action(ch: int) -> Optional[str]:
-    """把原始按鍵碼映射成動作標籤（純函式，可測；curses.KEY_* 為模組常數）。"""
-    if ch == ord("q"):
+    """把原始按鍵碼映射成動作標籤（純函式，可測；curses.KEY_* 為模組常數）。
+
+    【q 只關窗格，離開只走 Esc】子畫面（明細彈窗、CSV 檢視）也用 q 關掉，而連按 q
+    退好幾層之後，多出來的那一下會落在最外層 —— q 若在那裡等於離開，整個監視畫面就
+    這樣沒了。「我只是想關掉一個窗格」與「重開再等一輪掃描」的代價差太多，所以最外層
+    的 q 什麼都不做，離開只留給 Esc（沒有人會連按它）。這與 scheduler/dashboard 是
+    同一套規則，四個 TUI 不該各有一套。
+    """
+    if ch == 27:                       # Esc＝離開（最外層唯一的離開路徑）
         return "quit"
+    if ch in (ord("q"), ord("Q")):     # q＝關掉目前的窗格；最外層不做事
+        return "close"
     if ch in (curses.KEY_UP, ord("k")):
         return "up"
     if ch in (curses.KEY_DOWN, ord("j")):
@@ -651,6 +678,28 @@ def mouse_event_kind(bstate: int) -> Optional[str]:
     if bstate & _MOUSE_RIGHT_CLICK:
         return "close"
     return None
+
+
+def is_repeat_click(previous, target, now: float,
+                    window: float = _DOUBLE_CLICK_SEC) -> bool:
+    """這一次點擊算不算「同一列的第二次點擊」—— 也就是雙擊的後半。
+
+    previous 是 (目標, 時間戳) 或 None；now 用單調時鐘（time.monotonic）。
+    純函式，理由同 mouse_event_kind：在真終端機上測「雙擊有沒有反應」是最不可重現的
+    那種驗證。
+
+    【比對的是「哪一列」而不是「第幾列」】--watch 每幾秒重載一次，兩次點擊之間清單
+    可能已經重排。比索引的話，使用者對同一個位置點兩下，開到的會是**另一台裝置**。
+
+    【時間要單調】用 time.time() 的話，船上校時往回跳一秒，就會讓接下來的每一次點擊
+    都被算成雙擊。
+    """
+    if previous is None or target is None:
+        return False
+    prev_target, prev_time = previous
+    if prev_target != target:
+        return False
+    return 0 <= (now - prev_time) <= window
 
 
 # --- CSV 原始資料檢視的版面（純函式）--------------------------------------
@@ -880,7 +929,7 @@ _HELP_LINES = [
     "版本      v 顯示/隱藏版本欄（該次傳輸的程式碼版本；沒宣告版號的專案顯示 —）",
     "          版本排序是把同版本的船聚在一起，不是比新舊（0.10.0 會排在 0.9.0 前）",
     "過濾      / 搜尋（Esc 清除）、m 循環方向、s 循環狀態、p 只看異常",
-    "其他      r 立即重載、? 說明、q 離開",
+    "其他      r 立即重載、? 說明、Esc 離開（q／右鍵只關窗格，最外層不做事）",
 ]
 
 
@@ -914,6 +963,36 @@ def _read_mouse() -> Optional[Tuple[int, int, int]]:
     except (curses.error, ValueError):
         return None
     return x, y, bstate
+
+
+def _swallow_escape_sequence(stdscr) -> bool:
+    """ESC 之後緊接著還有位元組嗎？有就把整段吃掉，回傳 True。
+
+    【為什麼一定要有這個】Esc 現在是唯一的離開路徑，而**滑鼠回報與方向鍵本身就是
+    ESC 開頭的序列**。終端送出的編碼與 terminfo 的 kmous 對不上時（tmux 的
+    default-terminal 常常對不上），ncurses 解不出來就會把那些位元組原樣交出來 ——
+    第一個就是裸 ESC。於是使用者按一次右鍵，整個監視畫面直接關掉。實測踩過：
+    app 要求 SGR 而終端送 X10 時，一次右鍵就結束程式。
+
+    真正的 Esc 鍵按下時後面不會有東西（ncurses 已經等過 ESCDELAY），所以 nodelay
+    的一次探讀就足以分辨。最多吃 8 個位元組，免得壞掉的輸入把迴圈卡住。
+    """
+    stdscr.nodelay(True)
+    try:
+        first = stdscr.getch()
+        if first == -1:
+            return False                      # 單獨的 Esc＝使用者真的要離開
+        for _ in range(8):
+            # CSI/SS3 的終止字元是 @-~（'[' 與 'O' 是引入字元，不算結束）
+            if 0x40 <= first <= 0x7E and first not in (ord("["), ord("O")):
+                break
+            nxt = stdscr.getch()
+            if nxt == -1:
+                break
+            first = nxt
+        return True
+    finally:
+        stdscr.nodelay(False)
 
 
 def _clean_sync_line(line: str) -> str:
@@ -997,11 +1076,25 @@ def mouse_row_index(y: int, *, maxy: int, state: TuiState,
 
 
 def main_mouse_action(x: int, y: int, bstate: int, rows: List[Row],
-                      state: TuiState, maxy: int) -> Tuple[Optional[str], Optional[int]]:
-    """主列表滑鼠事件 → (動作, 列索引)，供 curses 迴圈與純邏輯測試共用。"""
+                      state: TuiState, maxy: int,
+                      now: Optional[float] = None) -> Tuple[Optional[str], Optional[int]]:
+    """主列表滑鼠事件 → (動作, 列索引)，供 curses 迴圈與純邏輯測試共用。
+
+    【右鍵＝q】兩個兄弟專案都是這個語意；主列表沒有窗格可關，所以回 "close"，
+    由迴圈決定「最外層什麼都不做」。
+
+    【雙擊由這裡判，不由 ncurses 判】mouseinterval = 0 之後 ncurses 不再合成
+    DOUBLE_CLICKED（也就不再為了等它而扣住 press），所以同一列在 _DOUBLE_CLICK_SEC
+    內的第二次點擊由 is_repeat_click 認定。**會就地更新 state.last_click** ——
+    這是這個函式唯一持有的狀態，慣例同 csv_apply 的就地套用。
+    now 可指定，讓測試釘住時間而不必真的等。
+    """
     kind = mouse_event_kind(bstate)
     if kind in ("wheel_up", "wheel_down"):
         return kind, None
+    if kind == "close":
+        state.last_click = None        # 中間插了別的動作，前一次點擊不再是雙擊的前半
+        return "close", None
     if kind not in ("click", "activate"):
         return None, None
 
@@ -1009,20 +1102,39 @@ def main_mouse_action(x: int, y: int, bstate: int, rows: List[Row],
         y, maxy=maxy, state=state, scroll=state.scroll, total=len(rows)
     )
     if idx is None:
+        state.last_click = None
         return None, None
     row = rows[idx]
     # 群組箭頭本身採單擊開合；列的其他位置維持桌面介面的單擊選取、雙擊啟動。
     arrow_clicked = row.kind != "device" and x == row.depth * 2
-    return ("enter" if kind == "activate" or arrow_clicked else "select"), idx
+    if kind == "activate" or arrow_clicked:
+        # ncurses 自己合成的雙擊仍然採信：有些建置即使 mouseinterval = 0 也會合成，
+        # 而在那些建置上 press 不會單獨出現，只認自己那套計時就會漏掉雙擊。
+        state.last_click = None
+        return "enter", idx
+    stamp = time.monotonic() if now is None else now
+    if is_repeat_click(state.last_click, row.key, stamp):
+        # 【觸發之後要清掉】不清的話第三下、第四下會各再啟動一次 —— 使用者連點常常
+        # 只是想確定「我到底有沒有點到」。
+        state.last_click = None
+        return "enter", idx
+    state.last_click = (row.key, stamp)
+    return "select", idx
 
 
 def footer_hint(state: TuiState) -> str:
-    """底部提示（純函式）：平坦模式沒有群組，展開收合的提示換成排序。"""
+    """底部提示（純函式）：平坦模式沒有群組，展開收合的提示換成排序。
+
+    有臨時提示時由它佔用這一行：這個介面沒有別的地方可以說話，而「按了 q 卻沒反應」
+    一定要有人解釋，否則使用者只會認為程式當掉了。
+    """
+    if state.notice:
+        return " " + state.notice
     if state.flat:
         return (" ↑↓移動  Enter明細  f分群  o欄位/O升降  /搜尋  m方向  s狀態"
-                "  p異常  v版本  r重載  ?說明  q離開")
+                "  p異常  v版本  r重載  ?說明  Esc離開")
     return (" ↑↓移動  Enter開合/明細  ←→收展  E/C全展收  f平坦  o/O排序"
-            "  /搜尋  m方向  s狀態  p異常  v版本  r重載  ?說明  q離開")
+            "  /搜尋  m方向  s狀態  p異常  v版本  r重載  ?說明  Esc離開")
 
 
 def _draw(stdscr, state: TuiState, rows: List[Row], tree, watch: float) -> None:
@@ -1339,6 +1451,12 @@ def _main_loop(stdscr, args):
                 tree = reload()
                 last = time.monotonic()
             continue
+        if ch == 27 and _swallow_escape_sequence(stdscr):
+            # 【不是真的 Esc】是一段解不出來的序列（多半是滑鼠回報或方向鍵）。
+            # 當成離開的話,使用者按一次右鍵程式就沒了。
+            stdscr.timeout(1000 if watch else -1)   # nodelay 探讀之後要還原讀鍵設定
+            state.notice = "未識別的按鍵序列（已忽略）"
+            continue
         if ch == curses.KEY_MOUSE:
             event = _read_mouse()
             if event is None:
@@ -1351,8 +1469,18 @@ def _main_loop(stdscr, args):
                 state.sel_key = rows[mouse_idx].key
         else:
             act = key_action(ch)
+        if act is None:
+            # 【不認得的輸入不要擦掉提示】mouseinterval = 0 之後一次實體點擊會送來
+            # press 與 release 兩個事件，而 release 不對應任何動作 —— 讓它清掉提示的話，
+            # press 剛寫上的「已經在最外層」會在幾十毫秒後消失，使用者只看得到一閃。
+            continue
+        state.notice = ""     # 提示的壽命：到下一個有作用的輸入為止
         if act == "quit":
             break
+        elif act == "close":
+            # 主列表就是最外層，沒有窗格可關 —— 什麼都不做，但要說出來。
+            state.notice = "已經在最外層（離開請按 Esc）"
+
         elif act == "up":
             move_selection(rows, state, -1)
         elif act == "down":

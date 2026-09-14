@@ -15,9 +15,16 @@ concurrency:
 
 jobs:
   pytest:
-    # 對齊船上 IPC1/IPC2 的 Jammy(22.04);Bionic(18.04)的相容性由 test_offline_deploy.py
-    # 的靜態掃描守門,GitHub 已經沒有 18.04 runner,真機驗證仍在 192.168.6.230 上做。
-    runs-on: ubuntu-22.04
+    # 對齊船上 IPC1/IPC2 的 Jammy(22.04)**與 aarch64**。
+    #
+    # 架構不是可有可無的:deploy/platforms/*/debs 裡是 arm64 的 tmux,而
+    # install_tmux_offline.sh 的 --check-only 會把它解包後**真的執行一次**做 ABI 探測。
+    # 在 x86 runner 上那支 binary 根本跑不起來,rc 會是 6(ABI 不符)而不是 5(可安裝)——
+    # 實測過,那是 x86 runner 上唯一紅的一項。輪子(wheelhouse)也同樣是 aarch64 的。
+    #
+    # Bionic(18.04)的相容性由 test_offline_deploy.py 的靜態掃描守門:GitHub 已經沒有
+    # 18.04 runner,真機驗證仍在 Bionic 開發機上做。
+    runs-on: ubuntu-22.04-arm
     steps:
       - uses: actions/checkout@v4
 

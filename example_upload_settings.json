@@ -20,5 +20,8 @@
   "log_remote_dir": "/data/logs",
   "log_dir": "logs/",
   "duplicate_mode": "overwrite",
-  "duplicate_suffix": "copy"
+  "duplicate_suffix": "copy",
+  "delete_source": false,
+  "delete_source_min_age_minutes": 10,
+  "delete_source_pattern": []
 }

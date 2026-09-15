@@ -8,6 +8,7 @@ import logging
 import os
 import stat
 import sys
+import time
 from pathlib import Path
 from unittest.mock import MagicMock
 
@@ -22,6 +23,12 @@ import uploader as up  # noqa: E402
 def _write(path: Path, data: bytes):
     path.parent.mkdir(parents=True, exist_ok=True)
     path.write_bytes(data)
+
+
+def _write_r(path: Path, data: bytes) -> Path:
+    """同 _write，但回傳路徑，方便串接（如 TestDeleteSource._aged）。"""
+    _write(path, data)
+    return path
 
 
 def _mtime(path: Path):
@@ -921,3 +928,267 @@ class TestRunMultiSource:
         # 不存在的來源略過、不影響其餘來源，整體仍算成功。
         assert ok is True
         assert fake.files["/remote/a.txt"] == b"aaa"
+
+
+class TestDeleteSource:
+    """delete_source：上傳完成後刪掉本地來源檔（日誌搬運任務用，預設關閉）。"""
+
+    @staticmethod
+    def _aged(path: Path, minutes=60):
+        """把檔案的 mtime 推到過去，讓它通過預設的隔離期。
+
+        大部分測試要驗的是「刪除本身」，用剛寫出來的檔會被隔離期擋下（那是另外幾條測試
+        在驗的事）。真實情境裡要被搬走的日誌本來就不是這一秒才寫的。
+        """
+        past = time.time() - minutes * 60
+        os.utime(str(path), (past, past))
+        return path
+
+    def _prepare(self, uploader_factory, fake_sftp_factory, files=None, **overrides):
+        d = uploader_factory(wait_for_network=False, **overrides)
+        fake = fake_sftp_factory(files=files or {})
+        d._connect_with_retry = MagicMock(side_effect=lambda: setattr(d, "sftp", fake))
+        d._close = MagicMock()
+        return d, fake
+
+    def test_default_off_keeps_every_source_file(self, uploader_factory, fake_sftp_factory, tmp_path):
+        _write(tmp_path / "a.txt", b"aaa")
+        d, fake = self._prepare(uploader_factory, fake_sftp_factory)
+
+        assert d.run() is True
+
+        assert fake.files["/remote/a.txt"] == b"aaa"
+        assert (tmp_path / "a.txt").exists()  # 沒開就絕不動來源
+
+    def test_uploaded_files_are_deleted_from_the_source(self, uploader_factory, fake_sftp_factory, tmp_path):
+        self._aged(_write_r(tmp_path / "a.log", b"aaa"))
+        self._aged(_write_r(tmp_path / "sub" / "b.log", b"bbb"))
+        d, fake = self._prepare(uploader_factory, fake_sftp_factory, delete_source=True)
+
+        assert d.run() is True
+
+        # 內容確實已經送達遠端，本地才會被清掉。
+        assert fake.files["/remote/a.log"] == b"aaa"
+        assert fake.files["/remote/sub/b.log"] == b"bbb"
+        assert not (tmp_path / "a.log").exists()
+        assert not (tmp_path / "sub" / "b.log").exists()
+        assert (tmp_path / "sub").is_dir()  # 只刪檔案，不動目錄結構
+
+    def test_skipped_file_is_deleted_too(self, uploader_factory, fake_sftp_factory, tmp_path):
+        """遠端已有完整同一份 → 判定略過，但來源一樣該清掉。
+
+        不這樣做的話，上一趟「上傳成功、刪除失敗」的檔案會永遠卡在來源目錄：
+        之後每一趟都只會判定略過，沒有任何一趟會再去刪它。
+        """
+        self._aged(_write_r(tmp_path / "a.log", b"aaa"))
+        d, fake = self._prepare(
+            uploader_factory, fake_sftp_factory, files={"/remote/a.log": b"aaa"}, delete_source=True
+        )
+
+        assert d.run() is True
+
+        assert not (tmp_path / "a.log").exists()
+
+    def test_deleted_file_is_dropped_from_the_manifest(self, uploader_factory, fake_sftp_factory, tmp_path):
+        """來源檔已經不在，版本紀錄留著只會隨著日誌檔名無限長大。"""
+        self._aged(_write_r(tmp_path / "a.log", b"aaa"))
+        self._aged(_write_r(tmp_path / "sub" / "b.log", b"bbb"))
+        d, fake = self._prepare(uploader_factory, fake_sftp_factory, delete_source=True)
+
+        assert d.run() is True
+
+        assert d._load_manifest(tmp_path) == {}
+
+    def test_delete_failure_warns_but_does_not_fail_the_task(
+        self, uploader_factory, fake_sftp_factory, tmp_path, monkeypatch, caplog
+    ):
+        self._aged(_write_r(tmp_path / "a.log", b"aaa"))
+        d, fake = self._prepare(uploader_factory, fake_sftp_factory, delete_source=True)
+
+        real_remove = up.os.remove
+
+        def refuse(path):
+            if Path(path).name == "a.log":
+                raise PermissionError(13, "Permission denied")
+            return real_remove(path)
+
+        monkeypatch.setattr(up.os, "remove", refuse)
+        with caplog.at_level(logging.WARNING):
+            ok = d.run()
+
+        # 內容已經送達，清不掉來源不該讓整個任務被判失敗、下一趟又全部重傳。
+        assert ok is True
+        assert fake.files["/remote/a.log"] == b"aaa"
+        assert (tmp_path / "a.log").exists()
+        assert any("SOURCE_DELETE_FAILED" in r.message for r in caplog.records)
+        # 紀錄刻意保留：下一趟才會判定「已完整上傳」直接略過，只重試刪除。
+        assert "a.log" in d._load_manifest(tmp_path)
+
+    def test_missing_source_file_counts_as_deleted(
+        self, uploader_factory, fake_sftp_factory, tmp_path, monkeypatch
+    ):
+        self._aged(_write_r(tmp_path / "a.log", b"aaa"))
+        d, fake = self._prepare(uploader_factory, fake_sftp_factory, delete_source=True)
+        monkeypatch.setattr(up.os, "remove", MagicMock(side_effect=FileNotFoundError(2, "gone")))
+
+        assert d.run() is True  # 已經不在了＝目的已達成，不是錯誤
+
+    def test_never_deletes_its_own_running_log_file(self, uploader_factory, fake_sftp_factory, tmp_path):
+        """logs/ 正是最典型的來源目錄，而本次執行的 log 還要寫結束統計、還要被 upload_log 上傳。
+
+        unlink 之後 handler 仍寫得進去，只是寫進一個沒有名字的 inode —— 整趟記錄安靜消失。
+        """
+        self._aged(_write_r(tmp_path / "old.csv", b"yesterday"))
+        active = self._aged(_write_r(tmp_path / "today.csv", b"running"))
+        d, fake = self._prepare(
+            uploader_factory, fake_sftp_factory, delete_source=True, log_file=str(active)
+        )
+
+        assert d.run() is True
+
+        assert fake.files["/remote/today.csv"] == b"running"  # 照樣上傳
+        assert active.exists()                                 # 但不刪
+        assert not (tmp_path / "old.csv").exists()             # 其他檔案照刪
+
+    def test_summary_reports_deletion_counts_and_stays_machine_readable(
+        self, uploader_factory, fake_sftp_factory, tmp_path, caplog
+    ):
+        self._aged(_write_r(tmp_path / "a.log", b"aaa"))
+        d, fake = self._prepare(uploader_factory, fake_sftp_factory, delete_source=True)
+
+        with caplog.at_level(logging.INFO):
+            assert d.run() is True
+
+        summary = [r.message for r in caplog.records if "上傳任務結束" in r.message][0]
+        assert "已刪除來源 1" in summary
+        # monitor/log_monitor.py 與 run_selected_transfers.py 都靠這行抓成功/略過/失敗數，
+        # 刪除統計接在「失敗 N」之後才不會破壞它們（兩邊都是 re.search）。這裡直接拿兩支
+        # 真正的 pattern 來驗，而不是抄一份到測試裡。
+        from monitor.log_monitor import _RE_SUMMARY
+        from run_selected_transfers import TRANSFER_SUMMARY_RE
+
+        assert _RE_SUMMARY.search(summary).groups() == ("上傳", "1", "0", "0")
+        assert TRANSFER_SUMMARY_RE.search(summary).groups() == ("1", "0", "0")
+
+
+class TestDeleteSourceFilters:
+    """delete_source 的兩道可選過濾：隔離期（預設 10 分鐘）與檔名樣式。"""
+
+    _aged = staticmethod(TestDeleteSource._aged)
+
+    def _prepare(self, uploader_factory, fake_sftp_factory, files=None, **overrides):
+        d = uploader_factory(wait_for_network=False, delete_source=True, **overrides)
+        fake = fake_sftp_factory(files=files or {})
+        d._connect_with_retry = MagicMock(side_effect=lambda: setattr(d, "sftp", fake))
+        d._close = MagicMock()
+        return d, fake
+
+    def test_min_age_defaults_to_ten_minutes(self, uploader_factory, fake_sftp_factory, tmp_path):
+        """沒設定時就有隔離期 —— 來源可能還在被寫入，這是預設而不是選配。"""
+        d, _ = self._prepare(uploader_factory, fake_sftp_factory)
+        assert d.delete_source_min_age == 600.0
+
+    def test_freshly_written_source_is_kept(self, uploader_factory, fake_sftp_factory, tmp_path, caplog):
+        _write(tmp_path / "today.log", b"still being written")
+        d, fake = self._prepare(uploader_factory, fake_sftp_factory)
+
+        with caplog.at_level(logging.INFO):
+            assert d.run() is True
+
+        assert fake.files["/remote/today.log"] == b"still being written"  # 照樣上傳
+        assert (tmp_path / "today.log").exists()                          # 但不刪
+        assert any('reason="within_min_age"' in r.message for r in caplog.records)
+
+    def test_source_older_than_the_window_is_deleted(self, uploader_factory, fake_sftp_factory, tmp_path):
+        self._aged(_write_r(tmp_path / "old.log", b"closed"), minutes=11)
+        d, fake = self._prepare(uploader_factory, fake_sftp_factory)
+
+        assert d.run() is True
+
+        assert not (tmp_path / "old.log").exists()
+
+    def test_min_age_zero_deletes_immediately(self, uploader_factory, fake_sftp_factory, tmp_path):
+        """明確設 0＝宣告「來源已經沒有人在寫」，例如上傳前自己封裝好的 tar。"""
+        _write(tmp_path / "fresh.log", b"x")
+        d, fake = self._prepare(uploader_factory, fake_sftp_factory, delete_source_min_age_minutes=0)
+
+        assert d.run() is True
+
+        assert not (tmp_path / "fresh.log").exists()
+
+    def test_invalid_min_age_falls_back_to_the_safe_default(self, uploader_factory, fake_sftp_factory):
+        # 護欄壞掉要往安全的方向倒，不是往「不設防」倒。
+        d, _ = self._prepare(uploader_factory, fake_sftp_factory, delete_source_min_age_minutes="十分鐘")
+        assert d.delete_source_min_age == 600.0
+        d2, _ = self._prepare(uploader_factory, fake_sftp_factory, delete_source_min_age_minutes=None)
+        assert d2.delete_source_min_age == 600.0
+        d3, _ = self._prepare(uploader_factory, fake_sftp_factory, delete_source_min_age_minutes=-5)
+        assert d3.delete_source_min_age == 0.0  # 負數就是 0，不是錯誤
+
+    def test_pattern_limits_which_sources_get_deleted(self, uploader_factory, fake_sftp_factory, tmp_path, caplog):
+        self._aged(_write_r(tmp_path / "U_edge_20260915.csv", b"log"), minutes=30)
+        self._aged(_write_r(tmp_path / "settings_backup.json", b"{}"), minutes=30)
+        d, fake = self._prepare(
+            uploader_factory, fake_sftp_factory, delete_source_pattern=["D_*.csv", "U_*.csv"]
+        )
+
+        with caplog.at_level(logging.INFO):
+            assert d.run() is True
+
+        # 兩個都上傳，但只有符合樣式的那個被清掉。
+        assert set(fake.files) == {"/remote/U_edge_20260915.csv", "/remote/settings_backup.json"}
+        assert not (tmp_path / "U_edge_20260915.csv").exists()
+        assert (tmp_path / "settings_backup.json").exists()
+        assert any('reason="pattern_not_matched"' in r.message for r in caplog.records)
+
+    def test_pattern_accepts_a_bare_string(self, uploader_factory, fake_sftp_factory, tmp_path):
+        self._aged(_write_r(tmp_path / "a.log", b"x"), minutes=30)
+        self._aged(_write_r(tmp_path / "a.txt", b"y"), minutes=30)
+        d, fake = self._prepare(uploader_factory, fake_sftp_factory, delete_source_pattern="*.log")
+
+        assert d.run() is True
+
+        assert not (tmp_path / "a.log").exists()
+        assert (tmp_path / "a.txt").exists()
+
+    def test_pattern_matches_the_file_name_not_the_path(self, uploader_factory, fake_sftp_factory, tmp_path):
+        """語意與 cleanup_old_files.py 一致：fnmatch 只比對 basename。
+
+        否則 `*log*` 這種寫法會命中路徑中段的目錄名，把 logs/ 底下的東西通通收走。
+        """
+        self._aged(_write_r(tmp_path / "logs" / "keep.txt", b"x"), minutes=30)
+        d, fake = self._prepare(uploader_factory, fake_sftp_factory, delete_source_pattern="*log*")
+
+        assert d.run() is True
+
+        assert (tmp_path / "logs" / "keep.txt").exists()
+
+    def test_pattern_is_case_sensitive_like_the_sweeper(self, uploader_factory, fake_sftp_factory, tmp_path):
+        self._aged(_write_r(tmp_path / "A.CSV", b"x"), minutes=30)
+        d, fake = self._prepare(uploader_factory, fake_sftp_factory, delete_source_pattern="*.csv")
+
+        assert d.run() is True
+
+        assert (tmp_path / "A.CSV").exists()  # Linux 上 *.csv 不命中 A.CSV
+
+    def test_kept_sources_are_counted_in_the_summary(self, uploader_factory, fake_sftp_factory, tmp_path, caplog):
+        self._aged(_write_r(tmp_path / "old.log", b"x"), minutes=30)
+        _write(tmp_path / "fresh.log", b"y")
+        d, fake = self._prepare(uploader_factory, fake_sftp_factory)
+
+        with caplog.at_level(logging.INFO):
+            assert d.run() is True
+
+        summary = [r.message for r in caplog.records if "上傳任務結束" in r.message][0]
+        assert "已刪除來源 1，保留 1" in summary
+        from run_selected_transfers import TRANSFER_SUMMARY_RE
+        assert TRANSFER_SUMMARY_RE.search(summary).groups() == ("2", "0", "0")
+
+    def test_kept_source_keeps_its_manifest_entry(self, uploader_factory, fake_sftp_factory, tmp_path):
+        """下一趟該檔夠舊時，要能走「略過傳輸 → 刪除」把它收掉，紀錄不能先被丟掉。"""
+        _write(tmp_path / "fresh.log", b"y")
+        d, fake = self._prepare(uploader_factory, fake_sftp_factory)
+
+        assert d.run() is True
+
+        assert "fresh.log" in d._load_manifest(tmp_path)

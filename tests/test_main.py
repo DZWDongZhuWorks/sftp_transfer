@@ -21,7 +21,8 @@ def make_args(**overrides):
         version_info=None, password=None, key_file=None, remote_path=None, local_path=None,
         ignore_file=None, no_auto_reconnect=False, no_resume=False, no_wait_network=False, no_recursive=False,
         retry_count=None, retry_delay=None, upload_log=False, log_remote_dir=None, log_dir=None,
-        duplicate_mode=None, duplicate_suffix=None,
+        duplicate_mode=None, duplicate_suffix=None, delete_source=False,
+        delete_source_min_age_minutes=None, delete_source_pattern=None,
     )
     defaults.update(overrides)
     return main_module.argparse.Namespace(**defaults)
@@ -94,6 +95,35 @@ class TestRunCliSettingsOnly:
         assert captured["kwargs"]["host"] == "10.0.0.5"
         assert captured["kwargs"]["retry_count"] == 9
         assert captured["kwargs"]["duplicate_mode"] == "duplicate"
+
+    def test_delete_source_knobs_resolved_from_settings(self, tmp_path, monkeypatch):
+        captured = self._fake_downloader_and_logger(monkeypatch)
+        settings_path = self._write_settings(
+            tmp_path, delete_source=True, delete_source_min_age_minutes=30,
+            delete_source_pattern=["D_*.csv", "U_*.csv"],
+        )
+        assert main_module.run_cli(make_args(config=str(settings_path))) == 0
+        assert captured["kwargs"]["delete_source"] is True
+        assert captured["kwargs"]["delete_source_min_age_minutes"] == 30
+        assert captured["kwargs"]["delete_source_pattern"] == ["D_*.csv", "U_*.csv"]
+
+    def test_delete_source_min_age_defaults_to_ten_minutes_when_unset(self, tmp_path, monkeypatch):
+        """設定檔沒寫隔離期時要拿到內建預設，不是 None/0 —— 這是安全護欄。"""
+        captured = self._fake_downloader_and_logger(monkeypatch)
+        settings_path = self._write_settings(tmp_path, delete_source=True)
+        assert main_module.run_cli(make_args(config=str(settings_path))) == 0
+        assert captured["kwargs"]["delete_source_min_age_minutes"] == 10
+
+    def test_cli_can_override_delete_source_knobs(self, tmp_path, monkeypatch):
+        captured = self._fake_downloader_and_logger(monkeypatch)
+        settings_path = self._write_settings(tmp_path, delete_source_min_age_minutes=30)
+        args = make_args(
+            config=str(settings_path), delete_source=True,
+            delete_source_min_age_minutes=0, delete_source_pattern=["*.log"],
+        )
+        assert main_module.run_cli(args) == 0
+        assert captured["kwargs"]["delete_source_min_age_minutes"] == 0
+        assert captured["kwargs"]["delete_source_pattern"] == ["*.log"]
 
     def test_cli_argument_overrides_settings_file(self, tmp_path, monkeypatch):
         captured = self._fake_downloader_and_logger(monkeypatch)

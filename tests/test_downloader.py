@@ -4,6 +4,7 @@ import hashlib
 import logging
 import os
 import stat
+import time
 from pathlib import Path
 from unittest.mock import MagicMock, patch
 
@@ -2097,3 +2098,250 @@ class TestCSVFileHandlerErrorHandling:
         handler._file.close()  # 先手動關閉，讓 handler.close() 內部再次呼叫 close() 時真的出錯
         handler._file.close = MagicMock(side_effect=Exception("already closed"))
         handler.close()  # 不應向外拋出例外
+
+
+class TestDeleteSource:
+    """delete_source：下載完成後刪掉遠端來源檔（日誌回收任務用，預設關閉）。"""
+
+    def _prepare(self, downloader_factory, fake_sftp_factory, files=None, mtimes=None, **overrides):
+        d = downloader_factory(wait_for_network=False, **overrides)
+        fake = fake_sftp_factory(files=files or {}, mtimes=mtimes or {})
+        d._connect_with_retry = MagicMock(side_effect=lambda: setattr(d, "sftp", fake))
+        d._close = MagicMock()
+        return d, fake
+
+    def test_default_off_keeps_every_remote_file(self, downloader_factory, fake_sftp_factory, tmp_path):
+        d, fake = self._prepare(
+            downloader_factory, fake_sftp_factory,
+            files={"/remote/a.txt": b"A"}, mtimes={"/remote/a.txt": 1},
+        )
+
+        assert d.run() is True
+
+        assert fake.files["/remote/a.txt"] == b"A"
+        assert fake.remove_calls == []
+
+    def test_downloaded_files_are_deleted_from_the_remote(self, downloader_factory, fake_sftp_factory, tmp_path):
+        d, fake = self._prepare(
+            downloader_factory, fake_sftp_factory,
+            files={"/remote/a.log": b"A", "/remote/sub/b.log": b"B"},
+            mtimes={"/remote/a.log": 1, "/remote/sub/b.log": 2},
+            delete_source=True,
+        )
+
+        assert d.run() is True
+
+        # 本地確實拿到完整內容，遠端才會被清掉。
+        assert (tmp_path / "a.log").read_bytes() == b"A"
+        assert (tmp_path / "sub" / "b.log").read_bytes() == b"B"
+        assert sorted(fake.remove_calls) == ["/remote/a.log", "/remote/sub/b.log"]
+        assert fake.files == {}
+
+    def test_skipped_file_is_deleted_too(self, downloader_factory, fake_sftp_factory, tmp_path):
+        """本地已有完整同一份 → 判定略過，但遠端來源一樣該清掉。
+
+        否則上一趟「下載成功、刪除失敗」的檔案會永遠卡在遠端：之後每一趟都只會判定略過。
+        """
+        files = {"/remote/a.log": b"A"}
+        mtimes = {"/remote/a.log": 1}
+        d, _ = self._prepare(downloader_factory, fake_sftp_factory, files=files, mtimes=mtimes)
+        assert d.run() is True  # 第一次：正常下載，不刪
+
+        d2, fake2 = self._prepare(
+            downloader_factory, fake_sftp_factory, files=files, mtimes=mtimes,
+            local_path=d.local_path, delete_source=True,
+        )
+        assert d2.run() is True  # 第二次：內容未變判定略過，但這次要把遠端清掉
+
+        assert fake2.remove_calls == ["/remote/a.log"]
+
+    def test_ignored_files_are_never_deleted(self, downloader_factory, fake_sftp_factory, tmp_path):
+        """沒下載就不能刪 —— 忽略規則擋掉的檔案根本不在清單裡。"""
+        ignore = tmp_path.parent / "dl_ignore.txt"
+        ignore.write_text("*.tmp\n", encoding="utf-8")
+        d, fake = self._prepare(
+            downloader_factory, fake_sftp_factory,
+            files={"/remote/a.log": b"A", "/remote/scratch.tmp": b"T"},
+            mtimes={"/remote/a.log": 1, "/remote/scratch.tmp": 2},
+            delete_source=True, ignore_file=str(ignore),
+        )
+
+        assert d.run() is True
+
+        assert fake.remove_calls == ["/remote/a.log"]
+        assert fake.files == {"/remote/scratch.tmp": b"T"}
+
+    def test_delete_failure_warns_but_does_not_fail_the_task(
+        self, downloader_factory, fake_sftp_factory, tmp_path, caplog
+    ):
+        d, fake = self._prepare(
+            downloader_factory, fake_sftp_factory,
+            files={"/remote/a.log": b"A"}, mtimes={"/remote/a.log": 1}, delete_source=True,
+        )
+        d._connect_with_retry = MagicMock(side_effect=lambda: setattr(d, "sftp", fake))
+        fake.remove = MagicMock(side_effect=PermissionError(13, "Permission denied"))
+
+        with caplog.at_level(logging.WARNING):
+            ok = d.run()
+
+        # 內容已經拿到手，清不掉來源不該讓整個任務被判失敗、下一趟又全部重下。
+        assert ok is True
+        assert (tmp_path / "a.log").read_bytes() == b"A"
+        assert any("SOURCE_DELETE_FAILED" in r.message for r in caplog.records)
+
+    def test_missing_remote_file_counts_as_deleted(self, downloader_factory, fake_sftp_factory, tmp_path):
+        d, fake = self._prepare(
+            downloader_factory, fake_sftp_factory,
+            files={"/remote/a.log": b"A"}, mtimes={"/remote/a.log": 1}, delete_source=True,
+        )
+        fake.remove = MagicMock(side_effect=FileNotFoundError(2, "gone"))
+
+        assert d.run() is True  # 已經不在了＝目的已達成，不是錯誤
+
+    def test_failed_download_leaves_the_remote_source_alone(
+        self, downloader_factory, fake_sftp_factory, tmp_path
+    ):
+        """傳輸失敗的檔案絕不能被刪 —— 那是唯一一份。"""
+        d, fake = self._prepare(
+            downloader_factory, fake_sftp_factory,
+            files={"/remote/a.log": b"A"}, mtimes={"/remote/a.log": 1},
+            delete_source=True, auto_reconnect=False,
+        )
+        d._download_one_file = MagicMock(side_effect=OSError("link down"))
+
+        assert d.run() is False
+        assert fake.remove_calls == []
+        assert fake.files == {"/remote/a.log": b"A"}
+
+    def test_summary_reports_deletion_counts_and_stays_machine_readable(
+        self, downloader_factory, fake_sftp_factory, tmp_path, caplog
+    ):
+        d, fake = self._prepare(
+            downloader_factory, fake_sftp_factory,
+            files={"/remote/a.log": b"A"}, mtimes={"/remote/a.log": 1}, delete_source=True,
+        )
+
+        with caplog.at_level(logging.INFO):
+            assert d.run() is True
+
+        summary = [r.message for r in caplog.records if "下載任務結束" in r.message][0]
+        assert "已刪除來源 1" in summary
+        # monitor/log_monitor.py 與 run_selected_transfers.py 都靠這行抓成功/略過/失敗數，
+        # 刪除統計接在「失敗 N」之後才不會破壞它們（兩邊都是 re.search）。這裡直接拿兩支
+        # 真正的 pattern 來驗，而不是抄一份到測試裡。
+        from monitor.log_monitor import _RE_SUMMARY
+        from run_selected_transfers import TRANSFER_SUMMARY_RE
+
+        assert _RE_SUMMARY.search(summary).groups() == ("下載", "1", "0", "0")
+        assert TRANSFER_SUMMARY_RE.search(summary).groups() == ("1", "0", "0")
+
+
+class TestDeleteSourceFilters:
+    """下載方向的 delete_source 過濾：遠端 mtime 隔離期與檔名樣式。"""
+
+    def _prepare(self, downloader_factory, fake_sftp_factory, files=None, mtimes=None, **overrides):
+        d = downloader_factory(wait_for_network=False, delete_source=True, **overrides)
+        fake = fake_sftp_factory(files=files or {}, mtimes=mtimes or {})
+        d._connect_with_retry = MagicMock(side_effect=lambda: setattr(d, "sftp", fake))
+        d._close = MagicMock()
+        return d, fake
+
+    def test_freshly_written_remote_source_is_kept(self, downloader_factory, fake_sftp_factory, tmp_path, caplog):
+        """岸端 log 是各船用 sftp.put 直寫最終檔名推上去的（沒有遠端 .part）。
+
+        傳到一半的檔看起來就是個正常小檔，下載端無從分辨 —— 隔離期是唯一擋得住
+        「拉到半截又把遠端刪掉」的東西。
+        """
+        now = time.time()
+        d, fake = self._prepare(
+            downloader_factory, fake_sftp_factory,
+            files={"/remote/U_ship_now.csv": b"half written"},
+            mtimes={"/remote/U_ship_now.csv": now},
+        )
+
+        with caplog.at_level(logging.INFO):
+            assert d.run() is True
+
+        assert (tmp_path / "U_ship_now.csv").exists()          # 照樣下載
+        assert fake.files["/remote/U_ship_now.csv"] == b"half written"  # 但遠端不刪
+        assert fake.remove_calls == []
+        assert any('reason="within_min_age"' in r.message for r in caplog.records)
+
+    def test_remote_source_older_than_the_window_is_deleted(self, downloader_factory, fake_sftp_factory, tmp_path):
+        old = time.time() - 30 * 60
+        d, fake = self._prepare(
+            downloader_factory, fake_sftp_factory,
+            files={"/remote/U_ship_old.csv": b"done"}, mtimes={"/remote/U_ship_old.csv": old},
+        )
+
+        assert d.run() is True
+
+        assert fake.remove_calls == ["/remote/U_ship_old.csv"]
+
+    def test_pattern_limits_which_remote_sources_get_deleted(
+        self, downloader_factory, fake_sftp_factory, tmp_path, caplog
+    ):
+        old = time.time() - 30 * 60
+        d, fake = self._prepare(
+            downloader_factory, fake_sftp_factory,
+            files={"/remote/U_ship.csv": b"log", "/remote/fleet_notes.md": b"doc"},
+            mtimes={"/remote/U_ship.csv": old, "/remote/fleet_notes.md": old},
+            delete_source_pattern=["D_*.csv", "U_*.csv"],
+        )
+
+        with caplog.at_level(logging.INFO):
+            assert d.run() is True
+
+        assert fake.remove_calls == ["/remote/U_ship.csv"]
+        assert set(fake.files) == {"/remote/fleet_notes.md"}
+        assert any('reason="pattern_not_matched"' in r.message for r in caplog.records)
+
+    def test_unknown_remote_mtime_keeps_the_source(self, downloader_factory, fake_sftp_factory, tmp_path, caplog):
+        """判斷不了年紀時不刪 —— SFTP 協定允許伺服器省略 mtime。"""
+        d, fake = self._prepare(
+            downloader_factory, fake_sftp_factory,
+            files={"/remote/a.log": b"A"}, mtimes={"/remote/a.log": time.time() - 3600},
+        )
+        # 只讓「刪除前問年紀」這一步問不到；下載本身照常走，否則 _download_one_file 也會
+        # 撞上同一個例外而進入無限重連（retry_count 預設就是無限次）。
+        d._download_one_file = MagicMock(return_value="downloaded")
+        d._resolve_remote_attr = MagicMock(side_effect=OSError("stat failed"))
+
+        with caplog.at_level(logging.INFO):
+            assert d.run() is True
+
+        assert fake.remove_calls == []
+        assert any('reason="mtime_unknown"' in r.message for r in caplog.records)
+
+    def test_pattern_check_costs_no_extra_stat(self, downloader_factory, fake_sftp_factory, tmp_path):
+        """樣式不符就直接留下，不該為了算年紀再打一次 stat。
+
+        船上的高延遲鏈路，每檔一次來回就是最主要的成本（見 _resolve_remote_attr）。
+        """
+        d, fake = self._prepare(
+            downloader_factory, fake_sftp_factory,
+            files={"/remote/notes.md": b"doc"}, mtimes={"/remote/notes.md": time.time() - 3600},
+            delete_source_pattern="*.csv",
+        )
+        d._download_one_file = MagicMock(return_value="downloaded")
+        d._resolve_remote_attr = MagicMock()
+
+        assert d.run() is True
+
+        d._resolve_remote_attr.assert_not_called()
+
+    def test_kept_sources_are_counted_in_the_summary(self, downloader_factory, fake_sftp_factory, tmp_path, caplog):
+        now = time.time()
+        d, fake = self._prepare(
+            downloader_factory, fake_sftp_factory,
+            files={"/remote/old.log": b"O", "/remote/new.log": b"N"},
+            mtimes={"/remote/old.log": now - 3600, "/remote/new.log": now},
+        )
+
+        with caplog.at_level(logging.INFO):
+            assert d.run() is True
+
+        summary = [r.message for r in caplog.records if "下載任務結束" in r.message][0]
+        assert "已刪除來源 1，保留 1" in summary
+        from run_selected_transfers import TRANSFER_SUMMARY_RE
+        assert TRANSFER_SUMMARY_RE.search(summary).groups() == ("2", "0", "0")

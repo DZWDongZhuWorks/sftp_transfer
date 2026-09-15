@@ -190,8 +190,11 @@ class TuiState:
 def _badge(s, show_clock: bool = True) -> str:
     """群組節點的統計徽章。
 
-    時鐘偏差只掛在 vessel / IPC 兩層（show_clock）：那是「一台機器一個鐘」的自然歸屬，
-    而 mode 層是整支船隊的混合，取中位數沒有意義、只會變成一個永遠都在的雜訊。
+    時鐘偏差只掛在 vessel / IPC 兩層（show_clock）：那是「一台機器一個鐘」的自然歸屬。
+    mode 層是整支船隊，取最歪的那一台等於永遠都在報同一艘船，變成常駐雜訊。
+
+    船群那一列報的是「這艘船最歪的一台 IPC」而不是全船的典型值：這顆徽章的用途是在
+    收合狀態下把問題頂出來，只有一台 IPC 壞掉的船正是它要抓的（見 GroupSummary）。
     """
     parts = [f"裝置 {s.total}", f"正常 {s.ok}"]
     if s.stale:
@@ -339,19 +342,46 @@ def sort_devices(devices: list, key: str, desc: bool) -> list:
     return sorted(devices, key=lambda d: sort_value(d, key), reverse=desc)
 
 
+def group_clock_magnitude(group) -> float:
+    """群組（船／IPC）的時鐘排序值：群內最歪那台機器的偏差絕對值。
+
+    summary.clock_offset 本身就是「群內最歪的那台」（見 log_monitor.GroupSummary），
+    這裡只是取絕對值 —— 理由同 sort_value：快 8 小時與慢 8 小時一樣糟。徽章、預設展開
+    與這個排序因此看的是同一個數字，排到最前面的船，那一列的 ⏱ 就是它被排上來的原因。
+
+    取不到偏差的群組當 0（＝正常），沿用「無從判斷就不製造警報」的一貫做法
+    （見 log_monitor.clock_level）。
+    """
+    return abs(getattr(group.summary, "clock_offset", None) or 0)
+
+
 def sort_vessels(vessels: list, key: str, desc: bool) -> list:
-    """分群模式的船群次序：只有「船隻名稱」欄位會重排，其餘維持資料層順序。
+    """分群模式的船群次序：只有「船隻名稱」與「時鐘偏差」會重排，其餘維持資料層順序。
 
     船名對整個 IPC 群組是常數（樹就是依 船→IPC 分的），套在群組內的裝置列上必然是
-    no-op，所以這個欄位得作用在「船」這一層才有意義。其餘欄位是裝置屬性，群組層沒有
-    單一值可比，維持 build_tree 的 (未分類置底, -嚴重度, 名稱) 次序。
+    no-op，所以這個欄位得作用在「船」這一層才有意義。時鐘同理：鐘是**機器**的屬性，
+    同一台 IPC 的各專案共用同一個鐘，只排 IPC 底下的裝置列等於在排一串相同的數字，
+    真正要比的是船與船之間、IPC 與 IPC 之間。其餘欄位是裝置屬性，群組層沒有單一值
+    可比，維持 build_tree 的 (未分類置底, -嚴重度, 名稱) 次序。
 
     排序值與 sort_value("船隻名稱") 同為 name.casefold()，兩種檢視的船名次序才一致
     （含 （未分類） 這個 sentinel：升冪在最後、降冪在最前）。
     """
+    if key == "時鐘偏差":
+        return sorted(vessels, key=group_clock_magnitude, reverse=desc)
     if key != "船隻名稱":
         return vessels
     return sorted(vessels, key=lambda g: g.name.casefold(), reverse=desc)
+
+
+def sort_ipcs(ipcs: list, key: str, desc: bool) -> list:
+    """同一艘船底下的 IPC 群次序：只有「時鐘偏差」會重排（見 sort_vessels）。
+
+    其餘欄位（含船名）在這一層都是常數或裝置屬性，維持 build_tree 的次序。
+    """
+    if key != "時鐘偏差":
+        return ipcs
+    return sorted(ipcs, key=group_clock_magnitude, reverse=desc)
 
 
 def sort_label(key: str, desc: bool) -> str:
@@ -412,7 +442,7 @@ def flatten_tree(tree, state: TuiState, now: Optional[datetime]) -> List[Row]:
             )
             if vkey not in state.expanded:
                 continue
-            for ip in v.ipcs:
+            for ip in sort_ipcs(v.ipcs, state.sort_key, state.sort_desc):
                 dvs = [d for d in ip.devices if _device_matches(d, state)]
                 if not dvs:
                     continue
@@ -982,14 +1012,14 @@ def clamp_hscroll(max_width: int, view_w: int, hoff: int) -> int:
 # ---------------------------------------------------------------------------
 # 資料載入
 # ---------------------------------------------------------------------------
-def load_tree(args, now: datetime, sync_handler=None):
+def load_tree(args, now: datetime, sync_handler=None, progress=None):
     if getattr(args, "sync_config", None):
         if sync_handler is None:
             # 非 curses 呼叫仍不可讓 main.py 的輸出直接污染目前終端機。
             sync_logs(args.sync_config, quiet=True)
         else:
             sync_handler(args.sync_config)
-    records = collect_logs(args.log_dir, mode=args.mode)
+    records = collect_logs(args.log_dir, mode=args.mode, progress=progress)
     devices = aggregate_by_device(records, now=now, stale_hours=args.stale_hours)
     devices = _apply_filters(devices, args.vessel, args.ipc, args.component, args.status)
     return build_tree(devices)
@@ -1143,6 +1173,73 @@ def _sync_with_progress(stdscr, sync_config) -> bool:
         quiet=True,
         output_callback=show,
     )
+
+
+# 全船隊 31,876 份 log 平行解析要十幾秒，在那之前畫面上什麼都沒有 —— 看起來就像當掉。
+# 這一段的存在只為了「讓人看得出它在動」：總數、已解析、百分比與粗估剩餘時間。
+_LOADING_REDRAW_SEC = 0.2   # 每秒最多重畫 5 次：再密只是把時間花在畫面上
+_LOADING_BAR_W = 30
+
+
+def loading_line(done: int, total: int, elapsed: float) -> str:
+    """載入畫面那一行字（純函式）。
+
+    剩餘時間要等有樣本才估得準，所以前 1 秒不寫（一開場的估值會從天文數字往下跳，
+    比不寫還讓人不安）。解析完成後還要彙整、建樹，那段沒有進度可報，就直說在彙整。
+    """
+    if total <= 0:
+        return "沒有找到任何 log 檔"
+    if done >= total:
+        return f"已解析 {total:,} 份 log，正在彙整…"
+    pct = int(done * 100 / total)
+    text = f"解析 {done:,}/{total:,} 份 log（{pct}%）｜已 {int(elapsed)} 秒"
+    if done and elapsed >= 1:
+        text += f"｜剩約 {int(elapsed / done * (total - done))} 秒"
+    return text
+
+
+def loading_bar(done: int, total: int, width: int = _LOADING_BAR_W) -> str:
+    """純 ASCII 進度條：終端機字型不一定有方塊字，# 到哪裡都畫得出來。"""
+    if width <= 2:
+        return ""
+    inner = width - 2
+    filled = inner if total <= 0 else min(inner, int(done * inner / max(total, 1)))
+    return "[" + "#" * filled + "-" * (inner - filled) + "]"
+
+
+def _draw_loading(stdscr, log_dir, done: int, total: int, elapsed: float) -> None:
+    """載入專用畫面，形狀比照 _draw_sync：標題一行、內容一行、底部一行提示。"""
+    stdscr.erase()
+    maxy, maxx = stdscr.getmaxyx()
+    width = max(0, maxx - 1)
+    title = f" 正在讀取 {log_dir}…" if log_dir else " 正在讀取 log…"
+    _addstr(stdscr, 0, 0, fit_display(title, width)[0], curses.A_BOLD)
+    if maxy > 2:
+        _addstr(stdscr, 2, 0, fit_display(" " + loading_bar(done, total), width)[0])
+        _addstr(stdscr, 3, 0, fit_display(" " + loading_line(done, total, elapsed), width)[0])
+    if maxy > 1:
+        _addstr(stdscr, maxy - 1, 0,
+                pad_display(" 讀完自動進入監視畫面", width), curses.A_REVERSE)
+    stdscr.refresh()
+
+
+def _loading_progress(stdscr, log_dir):
+    """給 collect_logs 的進度回呼：限流後畫在 curses 上。
+
+    回呼是每解析完一份就叫一次（全船隊 3 萬多次），所以這裡要自己限流；但第一次
+    （done=0，總數剛數完）與最後一次一定畫，不然畫面會停在舊數字上。
+    """
+    started = time.monotonic()
+    last = [0.0]
+
+    def tick(done, total):
+        now = time.monotonic()
+        if done and done < total and (now - last[0]) < _LOADING_REDRAW_SEC:
+            return
+        last[0] = now
+        _draw_loading(stdscr, log_dir, done, total, now - started)
+
+    return tick
 
 
 def _attr(status):
@@ -1534,6 +1631,7 @@ def _main_loop(stdscr, args):
             args,
             now,
             sync_handler=lambda config: _sync_with_progress(stdscr, config),
+            progress=_loading_progress(stdscr, getattr(args, "log_dir", "")),
         )
         seed_expanded(tree, state)
         state.now = now

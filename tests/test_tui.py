@@ -13,6 +13,7 @@ from unittest import mock
 from monitor.log_monitor import (
     aggregate_by_device,
     build_tree,
+    clock_level,
     collect_logs,
     device_detail_lines,
 )
@@ -76,6 +77,55 @@ def test_load_tree_quiets_sync_output(tmp_path):
     with mock.patch.object(tui, "sync_logs", return_value=True) as sync:
         assert tui.load_tree(args, NOW) == []
     sync.assert_called_once_with("sync.json", quiet=True)
+
+
+def test_load_tree_passes_progress_down_to_collect_logs(tmp_path):
+    """進度回呼要真的接到資料層，否則載入畫面永遠停在 0。"""
+    args = SimpleNamespace(
+        sync_config=None, log_dir=tmp_path, mode="all", stale_hours=24,
+        vessel=None, ipc=None, component=None, status="all",
+    )
+    seen = []
+    tui.load_tree(args, NOW, progress=lambda done, total: seen.append((done, total)))
+    assert seen == [(0, 0)]      # 空目錄也要先報一次總數
+
+
+# --- 載入畫面（全船隊要十幾秒，不能是一片黑）------------------------------
+def test_loading_line_shape():
+    assert tui.loading_line(0, 0, 0) == "沒有找到任何 log 檔"
+    # 前 1 秒不估剩餘時間：一開場的估值會從天文數字往下跳，比不寫還讓人不安
+    assert tui.loading_line(100, 31876, 0.4) == "解析 100/31,876 份 log（0%）｜已 0 秒"
+    assert tui.loading_line(12800, 31876, 5.0) == (
+        "解析 12,800/31,876 份 log（40%）｜已 5 秒｜剩約 7 秒"
+    )
+    # 解析完還要彙整、建樹，那段沒有進度可報
+    assert tui.loading_line(31876, 31876, 12.0) == "已解析 31,876 份 log，正在彙整…"
+
+
+def test_loading_bar_is_pure_ascii_and_clamped():
+    assert tui.loading_bar(0, 100, 12) == "[" + "-" * 10 + "]"
+    assert tui.loading_bar(50, 100, 12) == "[" + "#" * 5 + "-" * 5 + "]"
+    assert tui.loading_bar(100, 100, 12) == "[" + "#" * 10 + "]"
+    assert tui.loading_bar(999, 100, 12) == "[" + "#" * 10 + "]"   # 不會溢出
+    assert tui.loading_bar(1, 100, 2) == ""                        # 窄到畫不下就不畫
+    assert tui.disp_width(tui.loading_bar(3, 10)) == tui._LOADING_BAR_W
+
+
+def test_loading_progress_throttles_but_always_draws_first_and_last():
+    """回呼是每份 log 叫一次（全船隊 3 萬多次），不限流會把時間花在畫面上。"""
+    drawn = []
+    clock = [100.0]
+    with mock.patch.object(tui, "_draw_loading",
+                           side_effect=lambda _s, _d, done, total, _e: drawn.append(done)), \
+         mock.patch.object(tui.time, "monotonic", side_effect=lambda: clock[0]):
+        tick = tui._loading_progress(object(), "fleet_logs")
+        tick(0, 1000)                    # 總數剛數完：一定要畫
+        for done in range(1, 500):       # 同一瞬間的 499 次回呼只該畫第一次之後的 0 次
+            tick(done, 1000)
+        clock[0] += tui._LOADING_REDRAW_SEC + 0.01
+        tick(500, 1000)                  # 過了限流間隔才再畫一次
+        tick(1000, 1000)                 # 最後一次無論如何都要畫
+    assert drawn == [0, 500, 1000]
 
 
 def _html_args(tmp_path, html):
@@ -1511,6 +1561,87 @@ def test_sort_by_clock_offset_puts_the_worst_last_ascending(tmp_path):
     assert order == ["aaa", "ccc", "bbb"]
     # 絕對值比較：快 8 小時與慢 8 小時一樣糟
     assert tui.sort_value(devices[0], "時鐘偏差") >= 0
+
+
+def _clock_fleet(tmp_path):
+    """一支「中位數會騙人」的船隊。
+
+    WH322 三台 IPC 只有 IPC-3 歪了 8 小時，另兩台各差幾秒 —— 該船的中位數因此接近 0。
+    WH311 整船慢 30 分，CLINK 全正常。資料層的船序是名稱升冪（全部 success）。
+    """
+    return _clock_tree(tmp_path, [
+        ("CLINK_IPC-1_ecdis", "download", "2026-07-27 11:00:00", "2026-07-27 11:00:05"),
+        ("WH311_IPC-1_ecdis", "download", "2026-07-27 11:00:00", "2026-07-27 11:30:00"),
+        ("WH322_IPC-1_ecdis", "download", "2026-07-27 11:00:00", "2026-07-27 11:00:03"),
+        ("WH322_IPC-2_ecdis", "download", "2026-07-27 11:00:00", "2026-07-27 11:00:02"),
+        ("WH322_IPC-3_ecdis", "download", "2026-07-27 11:00:00", "2026-07-27 03:00:00"),
+    ])
+
+
+def _ipc_names(tree, st, vessel):
+    rows = tui.flatten_tree(tree, st, NOW)
+    keys = [r.key for r in rows if r.kind == "ipc" and r.key[2] == vessel]
+    return [k[3] for k in keys]
+
+
+def test_grouped_clock_sort_reorders_vessels_and_ipcs(tmp_path):
+    """時鐘排序要排的是「船」與「IPC」兩層 —— 只排 IPC 底下的專案列等於沒排。
+
+    鐘是機器的屬性：同一台 IPC 的各專案共用同一個鐘，那一層的數字全都一樣。
+    """
+    tree, _ = _clock_fleet(tmp_path)
+    st = tui.TuiState(sort_key="時鐘偏差", sort_desc=True)
+    tui.expand_all(st, tree)
+    assert _vessel_names(tree, st) == ["WH322", "WH311", "CLINK"]   # 最歪的船在最前
+    assert _ipc_names(tree, st, "WH322") == ["IPC-3", "IPC-1", "IPC-2"]
+
+    st.sort_desc = False
+    assert _vessel_names(tree, st) == ["CLINK", "WH311", "WH322"]
+    assert _ipc_names(tree, st, "WH322") == ["IPC-2", "IPC-1", "IPC-3"]
+
+
+def test_grouped_clock_sort_ranks_by_worst_machine(tmp_path):
+    """排序、徽章、預設展開看的是同一個數字：群內最歪的那台。
+
+    WH322 三台 IPC 只有一台歪 8 小時。若船層取的是典型值（中位數），它會被另外兩台
+    正常的 IPC 稀釋到門檻以下 —— 那艘船既不會排到前面、收合時也看不出有問題。
+    """
+    tree, _ = _clock_fleet(tmp_path)
+    wh322 = next(v for v in tree[0].vessels if v.name == "WH322")
+    assert wh322.summary.clock_offset == 8 * 3600
+    assert tui.group_clock_magnitude(wh322) == 8 * 3600
+    assert clock_level(wh322.summary.clock_offset) == "bad"
+    assert "⏱+8時00分" in tui._badge(wh322.summary)      # 收合著也看得到是哪艘船
+
+    st = tui.TuiState(sort_key="時鐘偏差", sort_desc=True)
+    tui.expand_all(st, tree)
+    assert _vessel_names(tree, st)[0] == "WH322"
+
+
+def test_grouped_clock_sort_survives_groups_without_offset(tmp_path):
+    """整群都取不到偏差（summary 為 None）時排序值是 0（＝正常），不爆掉也不製造假警報。"""
+    tree, _ = _clock_fleet(tmp_path)
+    for m in tree:
+        for v in m.vessels:
+            v.summary.clock_offset = None
+            for ip in v.ipcs:
+                ip.summary.clock_offset = None
+    assert all(tui.group_clock_magnitude(v) == 0 for v in tree[0].vessels)
+    st = tui.TuiState(sort_key="時鐘偏差", sort_desc=True)
+    tui.expand_all(st, tree)
+    # 全等值 → 穩定排序保留資料層次序
+    assert _vessel_names(tree, st) == [v.name for v in tree[0].vessels]
+
+
+def test_grouped_other_sort_keys_keep_data_layer_ipc_order(tmp_path):
+    """時鐘以外的欄位在 IPC 群這一層沒有單一值可比，維持 build_tree 的次序。"""
+    tree, _ = _clock_fleet(tmp_path)
+    from_tree = [ip.name for v in tree[0].vessels if v.name == "WH322" for ip in v.ipcs]
+    for key in ("船隻名稱", "更新時間", "嚴重度", "裝置名稱", "版本"):
+        for desc in (False, True):
+            st = tui.TuiState(sort_key=key, sort_desc=desc)
+            tui.expand_all(st, tree)
+            assert _ipc_names(tree, st, "WH322") == from_tree
 
 
 def test_clock_row_survives_devices_without_offset(tmp_path):

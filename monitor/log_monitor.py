@@ -23,6 +23,7 @@ from typing import Dict, List, Optional, Tuple
 import argparse
 import csv
 import html
+import multiprocessing
 import os
 import re
 import subprocess
@@ -153,6 +154,22 @@ def _median(values: List[float]) -> Optional[float]:
     if len(ordered) % 2:
         return ordered[mid]
     return (ordered[mid - 1] + ordered[mid]) / 2
+
+
+def _worst_offset(values: List[float]) -> Optional[float]:
+    """群組層的時鐘彙總：絕對值最大的那一個（保留正負號）。空清單回 None。
+
+    比絕對值是因為快 8 小時與慢 8 小時一樣糟；回傳時保留正負號，畫面上才看得出是快是慢。
+    等值時取先出現的那個，次序由資料層（devices 的既有排序）決定，結果才穩定。
+
+    單一裝置的偏差本身已是最近數次執行的中位數（見 aggregate_by_device），一次性的上傳
+    排隊延遲在那一層就被磨掉了，所以這裡取最大值不會被單次雜訊帶跑。
+    """
+    worst: Optional[float] = None
+    for v in values:
+        if worst is None or abs(v) > abs(worst):
+            worst = v
+    return worst
 
 
 @dataclass
@@ -358,16 +375,71 @@ def _device_from_filename(filename: str) -> str:
     return stem or "unknown"
 
 
-def collect_logs(log_dir, mode: str = "all") -> List[RunRecord]:
+# 解析是這支工具唯一的重活：船隊實測 31,876 份 log（993 MB）單執行緒要 96 秒，而目錄
+# 走訪加 stat 只佔 0.7 秒 —— 幾乎全花在逐列剖析 CSV。那是純 CPU 的工作，GIL 讓 thread
+# 幫不上忙，只有 process pool 吃得到多核（本機 12 核實測 8 倍：6,000 份 18.9 秒 → 2.4 秒）。
+_PARALLEL_MIN_FILES = 200   # 更少的話，開 pool 的成本比省下來的還多
+_PARALLEL_MAX_WORKERS = 12  # 再多的邊際效益很小（12 核實測 8→2.75 秒、12→2.38 秒），記憶體卻線性增加
+_PARSE_CHUNK = 64           # 每個 worker 一次領這麼多份，攤掉 pickle 往返
+
+
+def _worker_count(total: int, workers: Optional[int] = None) -> int:
+    """要開幾個解析行程。workers 由呼叫端（測試）指定時一律照辦。"""
+    if workers is not None:
+        return max(1, int(workers))
+    if total < _PARALLEL_MIN_FILES:
+        return 1
+    return max(1, min(os.cpu_count() or 1, _PARALLEL_MAX_WORKERS))
+
+
+def _parse_all(paths: List[Path], workers: Optional[int] = None):
+    """依 paths 的順序產出每一份的解析結果（None ＝ 不是本工具的 log）。
+
+    用 fork 而不是 spawn：spawn 會在子行程重新 import 這個模組，而它同時是可執行腳本，
+    重新 import 等於再跑一次 argparse。fork 只有 Linux 有（船岸兩端都是 Ubuntu），
+    取不到就退回單執行緒 —— 結果一模一樣，只是慢。
+
+    pool 中途壞掉（worker 被 OOM killer 收掉之類）也一樣退回單執行緒把**剩下的**補完：
+    imap 保證順序，已經產出幾份就是已經走到哪裡，不會重複也不會漏。監視工具不該因為
+    平行化本身的意外而整個掛掉 —— 它的職責是把船隊狀態顯示出來。
+    """
+    done = 0
+    if _worker_count(len(paths), workers) > 1:
+        try:
+            ctx = multiprocessing.get_context("fork")
+        except ValueError:      # 平台沒有 fork
+            ctx = None
+        if ctx is not None:
+            try:
+                with ctx.Pool(_worker_count(len(paths), workers)) as pool:
+                    for rec in pool.imap(parse_log_file, paths, chunksize=_PARSE_CHUNK):
+                        done += 1
+                        yield rec
+            except Exception:   # noqa: BLE001 —— 平行化是最佳化，失敗就退回，不改結果
+                pass
+    for path in paths[done:]:
+        yield parse_log_file(path)
+
+
+def collect_logs(log_dir, mode: str = "all", progress=None,
+                 workers: Optional[int] = None) -> List[RunRecord]:
     """遞迴掃描 log_dir 下所有 *.csv，解析成 RunRecord 清單並依 mode 過濾。
 
     用 rglob 是為了涵蓋遠端 sftp_logs 下載後的巢狀結構
     （download/{vsl}/{ipc}/{component}/*.csv）；平面目錄（如既有 logs/）同樣適用。
+
+    progress(done, total) 每解析完一份呼叫一次，另在開工前先以 (0, total) 呼叫一次 ——
+    全船隊要跑十幾秒，呼叫端（TUI）得先知道總數才畫得出進度，否則畫面就是一片黑。
+    限流是呼叫端的事，這裡只如實回報。workers 只給測試指定，預設由 _worker_count 決定。
     """
     log_dir = Path(log_dir)
+    paths = sorted(log_dir.rglob("*.csv"))
+    if progress is not None:
+        progress(0, len(paths))
     records: List[RunRecord] = []
-    for path in sorted(log_dir.rglob("*.csv")):
-        rec = parse_log_file(path)
+    for done, rec in enumerate(_parse_all(paths, workers), start=1):
+        if progress is not None:
+            progress(done, len(paths))
         if rec is None:
             continue
         if mode != "all" and rec.mode != mode:
@@ -457,9 +529,13 @@ class GroupSummary:
     stale: int = 0
     bad: int = 0
     worst: str = "success"  # 群內 display_status 最嚴重者
-    # 群內裝置時鐘偏差的中位數（正＝船機快）。時鐘是**機器**的屬性不是任務的屬性 ——
-    # 同一台 IPC 上的所有元件共用同一個鐘（實測歪掉時都是整台一起歪），所以這個值在
-    # IPC 層才是它真正的歸屬；vessel 層則是該船各 IPC 的綜合，用來在收合狀態下也看得到。
+    # 群內**最歪**那台機器的時鐘偏差（正＝船機快；保留正負號）。時鐘是**機器**的屬性
+    # 不是任務的屬性 —— 同一台 IPC 上的所有元件共用同一個鐘（實測歪掉時都是整台一起
+    # 歪），所以這個值在 IPC 層就是那台機器的鐘；vessel 層則是「這艘船最歪的一台」。
+    #
+    # 取最歪而不是中位數：這個值的用途是**在收合狀態下把問題頂出來**（徽章、預設展開、
+    # 排序），中位數會反過來把它藏起來。實測 WH622 三台 IPC 只有 IPC-2 歪 +9時53分，
+    # 中位數是 -2 秒 —— 照中位數呈現，整艘船看起來完全正常，那台機器要展開兩層才找得到。
     clock_offset: Optional[float] = None
 
 
@@ -498,12 +574,15 @@ def _summarize(devices: List[DeviceStatus]) -> GroupSummary:
         sev = _SEVERITY.get(st, 0)
         if sev > worst_sev:
             worst_sev, s.worst = sev, st
-    s.clock_offset = _median([d.clock_offset for d in devices if d.clock_offset is not None])
+    s.clock_offset = _worst_offset([d.clock_offset for d in devices if d.clock_offset is not None])
     return s
 
 
 def group_is_problem(summary: GroupSummary) -> bool:
     """群組是否含需關注的裝置（過期 / 失敗 / 中止 / 未完成 / 時鐘嚴重歪掉）→ 預設展開。
+
+    時鐘看的是群內最歪那台（見 GroupSummary.clock_offset），所以一艘船只要有一台 IPC
+    的鐘壞掉，那艘船就會自己打開 —— 否則它藏在收合的船群裡，誰也不會去點開。
 
     時鐘只在 **bad**（> 1 小時）才算問題，warn 不算：船隊實測 42% 的 IPC 偏差超過 5
     分鐘，把 warn 也算進來等於預設展開將近一半的樹，那個畫面沒有人看得下去。超過 1

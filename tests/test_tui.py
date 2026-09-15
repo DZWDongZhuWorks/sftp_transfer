@@ -4,6 +4,7 @@
 curses.KEY_* 為模組常數，import 後即可用，無需真實終端機。
 """
 import csv
+import os
 import curses
 from datetime import datetime
 from types import SimpleNamespace
@@ -28,7 +29,12 @@ RECENT = "2026-07-27 11:00:00"  # 1 小時前（未過期）
 OLD = "2026-07-20 11:00:00"     # 7 天前（過期）
 
 
-def _write(path, device_name, direction, when, success, skipped, failed, version=""):
+def _write(path, device_name, direction, when, success, skipped, failed, version="", arrived=None):
+    """寫一份假 log。mtime 設成 when（或 arrived）——那是 RunRecord.arrived_at 的來源。
+
+    不設的話每個假 log 都會是「剛剛才到」，過期與排序的測試就全部失去意義。
+    arrived 可以獨立指定，用來造出「船機時鐘與岸端不一致」的情境。
+    """
     verb = "下載" if direction == "download" else "上傳"
     rows = [
         (when, "INFO", f"=== SFTP {verb}任務開始 ==="),
@@ -39,6 +45,10 @@ def _write(path, device_name, direction, when, success, skipped, failed, version
         w.writerow(["timestamp", "device_name", "version_info", "level", "message"])
         for ts, level, msg in rows:
             w.writerow([ts, device_name, version, level, msg])
+    stamp = arrived if arrived is not None else when
+    if isinstance(stamp, str):
+        stamp = datetime.strptime(stamp, "%Y-%m-%d %H:%M:%S")
+    os.utime(str(path), (stamp.timestamp(), stamp.timestamp()))
 
 
 def _tree(tmp_path, specs, stale_hours=24):
@@ -624,7 +634,7 @@ def test_device_line_columns_align():
         d = types.SimpleNamespace(
             component=comp, latest=rec, is_stale=False, status="success",
             display_status="success", device_name="x", vessel="V", ipc="IPC-1",
-            last_seen=_dt(2026, 7, 27, 1, 0, 0),
+            last_seen=_dt(2026, 7, 27, 1, 0, 0), clock_offset=None,
         )
         return d
 
@@ -1101,12 +1111,13 @@ def test_collapse_or_parent_does_not_jump_in_flat(tmp_path):
 def test_sort_reducers_and_defaults():
     st = tui.TuiState()
     assert (st.flat, st.sort_key, st.sort_desc) == (False, "船隻名稱", False)
-    assert tui._SORT_CYCLE == ["船隻名稱", "更新時間", "嚴重度", "裝置名稱", "版本"]
+    assert tui._SORT_CYCLE == ["船隻名稱", "更新時間", "嚴重度", "裝置名稱", "版本", "時鐘偏差"]
 
     tui.cycle_sort(st); assert st.sort_key == "更新時間"
     tui.cycle_sort(st); assert st.sort_key == "嚴重度"
     tui.cycle_sort(st); assert st.sort_key == "裝置名稱"
     tui.cycle_sort(st); assert st.sort_key == "版本"
+    tui.cycle_sort(st); assert st.sort_key == "時鐘偏差"
     tui.cycle_sort(st); assert st.sort_key == "船隻名稱"    # 繞回
     st.sort_key = "亂填"
     tui.cycle_sort(st); assert st.sort_key == "更新時間"     # 不在循環內也不炸
@@ -1151,7 +1162,7 @@ def test_flat_line_and_header_align():
         dev = SimpleNamespace(component=comp, latest=rec, is_stale=False,
                               status="success", display_status="success",
                               device_name="x", vessel=vessel, ipc="IPC-1",
-                              last_seen=age_now)
+                              last_seen=age_now, clock_offset=None)
         return tui.FlatItem("download", vessel, "IPC-1", dev)
 
     from datetime import datetime as _dt
@@ -1166,7 +1177,7 @@ def test_flat_line_and_header_align():
     assert tui.disp_width(tui.fit_display(body, fixed)[0]) == fixed
     assert header.rstrip().endswith("摘要")
     # 每個欄名都必須真的塞得進自己的欄寬（全形字放進 1 欄寬會被整個丟掉）
-    for label, w in zip(["↕", "船", "IPC", "元件", "最後執行", "檔案", "成/略/失", "距今"],
+    for label, w in zip(["↕", "船", "IPC", "元件", "最後執行", "檔案", "成/略/失", "距今", "時鐘"],
                         tui._FLAT_COLS):
         assert tui.disp_width(label) <= w, f"欄名 {label!r} 放不進 {w} 欄"
         assert label in body
@@ -1340,3 +1351,84 @@ def test_toggle_version_flag():
 def test_key_v_maps_to_toggle_version():
     assert tui.key_action(ord("v")) == "toggle_version"
 
+
+
+# --- 船機時鐘偏差的呈現 ----------------------------------------------------
+def _clock_tree(tmp_path, specs, stale_hours=72, now=None):
+    """specs: (device, direction, 船機時間, 抵達時間)。回傳 (tree, devices)。"""
+    for i, (dev, direction, when, arrived) in enumerate(specs):
+        prefix = "D_" if direction == "download" else "U_"
+        _write(tmp_path / f"{prefix}{dev}_{i}.csv", dev, direction, when, 5, 0, 0, arrived=arrived)
+    devices = aggregate_by_device(collect_logs(tmp_path), now=now or NOW, stale_hours=stale_hours)
+    return build_tree(devices), devices
+
+
+def test_clock_cell_is_blank_when_normal_and_shows_value_when_skewed(tmp_path):
+    """正常留白是刻意的：42% 的 IPC 超過門檻，每列都印 +3 秒會把真的歪掉那幾台淹掉。"""
+    _, devices = _clock_tree(tmp_path, [
+        ("CLINK_IPC-1_ecdis", "download", "2026-07-27 11:00:00", "2026-07-27 11:00:05"),
+        ("WH322_IPC-1_ecdis", "download", "2026-07-27 11:00:00", "2026-07-27 03:00:00"),
+    ])
+    by_name = {d.device_name: d for d in devices}
+    assert tui._clock_cell(by_name["CLINK_IPC-1_ecdis"]) == ""
+    assert tui._clock_cell(by_name["WH322_IPC-1_ecdis"]) == "+8時00分"
+
+
+def test_flat_line_stays_aligned_with_the_clock_column(tmp_path):
+    _, devices = _clock_tree(tmp_path, [
+        ("WH322_IPC-1_ecdis", "download", "2026-07-27 11:00:00", "2026-07-27 03:00:00"),
+        ("CLINK_IPC-1_radar", "download", "2026-07-27 11:00:00", "2026-07-27 11:00:05"),
+    ])
+    fixed = sum(tui._FLAT_COLS) + len(tui._FLAT_COLS) - 1
+    for d in devices:
+        line = tui._device_line_flat(tui.FlatItem("download", d.vessel, d.ipc, d), NOW, show_version=False)
+        assert tui.disp_width(tui.fit_display(line, fixed)[0]) == fixed
+    header = tui.flat_header_line(show_version=False)
+    assert "時鐘" in header
+    assert header.rstrip().endswith("摘要")
+
+
+def test_flat_detail_does_not_repeat_the_clock_column(tmp_path):
+    """平坦模式有專屬時鐘欄，摘要欄再印一次只會把真正的訊息往右推。"""
+    _, devices = _clock_tree(tmp_path, [
+        ("WH322_IPC-1_ecdis", "download", "2026-07-27 11:00:00", "2026-07-27 03:00:00"),
+    ])
+    d = devices[0]
+    line = tui._device_line_flat(tui.FlatItem("download", d.vessel, d.ipc, d), NOW, show_version=False)
+    assert line.count("+8時00分") == 1
+    # 分群模式沒有那一欄，摘要欄就要負責講出來
+    assert "⏱時鐘+8時00分" in tui._device_line(d, NOW, show_version=False)
+
+
+def test_badge_shows_clock_on_ipc_but_not_on_the_mode_row(tmp_path):
+    """時鐘是一台機器的屬性；mode 層是整支船隊的混合，取中位數只會變成常駐雜訊。"""
+    tree, _ = _clock_tree(tmp_path, [
+        ("WH322_IPC-1_ecdis", "download", "2026-07-27 11:00:00", "2026-07-27 03:00:00"),
+    ])
+    mode = tree[0]
+    ipc = mode.vessels[0].ipcs[0]
+    assert "⏱+8時00分" in tui._badge(ipc.summary)
+    assert "⏱" not in tui._badge(mode.summary, show_clock=False)
+
+
+def test_sort_by_clock_offset_puts_the_worst_last_ascending(tmp_path):
+    _, devices = _clock_tree(tmp_path, [
+        ("CLINK_IPC-1_aaa", "download", "2026-07-27 11:00:00", "2026-07-27 11:00:05"),
+        ("WH322_IPC-1_bbb", "download", "2026-07-27 11:00:00", "2026-07-27 03:00:00"),
+        ("WH311_IPC-1_ccc", "download", "2026-07-27 11:00:00", "2026-07-27 11:30:00"),  # 慢 30 分
+    ])
+    order = [d.component for d in tui.sort_devices(devices, "時鐘偏差", desc=False)]
+    assert order == ["aaa", "ccc", "bbb"]
+    # 絕對值比較：快 8 小時與慢 8 小時一樣糟
+    assert tui.sort_value(devices[0], "時鐘偏差") >= 0
+
+
+def test_clock_row_survives_devices_without_offset(tmp_path):
+    """沒有抵達時間（stat 失敗）的裝置不能讓排序或畫面爆掉。"""
+    _, devices = _clock_tree(tmp_path, [
+        ("CLINK_IPC-1_ecdis", "download", "2026-07-27 11:00:00", "2026-07-27 11:00:05"),
+    ])
+    d = devices[0]
+    d.clock_offset = None
+    assert tui._clock_cell(d) == ""
+    assert tui.sort_value(d, "時鐘偏差") == 0

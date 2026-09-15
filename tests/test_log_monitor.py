@@ -4,6 +4,7 @@
 不需網路：於 tmp_path 寫入含 BOM 的合成 CSV log，直接驗證解析、彙整與呈現。
 """
 import csv
+import os
 from pathlib import Path
 import subprocess
 from datetime import datetime
@@ -29,17 +30,31 @@ from monitor.log_monitor import (
 )
 
 
-def write_log(path, device_name, rows, version_info=""):
+def write_log(path, device_name, rows, version_info="", arrived_at=None):
     """rows: list of (timestamp, level, message)。以本體相同格式（utf-8-sig CSV）寫出。
 
     version_info 預設空字串 —— 那是舊 log 與「還沒宣告 VERSION.json 的專案」的實際樣子，
     也是絕大多數既有測試要的情境。
+
+    寫完會把檔案 mtime 設成**最後一列的時間戳**（或 arrived_at 指定的時間）。那是
+    `RunRecord.arrived_at` 的來源，也就是「這份 log 什麼時候落到我們這邊」。不設的話
+    每個假 log 都會是「剛剛才到」，過期與排序的測試就全部失去意義 —— 真實世界裡
+    一份寫著 07-27 的 log 就是 07-27 抵達的。`arrived_at` 刻意獨立指定，才能造出
+    「船機時鐘與岸端不一致」的情境（見時鐘偏差的測試）。
     """
     with open(path, "w", encoding="utf-8-sig", newline="") as fh:
         w = csv.writer(fh)
         w.writerow(["timestamp", "device_name", "version_info", "level", "message"])
         for ts, level, msg in rows:
             w.writerow([ts, device_name, version_info, level, msg])
+    stamp = arrived_at
+    if stamp is None and rows:
+        stamp = rows[-1][0]
+    if stamp is not None:
+        if isinstance(stamp, str):
+            stamp = datetime.strptime(stamp, "%Y-%m-%d %H:%M:%S")
+        epoch = stamp.timestamp()
+        os.utime(str(path), (epoch, epoch))
     return path
 
 
@@ -670,3 +685,115 @@ def test_run_record_version_info_defaults_to_empty():
     """RunRecord 給了預設值 —— 既有的建構呼叫端不必跟著改（向上相容）。"""
     rec = RunRecord(path=Path("x.csv"), device_name="d", mode="download")
     assert rec.version_info == ""
+
+
+# --- 船機時鐘偏差 ----------------------------------------------------------
+class TestClockOffset:
+    """兩個獨立的鐘：CSV 時間戳是船機寫的，檔案 mtime 是岸端寫的。"""
+
+    def _log(self, tmp_path, name, ship_ts, arrived):
+        return write_log(
+            tmp_path / name,
+            "WH322_IPC-1_ecdis",
+            [
+                (ship_ts, "INFO", "=== SFTP 下載任務開始 ==="),
+                (ship_ts, "INFO", "=== 下載任務結束：成功 1，略過 0，失敗 0 ==="),
+            ],
+            arrived_at=arrived,
+        )
+
+    def test_offset_is_ship_minus_shore(self, tmp_path):
+        # 船機說 10:00 寫完，岸端 09:00 就收到了 → 船機快 1 小時
+        p = self._log(tmp_path, "D_WH322_IPC-1_ecdis_20260915_100000.csv",
+                      "2026-09-15 10:00:00", "2026-09-15 09:00:00")
+        rec = parse_log_file(p)
+        assert rec.arrived_at == datetime(2026, 9, 15, 9, 0, 0)
+        assert rec.clock_offset == 3600.0
+
+    def test_offset_is_none_when_either_clock_missing(self, tmp_path):
+        rec = RunRecord(path=Path("x.csv"), device_name="d", mode="download")
+        assert rec.clock_offset is None
+
+    def test_device_offset_is_the_median_of_recent_runs(self, tmp_path):
+        """單次會被「上傳排隊」這種一次性延遲帶偏，中位數不會。"""
+        for i, (ship, arrived) in enumerate([
+            ("2026-09-15 10:00:00", "2026-09-15 09:00:00"),   # +1h
+            ("2026-09-14 10:00:00", "2026-09-14 09:00:00"),   # +1h
+            ("2026-09-13 10:00:00", "2026-09-13 02:00:00"),   # +8h（異常值）
+        ]):
+            self._log(tmp_path, "D_WH322_IPC-1_ecdis_%d.csv" % i, ship, arrived)
+        devices = aggregate_by_device(collect_logs(tmp_path), now=datetime(2026, 9, 15, 12), stale_hours=72)
+        assert devices[0].clock_offset == 3600.0
+
+    def test_stale_uses_arrival_not_the_ship_clock(self, tmp_path):
+        """船機時鐘快 8 小時時，用船機時間算會少算 8 小時而漏報過期。"""
+        # 船機說 09-15 08:00 跑完（距 now 才 4 小時），實際 09-14 00:00 就抵達（36 小時前）
+        self._log(tmp_path, "D_WH322_IPC-1_ecdis_0.csv",
+                  "2026-09-15 08:00:00", "2026-09-14 00:00:00")
+        now = datetime(2026, 9, 15, 12, 0, 0)
+        devices = aggregate_by_device(collect_logs(tmp_path), now=now, stale_hours=24)
+        d = devices[0]
+        assert d.last_seen == datetime(2026, 9, 14, 0, 0, 0)
+        assert d.is_stale is True          # 用船機時間的話會是 False
+        assert d.display_status == "stale"
+
+    def test_latest_is_chosen_by_arrival_order(self, tmp_path):
+        """船機時鐘跳動（校時）後，船機時間的大小關係會反轉，抵達順序不會。"""
+        self._log(tmp_path, "D_WH322_IPC-1_ecdis_old.csv",
+                  "2026-09-15 20:00:00", "2026-09-15 08:00:00")   # 先到，但船機時間較晚
+        self._log(tmp_path, "D_WH322_IPC-1_ecdis_new.csv",
+                  "2026-09-15 09:30:00", "2026-09-15 09:40:00")   # 後到，校時後
+        devices = aggregate_by_device(collect_logs(tmp_path), now=datetime(2026, 9, 15, 10), stale_hours=72)
+        assert devices[0].latest.path.name == "D_WH322_IPC-1_ecdis_new.csv"
+
+    @pytest.mark.parametrize("seconds,text,level", [
+        (None, "—", "ok"),
+        (0, "+0秒", "ok"),
+        (45, "+45秒", "ok"),
+        (-45, "-45秒", "ok"),
+        (299, "+4分", "ok"),          # 門檻是「超過」5 分鐘
+        (301, "+5分", "warn"),
+        (-1800, "-30分", "warn"),
+        (3599, "+59分", "warn"),
+        (28823, "+8時00分", "bad"),   # WH322 IPC-1 的真實形狀
+        (-172800, "-2天", "bad"),
+    ])
+    def test_format_and_level(self, seconds, text, level):
+        from monitor.log_monitor import clock_level, format_clock_offset
+        assert format_clock_offset(seconds) == text
+        assert clock_level(seconds) == level
+
+    def test_group_summary_rolls_up_to_the_ipc(self, tmp_path):
+        """時鐘是機器的屬性：同一台 IPC 上每個元件都該得到同一個偏差。"""
+        for comp in ("ecdis", "radar"):
+            write_log(
+                tmp_path / ("D_WH322_IPC-1_%s_0.csv" % comp),
+                "WH322_IPC-1_%s" % comp,
+                [("2026-09-15 10:00:00", "INFO", "=== SFTP 下載任務開始 ==="),
+                 ("2026-09-15 10:00:00", "INFO", "=== 下載任務結束：成功 1，略過 0，失敗 0 ===")],
+                arrived_at="2026-09-15 02:00:00",   # 船機快 8 小時
+            )
+        devices = aggregate_by_device(collect_logs(tmp_path), now=datetime(2026, 9, 15, 3), stale_hours=72)
+        tree = build_tree(devices)
+        ipc = tree[0].vessels[0].ipcs[0]
+        assert ipc.summary.clock_offset == 8 * 3600
+        # 超過 1 小時＝嚴重，預設展開；摘要欄也會直接寫出來
+        assert group_is_problem(ipc.summary) is True
+        from monitor.log_monitor import _detail_str
+        assert _detail_str(ipc.devices[0]).startswith("⏱時鐘+8時00分")
+
+    def test_warn_level_does_not_force_the_group_open(self, tmp_path):
+        """42% 的 IPC 都超過 5 分鐘門檻，warn 也算問題的話等於預設展開半棵樹。"""
+        write_log(
+            tmp_path / "D_WH271_IPC-1_ecdis_0.csv",
+            "WH271_IPC-1_ecdis",
+            [("2026-09-15 10:00:00", "INFO", "=== SFTP 下載任務開始 ==="),
+             ("2026-09-15 10:00:00", "INFO", "=== 下載任務結束：成功 1，略過 0，失敗 0 ===")],
+            arrived_at="2026-09-15 09:30:00",   # 快 30 分鐘 → warn
+        )
+        devices = aggregate_by_device(collect_logs(tmp_path), now=datetime(2026, 9, 15, 10), stale_hours=72)
+        ipc = build_tree(devices)[0].vessels[0].ipcs[0]
+        assert ipc.summary.clock_offset == 1800
+        assert group_is_problem(ipc.summary) is False
+        from monitor.log_monitor import _detail_str
+        assert _detail_str(ipc.devices[0]) == ""    # warn 不擠進摘要欄

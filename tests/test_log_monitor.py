@@ -855,7 +855,7 @@ class TestClockOffset:
         # 超過 1 小時＝嚴重，預設展開；摘要欄也會直接寫出來
         assert group_is_problem(ipc.summary) is True
         from monitor.log_monitor import _detail_str
-        assert _detail_str(ipc.devices[0]).startswith("⏱時鐘+8時00分")
+        assert _detail_str(ipc.devices[0]).startswith("⌚ 時鐘+8時00分")
 
     def _fleet_with_one_broken_ipc(self, tmp_path):
         """WH622 的真實形狀：三台 IPC 只有 IPC-2 歪了將近 10 小時，另兩台差幾秒。"""
@@ -893,7 +893,7 @@ class TestClockOffset:
         """HTML 與 TUI 看同一個數字，否則兩份報表會對同一艘船給出不同結論。"""
         from monitor.log_monitor import _html_badges
         vessel = self._fleet_with_one_broken_ipc(tmp_path)
-        assert "⏱ 時鐘 +9時53分" in _html_badges(vessel.summary)
+        assert "⌚ 時鐘 +9時53分" in _html_badges(vessel.summary)
 
     def test_warn_level_does_not_force_the_group_open(self, tmp_path):
         """42% 的 IPC 都超過 5 分鐘門檻，warn 也算問題的話等於預設展開半棵樹。"""

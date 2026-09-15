@@ -1,7 +1,7 @@
 {
-  "version": "0.19.0",
+  "version": "0.19.1",
   "date": "2026-09-15",
-  "notes": "接續 0.18.1:TUI 開場不再是十幾秒到一分半的全黑畫面。【問題】--tui 掃全船隊 fleet_logs(31,876 份 log、993 MB)時,畫面要等 96 秒才出現第一格。實測拆解:rglob 走訪加 stat 只佔0.7 秒,其餘全在逐列剖析 CSV —— 那是純 CPU 的工作,GIL 讓 thread 幫不上忙。【平行解析】collect_logs 拆出 _parse_all:檔案數超過 200 份(_PARALLEL_MIN_FILES,更少的話開 pool 比省下來的還貴)時用 multiprocessing 的 process pool,worker 數取 min(cpu_count, 12) ——本機 12 核實測全量 96 秒 → 12 秒(6,000 份的對照:序列 18.9 秒、8 worker 2.75 秒、12 worker 2.38 秒,再多邊際效益很小而記憶體線性增加)。用 fork context 而非 spawn:spawn 會在子行程重新 import 這個模組,而它同時是可執行腳本(等於再跑一次 argparse)。取不到 fork(非 Linux)、pool 開不起來、或中途壞掉(worker 被 OOM killer 收掉之類),一律退回單執行緒把**剩下的**補完 —— imap 保證順序,已產出幾份就是走到哪裡,不重複也不漏;平行化是最佳化,不該讓監視工具本身掛掉。逐檔比對驗證平行與序列結果完全相同(含順序 —— aggregate 的穩定排序靠它)。【載入畫面】collect_logs 多一個 progress(done,total) 回呼,開工前先以 (0, total) 呼叫一次(呼叫端要先知道總數才畫得出進度條);load_tree 往下傳,TUI 的 reload 掛上 _loading_progress,形狀比照既有的 _draw_sync。回呼是每份 log 叫一次(全船隊 3 萬多次),所以限流成每秒最多 5 次,但 done=0 與done=total 一定畫。剩餘時間前 1 秒不估:一開場的估值會從天文數字往下跳,比不寫還讓人不安;解析完到彙整、建樹那段沒有進度可報,就直說「正在彙整」。進度條走純 ASCII,終端機字型不一定有方塊字。驗證:pytest 651 條全過(新增 9 條:平行與序列逐檔相同、進度回呼的首末與單調、無 fork 退回、pool 中途壞掉補完、worker 數、載入文字與進度條的形狀、限流);另以 tmux 實際驅動 --tui 掃全船隊,確認 3 秒時畫面已在報 16%、13 秒進入監視畫面。",
+  "notes": "接續 0.19.0:時鐘徽章的 ⏱ 在終端機裡是變形的,改用 ⌚。【症狀】TUI 群組徽章與 CLI/TUI 摘要前綴的 ⏱(U+23F1)畫出來被橫向壓扁 —— 不是跟隔壁的字疊在一起,是字本身變形。【原因】U+23F1 的 east_asian_width 是「N」,終端機照這個只配給它 1 欄;但這台機器上有這個字的字型只有 Noto Color Emoji(fc-list :charset=23f1 只回它一個),那是方形的彩色字,方形塞進一格寬的格子就被壓扁。程式內部的 _char_width 管的是「它跟隔壁字的距離」,終端機配幾欄不看我們的算法 —— 所以先加一個空白那一版沒有用,只是在變形的字旁邊多留了一格。【改法】換成 east_asian_width 本來就是 W 的 ⌚(U+231A):終端機配 2 欄、字型也是方形,比例就對了,而且 unicodedata 與終端機對同一個字達成共識,_char_width 不必為它開特例(上一版試過的白名單一併拿掉)。徽章、摘要前綴、HTML 三處一致,符號後面保留一個空白(HTML 版本來就有)。_char_width 上方留註解說明:畫面上的符號只能挑 EAW=W 的表情符號,回報 N 的那些(⏱ U+23F1、🕰 U+1F570…)不能用,免得日後又換回去。驗證:pytest 651 條全過(徽章、摘要、HTML 三處斷言隨之更新);monitor/README.md 的範例一併改。",
   "stamp_exclude": [
     "*.whl"
   ]

@@ -1537,7 +1537,7 @@ def test_flat_detail_does_not_repeat_the_clock_column(tmp_path):
     line = tui._device_line_flat(tui.FlatItem("download", d.vessel, d.ipc, d), NOW, show_version=False)
     assert line.count("+8時00分") == 1
     # 分群模式沒有那一欄，摘要欄就要負責講出來
-    assert "⏱時鐘+8時00分" in tui._device_line(d, NOW, show_version=False)
+    assert "⌚ 時鐘+8時00分" in tui._device_line(d, NOW, show_version=False)
 
 
 def test_badge_shows_clock_on_ipc_but_not_on_the_mode_row(tmp_path):
@@ -1547,8 +1547,8 @@ def test_badge_shows_clock_on_ipc_but_not_on_the_mode_row(tmp_path):
     ])
     mode = tree[0]
     ipc = mode.vessels[0].ipcs[0]
-    assert "⏱+8時00分" in tui._badge(ipc.summary)
-    assert "⏱" not in tui._badge(mode.summary, show_clock=False)
+    assert "⌚ +8時00分" in tui._badge(ipc.summary)
+    assert "⌚" not in tui._badge(mode.summary, show_clock=False)
 
 
 def test_sort_by_clock_offset_puts_the_worst_last_ascending(tmp_path):
@@ -1611,7 +1611,7 @@ def test_grouped_clock_sort_ranks_by_worst_machine(tmp_path):
     assert wh322.summary.clock_offset == 8 * 3600
     assert tui.group_clock_magnitude(wh322) == 8 * 3600
     assert clock_level(wh322.summary.clock_offset) == "bad"
-    assert "⏱+8時00分" in tui._badge(wh322.summary)      # 收合著也看得到是哪艘船
+    assert "⌚ +8時00分" in tui._badge(wh322.summary)      # 收合著也看得到是哪艘船
 
     st = tui.TuiState(sort_key="時鐘偏差", sort_desc=True)
     tui.expand_all(st, tree)

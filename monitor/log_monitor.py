@@ -802,7 +802,7 @@ def _detail_str(dev: DeviceStatus, with_clock: bool = True) -> str:
     rec = dev.latest
     prefix = ""
     if with_clock and clock_level(dev.clock_offset) == "bad":
-        prefix = f"⏱時鐘{format_clock_offset(dev.clock_offset)} "
+        prefix = f"⌚ 時鐘{format_clock_offset(dev.clock_offset)} "
     if rec.abort_reason:
         return f"{prefix}中止：{rec.abort_reason}"
     if rec.errors:
@@ -1143,7 +1143,7 @@ def _html_badges(summary: GroupSummary) -> str:
     if level != "ok":
         cls = "bad" if level == "bad" else "warn"
         parts.append(
-            f'<span class="{cls}">⏱ 時鐘 {_esc(format_clock_offset(summary.clock_offset))}</span>'
+            f'<span class="{cls}">⌚ 時鐘 {_esc(format_clock_offset(summary.clock_offset))}</span>'
         )
     return '<span class="badge">' + " · ".join(parts) + "</span>"
 

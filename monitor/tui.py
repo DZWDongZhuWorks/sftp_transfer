@@ -97,6 +97,10 @@ _MOUSE_SHIFT = getattr(curses, "BUTTON_SHIFT", 0)
 
 
 # --- 顯示寬度（CJK 全形字佔 2 欄）------------------------------------------
+# 畫面上的符號只能挑 east_asian_width 是 W 的表情符號（時鐘徽章用 ⌚ U+231A 就是為此）。
+# 回報 "N" 的那些（⏱ U+23F1、🕰 U+1F570…）在系統上只有 Noto Color Emoji 有字，而那是
+# 方形的彩色字；終端機照 "N" 只配給它 1 欄，方形字被壓進一格就變形，加空白也救不了
+# —— 變形的是字本身，不是它跟隔壁字的距離。
 def _char_width(ch: str) -> int:
     return 2 if unicodedata.east_asian_width(ch) in ("W", "F") else 1
 
@@ -203,7 +207,7 @@ def _badge(s, show_clock: bool = True) -> str:
         parts.append(f"異常 {s.bad}")
     offset = getattr(s, "clock_offset", None)
     if show_clock and clock_level(offset) != "ok":
-        parts.append(f"⏱{format_clock_offset(offset)}")
+        parts.append(f"⌚ {format_clock_offset(offset)}")
     return "｜".join(parts)
 
 
@@ -347,7 +351,7 @@ def group_clock_magnitude(group) -> float:
 
     summary.clock_offset 本身就是「群內最歪的那台」（見 log_monitor.GroupSummary），
     這裡只是取絕對值 —— 理由同 sort_value：快 8 小時與慢 8 小時一樣糟。徽章、預設展開
-    與這個排序因此看的是同一個數字，排到最前面的船，那一列的 ⏱ 就是它被排上來的原因。
+    與這個排序因此看的是同一個數字，排到最前面的船，那一列的 ⌚ 就是它被排上來的原因。
 
     取不到偏差的群組當 0（＝正常），沿用「無從判斷就不製造警報」的一貫做法
     （見 log_monitor.clock_level）。

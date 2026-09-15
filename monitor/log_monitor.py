@@ -155,6 +155,22 @@ def _median(values: List[float]) -> Optional[float]:
     return (ordered[mid - 1] + ordered[mid]) / 2
 
 
+def _worst_offset(values: List[float]) -> Optional[float]:
+    """群組層的時鐘彙總：絕對值最大的那一個（保留正負號）。空清單回 None。
+
+    比絕對值是因為快 8 小時與慢 8 小時一樣糟；回傳時保留正負號，畫面上才看得出是快是慢。
+    等值時取先出現的那個，次序由資料層（devices 的既有排序）決定，結果才穩定。
+
+    單一裝置的偏差本身已是最近數次執行的中位數（見 aggregate_by_device），一次性的上傳
+    排隊延遲在那一層就被磨掉了，所以這裡取最大值不會被單次雜訊帶跑。
+    """
+    worst: Optional[float] = None
+    for v in values:
+        if worst is None or abs(v) > abs(worst):
+            worst = v
+    return worst
+
+
 @dataclass
 class DeviceStatus:
     """依 device_name 彙整後的單一裝置狀態。"""
@@ -457,9 +473,13 @@ class GroupSummary:
     stale: int = 0
     bad: int = 0
     worst: str = "success"  # 群內 display_status 最嚴重者
-    # 群內裝置時鐘偏差的中位數（正＝船機快）。時鐘是**機器**的屬性不是任務的屬性 ——
-    # 同一台 IPC 上的所有元件共用同一個鐘（實測歪掉時都是整台一起歪），所以這個值在
-    # IPC 層才是它真正的歸屬；vessel 層則是該船各 IPC 的綜合，用來在收合狀態下也看得到。
+    # 群內**最歪**那台機器的時鐘偏差（正＝船機快；保留正負號）。時鐘是**機器**的屬性
+    # 不是任務的屬性 —— 同一台 IPC 上的所有元件共用同一個鐘（實測歪掉時都是整台一起
+    # 歪），所以這個值在 IPC 層就是那台機器的鐘；vessel 層則是「這艘船最歪的一台」。
+    #
+    # 取最歪而不是中位數：這個值的用途是**在收合狀態下把問題頂出來**（徽章、預設展開、
+    # 排序），中位數會反過來把它藏起來。實測 WH622 三台 IPC 只有 IPC-2 歪 +9時53分，
+    # 中位數是 -2 秒 —— 照中位數呈現，整艘船看起來完全正常，那台機器要展開兩層才找得到。
     clock_offset: Optional[float] = None
 
 
@@ -498,12 +518,15 @@ def _summarize(devices: List[DeviceStatus]) -> GroupSummary:
         sev = _SEVERITY.get(st, 0)
         if sev > worst_sev:
             worst_sev, s.worst = sev, st
-    s.clock_offset = _median([d.clock_offset for d in devices if d.clock_offset is not None])
+    s.clock_offset = _worst_offset([d.clock_offset for d in devices if d.clock_offset is not None])
     return s
 
 
 def group_is_problem(summary: GroupSummary) -> bool:
     """群組是否含需關注的裝置（過期 / 失敗 / 中止 / 未完成 / 時鐘嚴重歪掉）→ 預設展開。
+
+    時鐘看的是群內最歪那台（見 GroupSummary.clock_offset），所以一艘船只要有一台 IPC
+    的鐘壞掉，那艘船就會自己打開 —— 否則它藏在收合的船群裡，誰也不會去點開。
 
     時鐘只在 **bad**（> 1 小時）才算問題，warn 不算：船隊實測 42% 的 IPC 偏差超過 5
     分鐘，把 warn 也算進來等於預設展開將近一半的樹，那個畫面沒有人看得下去。超過 1

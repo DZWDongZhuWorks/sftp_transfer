@@ -17,6 +17,7 @@ from monitor.log_monitor import (
     aggregate_by_device,
     build_parser,
     build_tree,
+    clock_level,
     collect_logs,
     group_is_problem,
     parse_device_name,
@@ -781,6 +782,44 @@ class TestClockOffset:
         assert group_is_problem(ipc.summary) is True
         from monitor.log_monitor import _detail_str
         assert _detail_str(ipc.devices[0]).startswith("⏱時鐘+8時00分")
+
+    def _fleet_with_one_broken_ipc(self, tmp_path):
+        """WH622 的真實形狀：三台 IPC 只有 IPC-2 歪了將近 10 小時，另兩台差幾秒。"""
+        for ipc, arrived in (
+            ("IPC-1", "2026-09-15 09:59:57"),   # +3 秒
+            ("IPC-2", "2026-09-15 00:07:00"),   # +9 時 53 分
+            ("IPC-3", "2026-09-15 10:00:02"),   # -2 秒
+        ):
+            write_log(
+                tmp_path / ("D_WH622_%s_ecdis_0.csv" % ipc),
+                "WH622_%s_ecdis" % ipc,
+                [("2026-09-15 10:00:00", "INFO", "=== SFTP 下載任務開始 ==="),
+                 ("2026-09-15 10:00:00", "INFO", "=== 下載任務結束：成功 1，略過 0，失敗 0 ===")],
+                arrived_at=arrived,
+            )
+        devices = aggregate_by_device(collect_logs(tmp_path), now=datetime(2026, 9, 15, 11), stale_hours=72)
+        return build_tree(devices)[0].vessels[0]
+
+    def test_vessel_rollup_takes_the_worst_ipc_not_the_typical_one(self, tmp_path):
+        """船層取最歪的那台。取中位數的話這艘船會是 -2 秒 —— 看起來完全正常。"""
+        vessel = self._fleet_with_one_broken_ipc(tmp_path)
+        assert vessel.summary.clock_offset == 9 * 3600 + 53 * 60
+        assert clock_level(vessel.summary.clock_offset) == "bad"
+        # 一台 IPC 壞掉就要讓整艘船預設展開，否則它藏在收合的船群裡沒人點得到
+        assert group_is_problem(vessel.summary) is True
+        assert [ip.summary.clock_offset for ip in vessel.ipcs if ip.name == "IPC-3"] == [-2]
+
+    def test_worst_offset_keeps_the_sign_and_is_none_when_empty(self):
+        from monitor.log_monitor import _worst_offset
+        assert _worst_offset([]) is None
+        assert _worst_offset([60, -3600, 300]) == -3600      # 慢 1 小時和快 1 小時一樣糟
+        assert _worst_offset([-1800, 1800]) == -1800         # 等值取先出現的，結果才穩定
+
+    def test_html_badge_reports_the_worst_machine_on_the_vessel(self, tmp_path):
+        """HTML 與 TUI 看同一個數字，否則兩份報表會對同一艘船給出不同結論。"""
+        from monitor.log_monitor import _html_badges
+        vessel = self._fleet_with_one_broken_ipc(tmp_path)
+        assert "⏱ 時鐘 +9時53分" in _html_badges(vessel.summary)
 
     def test_warn_level_does_not_force_the_group_open(self, tmp_path):
         """42% 的 IPC 都超過 5 分鐘門檻，warn 也算問題的話等於預設展開半棵樹。"""

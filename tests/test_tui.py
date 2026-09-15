@@ -13,6 +13,7 @@ from unittest import mock
 from monitor.log_monitor import (
     aggregate_by_device,
     build_tree,
+    clock_level,
     collect_logs,
     device_detail_lines,
 )
@@ -1511,6 +1512,87 @@ def test_sort_by_clock_offset_puts_the_worst_last_ascending(tmp_path):
     assert order == ["aaa", "ccc", "bbb"]
     # 絕對值比較：快 8 小時與慢 8 小時一樣糟
     assert tui.sort_value(devices[0], "時鐘偏差") >= 0
+
+
+def _clock_fleet(tmp_path):
+    """一支「中位數會騙人」的船隊。
+
+    WH322 三台 IPC 只有 IPC-3 歪了 8 小時，另兩台各差幾秒 —— 該船的中位數因此接近 0。
+    WH311 整船慢 30 分，CLINK 全正常。資料層的船序是名稱升冪（全部 success）。
+    """
+    return _clock_tree(tmp_path, [
+        ("CLINK_IPC-1_ecdis", "download", "2026-07-27 11:00:00", "2026-07-27 11:00:05"),
+        ("WH311_IPC-1_ecdis", "download", "2026-07-27 11:00:00", "2026-07-27 11:30:00"),
+        ("WH322_IPC-1_ecdis", "download", "2026-07-27 11:00:00", "2026-07-27 11:00:03"),
+        ("WH322_IPC-2_ecdis", "download", "2026-07-27 11:00:00", "2026-07-27 11:00:02"),
+        ("WH322_IPC-3_ecdis", "download", "2026-07-27 11:00:00", "2026-07-27 03:00:00"),
+    ])
+
+
+def _ipc_names(tree, st, vessel):
+    rows = tui.flatten_tree(tree, st, NOW)
+    keys = [r.key for r in rows if r.kind == "ipc" and r.key[2] == vessel]
+    return [k[3] for k in keys]
+
+
+def test_grouped_clock_sort_reorders_vessels_and_ipcs(tmp_path):
+    """時鐘排序要排的是「船」與「IPC」兩層 —— 只排 IPC 底下的專案列等於沒排。
+
+    鐘是機器的屬性：同一台 IPC 的各專案共用同一個鐘，那一層的數字全都一樣。
+    """
+    tree, _ = _clock_fleet(tmp_path)
+    st = tui.TuiState(sort_key="時鐘偏差", sort_desc=True)
+    tui.expand_all(st, tree)
+    assert _vessel_names(tree, st) == ["WH322", "WH311", "CLINK"]   # 最歪的船在最前
+    assert _ipc_names(tree, st, "WH322") == ["IPC-3", "IPC-1", "IPC-2"]
+
+    st.sort_desc = False
+    assert _vessel_names(tree, st) == ["CLINK", "WH311", "WH322"]
+    assert _ipc_names(tree, st, "WH322") == ["IPC-2", "IPC-1", "IPC-3"]
+
+
+def test_grouped_clock_sort_ranks_by_worst_machine(tmp_path):
+    """排序、徽章、預設展開看的是同一個數字：群內最歪的那台。
+
+    WH322 三台 IPC 只有一台歪 8 小時。若船層取的是典型值（中位數），它會被另外兩台
+    正常的 IPC 稀釋到門檻以下 —— 那艘船既不會排到前面、收合時也看不出有問題。
+    """
+    tree, _ = _clock_fleet(tmp_path)
+    wh322 = next(v for v in tree[0].vessels if v.name == "WH322")
+    assert wh322.summary.clock_offset == 8 * 3600
+    assert tui.group_clock_magnitude(wh322) == 8 * 3600
+    assert clock_level(wh322.summary.clock_offset) == "bad"
+    assert "⏱+8時00分" in tui._badge(wh322.summary)      # 收合著也看得到是哪艘船
+
+    st = tui.TuiState(sort_key="時鐘偏差", sort_desc=True)
+    tui.expand_all(st, tree)
+    assert _vessel_names(tree, st)[0] == "WH322"
+
+
+def test_grouped_clock_sort_survives_groups_without_offset(tmp_path):
+    """整群都取不到偏差（summary 為 None）時排序值是 0（＝正常），不爆掉也不製造假警報。"""
+    tree, _ = _clock_fleet(tmp_path)
+    for m in tree:
+        for v in m.vessels:
+            v.summary.clock_offset = None
+            for ip in v.ipcs:
+                ip.summary.clock_offset = None
+    assert all(tui.group_clock_magnitude(v) == 0 for v in tree[0].vessels)
+    st = tui.TuiState(sort_key="時鐘偏差", sort_desc=True)
+    tui.expand_all(st, tree)
+    # 全等值 → 穩定排序保留資料層次序
+    assert _vessel_names(tree, st) == [v.name for v in tree[0].vessels]
+
+
+def test_grouped_other_sort_keys_keep_data_layer_ipc_order(tmp_path):
+    """時鐘以外的欄位在 IPC 群這一層沒有單一值可比，維持 build_tree 的次序。"""
+    tree, _ = _clock_fleet(tmp_path)
+    from_tree = [ip.name for v in tree[0].vessels if v.name == "WH322" for ip in v.ipcs]
+    for key in ("船隻名稱", "更新時間", "嚴重度", "裝置名稱", "版本"):
+        for desc in (False, True):
+            st = tui.TuiState(sort_key=key, sort_desc=desc)
+            tui.expand_all(st, tree)
+            assert _ipc_names(tree, st, "WH322") == from_tree
 
 
 def test_clock_row_survives_devices_without_offset(tmp_path):

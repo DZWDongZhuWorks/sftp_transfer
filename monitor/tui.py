@@ -190,8 +190,11 @@ class TuiState:
 def _badge(s, show_clock: bool = True) -> str:
     """群組節點的統計徽章。
 
-    時鐘偏差只掛在 vessel / IPC 兩層（show_clock）：那是「一台機器一個鐘」的自然歸屬，
-    而 mode 層是整支船隊的混合，取中位數沒有意義、只會變成一個永遠都在的雜訊。
+    時鐘偏差只掛在 vessel / IPC 兩層（show_clock）：那是「一台機器一個鐘」的自然歸屬。
+    mode 層是整支船隊，取最歪的那一台等於永遠都在報同一艘船，變成常駐雜訊。
+
+    船群那一列報的是「這艘船最歪的一台 IPC」而不是全船的典型值：這顆徽章的用途是在
+    收合狀態下把問題頂出來，只有一台 IPC 壞掉的船正是它要抓的（見 GroupSummary）。
     """
     parts = [f"裝置 {s.total}", f"正常 {s.ok}"]
     if s.stale:
@@ -339,19 +342,46 @@ def sort_devices(devices: list, key: str, desc: bool) -> list:
     return sorted(devices, key=lambda d: sort_value(d, key), reverse=desc)
 
 
+def group_clock_magnitude(group) -> float:
+    """群組（船／IPC）的時鐘排序值：群內最歪那台機器的偏差絕對值。
+
+    summary.clock_offset 本身就是「群內最歪的那台」（見 log_monitor.GroupSummary），
+    這裡只是取絕對值 —— 理由同 sort_value：快 8 小時與慢 8 小時一樣糟。徽章、預設展開
+    與這個排序因此看的是同一個數字，排到最前面的船，那一列的 ⏱ 就是它被排上來的原因。
+
+    取不到偏差的群組當 0（＝正常），沿用「無從判斷就不製造警報」的一貫做法
+    （見 log_monitor.clock_level）。
+    """
+    return abs(getattr(group.summary, "clock_offset", None) or 0)
+
+
 def sort_vessels(vessels: list, key: str, desc: bool) -> list:
-    """分群模式的船群次序：只有「船隻名稱」欄位會重排，其餘維持資料層順序。
+    """分群模式的船群次序：只有「船隻名稱」與「時鐘偏差」會重排，其餘維持資料層順序。
 
     船名對整個 IPC 群組是常數（樹就是依 船→IPC 分的），套在群組內的裝置列上必然是
-    no-op，所以這個欄位得作用在「船」這一層才有意義。其餘欄位是裝置屬性，群組層沒有
-    單一值可比，維持 build_tree 的 (未分類置底, -嚴重度, 名稱) 次序。
+    no-op，所以這個欄位得作用在「船」這一層才有意義。時鐘同理：鐘是**機器**的屬性，
+    同一台 IPC 的各專案共用同一個鐘，只排 IPC 底下的裝置列等於在排一串相同的數字，
+    真正要比的是船與船之間、IPC 與 IPC 之間。其餘欄位是裝置屬性，群組層沒有單一值
+    可比，維持 build_tree 的 (未分類置底, -嚴重度, 名稱) 次序。
 
     排序值與 sort_value("船隻名稱") 同為 name.casefold()，兩種檢視的船名次序才一致
     （含 （未分類） 這個 sentinel：升冪在最後、降冪在最前）。
     """
+    if key == "時鐘偏差":
+        return sorted(vessels, key=group_clock_magnitude, reverse=desc)
     if key != "船隻名稱":
         return vessels
     return sorted(vessels, key=lambda g: g.name.casefold(), reverse=desc)
+
+
+def sort_ipcs(ipcs: list, key: str, desc: bool) -> list:
+    """同一艘船底下的 IPC 群次序：只有「時鐘偏差」會重排（見 sort_vessels）。
+
+    其餘欄位（含船名）在這一層都是常數或裝置屬性，維持 build_tree 的次序。
+    """
+    if key != "時鐘偏差":
+        return ipcs
+    return sorted(ipcs, key=group_clock_magnitude, reverse=desc)
 
 
 def sort_label(key: str, desc: bool) -> str:
@@ -412,7 +442,7 @@ def flatten_tree(tree, state: TuiState, now: Optional[datetime]) -> List[Row]:
             )
             if vkey not in state.expanded:
                 continue
-            for ip in v.ipcs:
+            for ip in sort_ipcs(v.ipcs, state.sort_key, state.sort_desc):
                 dvs = [d for d in ip.devices if _device_matches(d, state)]
                 if not dvs:
                     continue

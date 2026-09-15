@@ -28,6 +28,8 @@ from monitor.log_monitor import (
     _counts_str,
     _detail_str,
     _humanize_age,
+    clock_level,
+    format_clock_offset,
     _MODE_LABEL,
     aggregate_by_device,
     build_tree,
@@ -45,14 +47,15 @@ _PAIR = {"success": 1, "stale": 2, "incomplete": 2, "partial": 3, "aborted": 3}
 _SYNC_LINE_LIMIT = 20
 _ANSI_ESCAPE = re.compile(r"\x1b\[[0-?]*[ -/]*[@-~]")
 _ENTER_KEYS = (10, 13, curses.KEY_ENTER)
-_SORT_CYCLE = ["船隻名稱", "更新時間", "嚴重度", "裝置名稱", "版本"]
+_SORT_CYCLE = ["船隻名稱", "更新時間", "嚴重度", "裝置名稱", "版本", "時鐘偏差"]
 _MODE_ARROW = {"download": "↓", "upload": "↑"}
 # 版本欄寬：`0.10.0+811a5c3-dirty` 是目前最長的形狀（20 欄），塞不下就截斷 ——
 # 版號與 commit 前綴才是辨識用的，-dirty 被切掉仍看得出是哪一版。
 _VERSION_W = 16
-# 平坦模式的欄寬（顯示欄）：方向 船 IPC 元件 [版本] 最後執行 檔案 成/略/失 距今 摘要
-_FLAT_COLS = (1, 10, 6, 20, 11, 5, 9, 8)
-_FLAT_ALIGN = ("left", "left", "left", "left", "left", "right", "right", "left")
+# 平坦模式的欄寬（顯示欄）：方向 船 IPC 元件 [版本] 最後執行 檔案 成/略/失 距今 時鐘 摘要
+# 時鐘欄 8 欄寬：最長的形狀是 `-8時00分`（全形「時」「分」各佔 2 欄）＝ 8。
+_FLAT_COLS = (1, 10, 6, 20, 11, 5, 9, 8, 8)
+_FLAT_ALIGN = ("left", "left", "left", "left", "left", "right", "right", "left", "right")
 _FLAT_GUTTER = "    "  # 對齊 _draw 的 depth-0 縮排("  ") + 狀態燈("●") + 空白
 _MOUSE_SCROLL_LINES = 3
 # 【設 0：讓 press 立刻出來，雙擊改由自己判】
@@ -180,12 +183,20 @@ class TuiState:
     notice: str = ""
 
 
-def _badge(s) -> str:
+def _badge(s, show_clock: bool = True) -> str:
+    """群組節點的統計徽章。
+
+    時鐘偏差只掛在 vessel / IPC 兩層（show_clock）：那是「一台機器一個鐘」的自然歸屬，
+    而 mode 層是整支船隊的混合，取中位數沒有意義、只會變成一個永遠都在的雜訊。
+    """
     parts = [f"裝置 {s.total}", f"正常 {s.ok}"]
     if s.stale:
         parts.append(f"過期 {s.stale}")
     if s.bad:
         parts.append(f"異常 {s.bad}")
+    offset = getattr(s, "clock_offset", None)
+    if show_clock and clock_level(offset) != "ok":
+        parts.append(f"⏱{format_clock_offset(offset)}")
     return "｜".join(parts)
 
 
@@ -203,6 +214,19 @@ def _version_str(rec) -> str:
     這一欄都會是空的，畫面上以 — 呈現，不能因此讓列變形或報錯。
     """
     return (getattr(rec, "version_info", "") or "").strip() or "—"
+
+
+def _clock_cell(d) -> str:
+    """時鐘欄的內容：正常留白，只有超過門檻才顯示數值。
+
+    一欄「正常時是空的」看起來不像資料欄，但這欄的用途是**掃描**：船隊實測 42% 的 IPC
+    偏差超過 5 分鐘門檻，若把每一列的 `+3秒` 都印出來，真正歪掉的那幾台就淹在裡面了。
+    排序（o 切到「時鐘偏差」）用的是底層數值，不受這裡留白影響。
+    """
+    offset = getattr(d, "clock_offset", None)
+    if clock_level(offset) == "ok":
+        return ""
+    return format_clock_offset(offset)
 
 
 def _device_line(d, now: Optional[datetime], show_version: bool = True) -> str:
@@ -259,7 +283,9 @@ def _device_line_flat(item, now: Optional[datetime], show_version: bool = True) 
         "—" if rec.file_count is None else str(rec.file_count),
         _counts_str(rec),
         _humanize_age(d.last_seen, now) if now else "—",
-        _detail_str(d),
+        _clock_cell(d),
+        # 平坦模式有專屬的時鐘欄，摘要欄就不要再印一次同樣的值（見 _detail_str）。
+        _detail_str(d, with_clock=False),
     ], show_version)
 
 
@@ -273,7 +299,7 @@ def flat_header_line(show_version: bool = True) -> str:
     if show_version:
         labels.append("版本")
     return _FLAT_GUTTER + _flat_cells(
-        labels + ["最後執行", "檔案", "成/略/失", "距今", "摘要"], show_version
+        labels + ["最後執行", "檔案", "成/略/失", "距今", "時鐘", "摘要"], show_version
     )
 
 
@@ -297,6 +323,10 @@ def sort_value(d, key: str):
         # 一整排破折號排在最前面只會擋路。不做版號的語意比較（0.10.0 vs 0.9.0 會排錯），
         # 這一欄是拿來「把同版本的船聚在一起」的，不是拿來比新舊的。
         return (getattr(d.latest, "version_info", "") or "~").casefold()
+    if key == "時鐘偏差":
+        # 比的是絕對值：快 8 小時與慢 8 小時一樣糟。取不到偏差的當 0（＝正常），
+        # 沿用「無從判斷就不製造警報」的一貫做法（見 log_monitor.clock_level）。
+        return abs(getattr(d, "clock_offset", None) or 0)
     return _SEVERITY.get(d.display_status, 0)  # 未知狀態→0，沿用資料層 .get(x, 0) 慣例
 
 
@@ -360,7 +390,8 @@ def flatten_tree(tree, state: TuiState, now: Optional[datetime]) -> List[Row]:
             continue
         mkey = ("M", m.mode)
         rows.append(
-            Row("mode", 0, mkey, f"{_MODE_LABEL.get(m.mode, m.mode)}  [{_badge(m.summary)}]",
+            Row("mode", 0, mkey,
+                f"{_MODE_LABEL.get(m.mode, m.mode)}  [{_badge(m.summary, show_clock=False)}]",
                 m.summary.worst, m)
         )
         if mkey not in state.expanded:

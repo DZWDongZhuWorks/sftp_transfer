@@ -59,6 +59,21 @@ _RE_DEVICE = re.compile(r"^(?P<vsl>[A-Za-z0-9_]+?)_(?P<ipc>IPC-\d+)_(?P<comp>.+)
 # 狀態嚴重度（數字越大越該優先呈現）
 _SEVERITY = {"aborted": 4, "incomplete": 3, "partial": 3, "stale": 2, "success": 0}
 
+# --- 船機時鐘偏差 ---------------------------------------------------------
+# 每個 log 檔同時帶著兩個獨立的鐘：CSV 裡的時間戳是**船機**寫的，檔案 mtime 是
+# **岸端 SFTP 伺服器**寫的（下載時會沿用遠端 mtime，見 downloader 的 os.utime）。
+# 兩者相減就是船機時鐘相對岸端的偏差，不需要任何新的收集機制。
+#
+# 基準取「log 最後一行」而不是檔名時間：最後一行就寫在 _upload_log_file 前幾秒，
+# 所以時鐘一致時兩者只差幾秒（船隊實測 p75 = +9 秒）；用檔名的話還要扣掉整趟傳輸
+# 的耗時，那是幾分鐘等級的雜訊，會把真正的偏差蓋掉。
+#
+# 正值＝船機時鐘比岸端**快**。
+CLOCK_WARN_SECONDS = 300.0    # 5 分鐘：實測 p95 的單次偏差是 4 分鐘，正常的船不會誤報
+CLOCK_BAD_SECONDS = 3600.0    # 1 小時：這個量級通常是時區設錯或 RTC 沒電，不是漂移
+# 取最近幾次執行的中位數。單次會被「上傳排隊」這種一次性延遲帶偏，中位數不會。
+CLOCK_SAMPLE_RUNS = 10
+
 
 # ---------------------------------------------------------------------------
 # 資料模型
@@ -76,6 +91,10 @@ class RunRecord:
     version_info: str = ""
     started_at: Optional[datetime] = None
     ended_at: Optional[datetime] = None
+    # 這份 log 抵達岸端的時間（檔案 mtime）。這是**我們這邊**的鐘 —— 對 fleet_logs 來說
+    # 是岸端 SFTP 伺服器的時間（下載時沿用遠端 mtime），對本機 logs/ 來說就是本機時間。
+    # 不像 started_at/ended_at 會受船機時鐘影響，所以「多久沒回報」要用它算。
+    arrived_at: Optional[datetime] = None
     file_count: Optional[int] = None
     success: Optional[int] = None
     skipped: Optional[int] = None
@@ -85,6 +104,55 @@ class RunRecord:
     failed_list: List[str] = field(default_factory=list)
     warnings: List[str] = field(default_factory=list)
     errors: List[str] = field(default_factory=list)
+
+    @property
+    def clock_offset(self) -> Optional[float]:
+        """船機時鐘減岸端時鐘的秒數（正＝船機快）。缺任一邊回 None。
+
+        ended_at 是船機寫的最後一行、arrived_at 是這份 log 落到岸端的時刻，兩者之間
+        只隔一次 log 上傳（47 KB 的檔在船岸鏈路上是秒級），所以差值幾乎就是時鐘偏差。
+        """
+        if self.ended_at is None or self.arrived_at is None:
+            return None
+        return (self.ended_at - self.arrived_at).total_seconds()
+
+
+def format_clock_offset(seconds: Optional[float]) -> str:
+    """把偏差秒數寫成人看的字串（+ 代表船機快）。None → 破折號。"""
+    if seconds is None:
+        return "—"
+    sign = "+" if seconds >= 0 else "-"
+    secs = int(abs(seconds))
+    if secs < 60:
+        return f"{sign}{secs}秒"
+    if secs < 3600:
+        return f"{sign}{secs // 60}分"
+    if secs < 86400:
+        return f"{sign}{secs // 3600}時{(secs % 3600) // 60:02d}分"
+    return f"{sign}{secs // 86400}天"
+
+
+def clock_level(seconds: Optional[float]) -> str:
+    """偏差的嚴重度：ok / warn / bad。取不到（None）一律當 ok，不製造假警報。"""
+    if seconds is None:
+        return "ok"
+    magnitude = abs(seconds)
+    if magnitude > CLOCK_BAD_SECONDS:
+        return "bad"
+    if magnitude > CLOCK_WARN_SECONDS:
+        return "warn"
+    return "ok"
+
+
+def _median(values: List[float]) -> Optional[float]:
+    """中位數；空清單回 None。刻意不用 statistics.median —— 它對空清單會拋例外。"""
+    if not values:
+        return None
+    ordered = sorted(values)
+    mid = len(ordered) // 2
+    if len(ordered) % 2:
+        return ordered[mid]
+    return (ordered[mid - 1] + ordered[mid]) / 2
 
 
 @dataclass
@@ -100,6 +168,8 @@ class DeviceStatus:
     last_seen: Optional[datetime]
     is_stale: bool
     history: List[RunRecord] = field(default_factory=list)
+    # 最近 CLOCK_SAMPLE_RUNS 次執行的時鐘偏差中位數（正＝船機快）。無從判斷時為 None。
+    clock_offset: Optional[float] = None
 
     @property
     def display_status(self) -> str:
@@ -138,6 +208,11 @@ def _detect_mode(filename: str, start_direction: Optional[str]) -> str:
 def parse_log_file(path) -> Optional[RunRecord]:
     """解析單一 CSV log 檔為 RunRecord；檔案損壞/非本工具格式回傳 None。"""
     path = Path(path)
+    try:
+        arrived_at = datetime.fromtimestamp(path.stat().st_mtime)
+    except OSError:
+        # 檔案在掃描與解析之間被搬走/權限變更。少一個時鐘不該讓整份 log 解析失敗。
+        arrived_at = None
     device_name = ""
     version_info = ""
     started_at = None
@@ -220,6 +295,7 @@ def parse_log_file(path) -> Optional[RunRecord]:
         mode=_detect_mode(path.name, direction),
         started_at=started_at,
         ended_at=ended_at,
+        arrived_at=arrived_at,
         file_count=file_count,
         success=success,
         skipped=skipped,
@@ -316,13 +392,28 @@ def aggregate_by_device(
     stale_delta = timedelta(hours=stale_hours)
     devices: List[DeviceStatus] = []
     for (device_name, _mode), recs in groups.items():
+        # 排序與「多久沒回報」都以 arrived_at（我們這邊的鐘）為準，取不到才退回船機時間。
+        #
+        # 為什麼不能用 started_at：那是**船機**寫的時間戳，而 now 是**本機**的時鐘 ——
+        # 拿兩個不同的鐘相減，船機時鐘歪多少，過期判斷就錯多少。船隊實測有一台 IPC 快
+        # 8 小時、另一台曾經慢 150 天；前者會讓已經沉默 30 小時的裝置看起來只過了 22
+        # 小時（門檻 24 小時就漏報），後者會讓整台 IPC 永遠掛著假的「逾期未回報」。
+        # arrived_at 對 fleet_logs 是岸端伺服器的鐘、對本機 logs/ 就是本機的鐘，
+        # 兩者都與 now 同一個參考系。
         recs_sorted = sorted(
-            recs, key=lambda r: r.started_at or datetime.min, reverse=True
+            recs,
+            key=lambda r: r.arrived_at or r.started_at or datetime.min,
+            reverse=True,
         )
         latest = recs_sorted[0]
-        last_seen = latest.started_at
+        last_seen = latest.arrived_at or latest.started_at
         is_stale = last_seen is None or (now - last_seen) > stale_delta
         vessel, ipc, component = parse_device_name(device_name)
+        offsets = [
+            rec.clock_offset
+            for rec in recs_sorted[:CLOCK_SAMPLE_RUNS]
+            if rec.clock_offset is not None
+        ]
         devices.append(
             DeviceStatus(
                 device_name=device_name,
@@ -334,6 +425,7 @@ def aggregate_by_device(
                 last_seen=last_seen,
                 is_stale=is_stale,
                 history=recs_sorted,
+                clock_offset=_median(offsets),
             )
         )
 
@@ -365,6 +457,10 @@ class GroupSummary:
     stale: int = 0
     bad: int = 0
     worst: str = "success"  # 群內 display_status 最嚴重者
+    # 群內裝置時鐘偏差的中位數（正＝船機快）。時鐘是**機器**的屬性不是任務的屬性 ——
+    # 同一台 IPC 上的所有元件共用同一個鐘（實測歪掉時都是整台一起歪），所以這個值在
+    # IPC 層才是它真正的歸屬；vessel 層則是該船各 IPC 的綜合，用來在收合狀態下也看得到。
+    clock_offset: Optional[float] = None
 
 
 @dataclass
@@ -402,12 +498,18 @@ def _summarize(devices: List[DeviceStatus]) -> GroupSummary:
         sev = _SEVERITY.get(st, 0)
         if sev > worst_sev:
             worst_sev, s.worst = sev, st
+    s.clock_offset = _median([d.clock_offset for d in devices if d.clock_offset is not None])
     return s
 
 
 def group_is_problem(summary: GroupSummary) -> bool:
-    """群組是否含需關注的裝置（過期 / 失敗 / 中止 / 未完成）→ 預設展開。"""
-    return bool(summary.bad or summary.stale)
+    """群組是否含需關注的裝置（過期 / 失敗 / 中止 / 未完成 / 時鐘嚴重歪掉）→ 預設展開。
+
+    時鐘只在 **bad**（> 1 小時）才算問題，warn 不算：船隊實測 42% 的 IPC 偏差超過 5
+    分鐘，把 warn 也算進來等於預設展開將近一半的樹，那個畫面沒有人看得下去。超過 1
+    小時的只有 1%，而那個量級通常是時區設錯或 RTC 沒電 —— 值得一開畫面就攤在眼前。
+    """
+    return bool(summary.bad or summary.stale) or clock_level(summary.clock_offset) == "bad"
 
 
 def _group_sort_key(summary: GroupSummary, name: str):
@@ -609,17 +711,28 @@ def _counts_str(rec: RunRecord) -> str:
     return f"{rec.success}/{rec.skipped}/{rec.failed}"
 
 
-def _detail_str(dev: DeviceStatus) -> str:
+def _detail_str(dev: DeviceStatus, with_clock: bool = True) -> str:
+    """摘要欄。時鐘**嚴重**歪掉時擺在最前面，其餘情況不擠進來。
+
+    只有 bad（> 1 小時）才進摘要：warn 等級有 42% 的 IPC 命中，每列都掛一個標記會把
+    真正的錯誤訊息推到看不見的地方。warn 由群組節點的徽章與平坦模式的時鐘欄負責呈現。
+
+    `with_clock=False` 給**已經有專屬時鐘欄**的檢視用（TUI 平坦模式）：同一個值印兩次
+    只是把真正的訊息往右推。沒有那一欄的檢視（分群模式、CLI、HTML）維持預設。
+    """
     rec = dev.latest
+    prefix = ""
+    if with_clock and clock_level(dev.clock_offset) == "bad":
+        prefix = f"⏱時鐘{format_clock_offset(dev.clock_offset)} "
     if rec.abort_reason:
-        return f"中止：{rec.abort_reason}"
+        return f"{prefix}中止：{rec.abort_reason}"
     if rec.errors:
-        return rec.errors[-1]
+        return prefix + rec.errors[-1]
     if rec.status == "success" and dev.is_stale:
-        return "逾期未回報"
+        return f"{prefix}逾期未回報"
     if rec.warnings:
-        return rec.warnings[-1]
-    return ""
+        return prefix + rec.warnings[-1]
+    return prefix.rstrip()
 
 
 def device_detail_lines(dev: DeviceStatus) -> List[str]:
@@ -641,6 +754,15 @@ def device_detail_lines(dev: DeviceStatus) -> List[str]:
         lines.append(f"ERROR：{e}")
     for w in rec.warnings[-5:]:
         lines.append(f"WARNING：{w}")
+    if dev.clock_offset is not None:
+        # 明細面板刻意把兩個鐘都印出來：畫面上「最後執行」（船機寫的）與「距今」（依抵達
+        # 時間算的）在時鐘歪掉時會對不起來，這兩行就是那個落差的解釋。
+        lines.append(
+            f"抵達時間：{rec.arrived_at.strftime(TS_FMT) if rec.arrived_at else '—'}"
+            f"｜船機時鐘偏差：{format_clock_offset(dev.clock_offset)}"
+            f"（{'正常' if clock_level(dev.clock_offset) == 'ok' else '需注意'}，"
+            f"正值代表船機比岸端快）"
+        )
     lines.append(f"來源檔：{rec.path.name}｜歷史執行 {dev.run_count} 次")
     if len(dev.history) > 1:
         hist = "、".join(
@@ -938,6 +1060,12 @@ def _html_badges(summary: GroupSummary) -> str:
         parts.append(f'<span class="warn">過期 {summary.stale}</span>')
     if summary.bad:
         parts.append(f'<span class="bad">異常 {summary.bad}</span>')
+    level = clock_level(summary.clock_offset)
+    if level != "ok":
+        cls = "bad" if level == "bad" else "warn"
+        parts.append(
+            f'<span class="{cls}">⏱ 時鐘 {_esc(format_clock_offset(summary.clock_offset))}</span>'
+        )
     return '<span class="badge">' + " · ".join(parts) + "</span>"
 
 

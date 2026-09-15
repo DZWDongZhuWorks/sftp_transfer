@@ -14,7 +14,13 @@ import sys
 from pathlib import Path
 
 import version_stamp
-from downloader import SFTPDownloader, TransferCancelled, create_logger, diagnostic_message
+from downloader import (
+    DEFAULT_DELETE_SOURCE_MIN_AGE_MINUTES,
+    SFTPDownloader,
+    TransferCancelled,
+    create_logger,
+    diagnostic_message,
+)
 from settings import SETTINGS_PATH, PlaceholderError, load_settings
 from uploader import SFTPUploader
 
@@ -93,6 +99,25 @@ def build_parser():
         "--duplicate-suffix",
         help="duplicate-mode 為 duplicate 時，另存新檔用的檔名後綴（預設 copy，第二次更新起會自動加上流水號 copy1、copy2...）",
     )
+    parser.add_argument(
+        "--delete-source",
+        action="store_true",
+        help="每個檔案傳輸完成後刪除來源檔：download 模式刪遠端來源、upload 模式刪本地來源。"
+        "預設不啟用，適合日誌搬運類任務（搬走就不該再佔空間）；一般部署/同步流切勿開啟",
+    )
+    parser.add_argument(
+        "--delete-source-min-age-minutes",
+        type=float,
+        help="delete_source 的隔離期（分鐘，預設 10）：來源檔距上次修改不足這麼久就保留不刪。"
+        "擋的是「來源還在被寫入」——傳到一半的檔看起來就是個正常小檔，刪掉就沒了。"
+        "設 0 等於明確宣告來源已經沒有人在寫",
+    )
+    parser.add_argument(
+        "--delete-source-pattern",
+        action="append",
+        help="只刪檔名符合此 glob 的來源（可重複指定多次，任一命中就算符合；未指定＝不限）。"
+        "語意同 scheduler 的 cleanup_rules.json：比對檔名不比對路徑、區分大小寫、不支援 {a,b} 展開",
+    )
     return parser
 
 
@@ -133,6 +158,13 @@ def run_cli(args):
     wait_for_network = False if args.no_wait_network else bool(settings.get("wait_for_network", True))
     recursive = False if args.no_recursive else bool(settings.get("recursive", True))
     upload_log = True if args.upload_log else bool(settings.get("upload_log", False))
+    delete_source = True if args.delete_source else bool(settings.get("delete_source", False))
+    # 隔離期是安全護欄：未指定時走內建預設（10 分鐘），不是 0。
+    delete_source_min_age_minutes = _resolve(
+        args.delete_source_min_age_minutes, settings, "delete_source_min_age_minutes",
+        DEFAULT_DELETE_SOURCE_MIN_AGE_MINUTES,
+    )
+    delete_source_pattern = _resolve(args.delete_source_pattern, settings, "delete_source_pattern")
 
     missing = [
         name
@@ -190,6 +222,9 @@ def run_cli(args):
         duplicate_mode=duplicate_mode,
         upload_log=upload_log,
         log_remote_dir=log_remote_dir,
+        delete_source=delete_source,
+        delete_source_min_age_minutes=delete_source_min_age_minutes if delete_source else None,
+        delete_source_pattern=delete_source_pattern if delete_source else None,
     ))
     transfer_cls = SFTPUploader if mode == "upload" else SFTPDownloader
     transfer = transfer_cls(
@@ -211,6 +246,9 @@ def run_cli(args):
         remote_log_dir=log_remote_dir,
         duplicate_mode=duplicate_mode,
         duplicate_suffix=duplicate_suffix,
+        delete_source=delete_source,
+        delete_source_min_age_minutes=delete_source_min_age_minutes,
+        delete_source_pattern=delete_source_pattern,
         logger=logger,
         log_file=log_file,
     )

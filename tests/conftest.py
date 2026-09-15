@@ -107,6 +107,7 @@ class FakeSFTPClient:
         self.dirs = set()
         self.mkdir_calls = []
         self.chmod_calls = []   # 記錄 (path, mode),供保留權限相關測試檢查
+        self.remove_calls = []  # 記錄被刪除的遠端路徑,供 delete_source 相關測試檢查
         self.truncate_calls = []  # 記錄 (path, size),供續傳切回檢查點的測試檢查
         self.utime_calls = []   # 記錄 (path, (atime, mtime))
 
@@ -160,6 +161,14 @@ class FakeSFTPClient:
         self.truncate_calls.append((path, size))
         data = self.files[path]
         self.files[path] = data[:size] + b"\0" * max(0, size - len(data))
+
+    def remove(self, path):
+        """對應 paramiko.SFTPClient.remove：刪除遠端檔案（delete_source 用）。"""
+        path = path.rstrip("/")
+        if path not in self.files:
+            raise FileNotFoundError(f"No such file: {path}")
+        self.remove_calls.append(path)
+        del self.files[path]
 
     def chmod(self, path, mode):
         path = path.rstrip("/")

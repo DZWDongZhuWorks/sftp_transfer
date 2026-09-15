@@ -5,6 +5,7 @@
 """
 
 import csv
+import fnmatch
 import hashlib
 import json
 import logging
@@ -48,6 +49,13 @@ MANIFEST_FILENAME = ".sftp_download_manifest.json"
 #      過:開機時 update_booster 更新 reboot_launcher.sh，把正在跑的自己改掉而中斷開機）。
 # 暫存檔與目的檔同目錄,確保同一個檔案系統、rename 才具原子性。
 PART_SUFFIX = ".part"
+
+# delete_source 的預設隔離期（分鐘）。刪除只發生在「來源檔至少這麼久沒被改過」之後。
+# 為什麼預設不是 0：來源端很可能還有人在寫。岸端 sftp_logs 就是各船用 upload_log 推上去的，
+# 而 _upload_log_file 走 sftp.put 直寫最終檔名、沒有遠端 .part —— 傳到一半的 log 看起來就是個
+# 正常小檔，下載端無從分辨，拉到半截再把遠端刪掉，剩下的就永遠沒了。本地側同理（正在被寫入
+# 的 log）。10 分鐘是保守起手值，設 0 等於明確宣告「來源已經沒有人在寫」。
+DEFAULT_DELETE_SOURCE_MIN_AGE_MINUTES = 10
 SFTP_RETRY_EXCEPTIONS = (
     paramiko.SSHException,
     paramiko.SFTPError,
@@ -225,6 +233,9 @@ class SFTPBase:
         remote_log_dir=None,
         duplicate_mode="overwrite",
         duplicate_suffix="copy",
+        delete_source=False,
+        delete_source_min_age_minutes=DEFAULT_DELETE_SOURCE_MIN_AGE_MINUTES,
+        delete_source_pattern=None,
         logger=None,
         log_file=None,
     ):
@@ -249,6 +260,27 @@ class SFTPBase:
         self.remote_log_dir = remote_log_dir
         self.duplicate_mode = duplicate_mode or "overwrite"  # "duplicate"（另存新檔）或 "overwrite"（直接覆蓋，預設）
         self.duplicate_suffix = duplicate_suffix or "copy"
+        # 傳輸完畢後刪除來源檔（下載＝刪遠端、上傳＝刪本地）。預設關閉,只給日誌搬運類任務用:
+        # 那種任務的來源本來就該被搬走(搬完就不該再佔磁碟),而一般的部署/同步流一旦誤開,
+        # 刪掉的是來源真本。刪除只在該檔「目的地已有完整同一份」時才發生（見各子類別的
+        # _delete_*_source），失敗只警告不讓整個任務失敗 —— 內容已經送達,不該因清不掉而重跑。
+        self.delete_source = bool(delete_source)
+        # 隔離期：來源檔的 mtime 距今不足這麼久就保留不刪（見 DEFAULT_DELETE_SOURCE_MIN_AGE_MINUTES）。
+        # 值不合法時退回預設值而不是退回 0 —— 這是安全護欄，壞掉要往安全的方向倒。
+        if delete_source_min_age_minutes is None:
+            delete_source_min_age_minutes = DEFAULT_DELETE_SOURCE_MIN_AGE_MINUTES
+        try:
+            minutes = float(delete_source_min_age_minutes)
+        except (TypeError, ValueError):
+            minutes = DEFAULT_DELETE_SOURCE_MIN_AGE_MINUTES
+        self.delete_source_min_age = max(0.0, minutes) * 60.0
+        # 只刪檔名符合這些 glob 的來源（單一字串或字串清單，任一命中就算符合；空＝不限）。
+        # 語意刻意與 scheduler/script/cleanup_old_files.py 的 pattern 完全一致，讓船上兩套刪除
+        # 工具共用同一個心智模型：fnmatch 比對**檔名**不比對路徑、Linux 上區分大小寫、
+        # `*` 連隱藏檔一起命中、不支援大括號展開 {a,b}、也完全不是正則。
+        if isinstance(delete_source_pattern, str):
+            delete_source_pattern = [delete_source_pattern]
+        self.delete_source_pattern = [p for p in (delete_source_pattern or []) if p]
         self.logger = logger
         self.log_file = log_file
 
@@ -523,6 +555,39 @@ class SFTPBase:
         if not self.resume or not self._manifest_dirty:
             return
         self._save_manifest(local_root)
+
+    def _delete_source_kept_reason(self, rel_path, mtime_getter):
+        """來源檔該不該留下來？可以刪回傳 None，要留則回傳 (reason_code, 訊息)。
+
+        兩道可選的過濾，下載與上傳共用同一套判定：
+          1. delete_source_pattern —— 檔名 glob（語意同 cleanup_old_files.py，見 __init__）。
+          2. delete_source_min_age —— mtime 隔離期，擋掉「可能還在被寫入」的來源。
+
+        mtime 用 callable 傳進來而不是直接傳值：下載方向取遠端 mtime 可能得多打一次 stat，
+        而在船上的高延遲鏈路，每檔一次來回就是最主要的成本（見 _resolve_remote_attr）。
+        樣式先判、不符就直接留下，那一次 stat 根本不會發生。
+
+        取不到 mtime（伺服器沒帶這個欄位、stat 失敗）一律**保留**：判斷不了年紀時，
+        不刪是唯一安全的選擇。
+        """
+        name = rel_path.rsplit("/", 1)[-1]
+        if self.delete_source_pattern and not any(
+            fnmatch.fnmatch(name, pattern) for pattern in self.delete_source_pattern
+        ):
+            return ("pattern_not_matched", f"檔名不符合 delete_source_pattern，保留來源: {rel_path}")
+        if self.delete_source_min_age <= 0:
+            return None
+        mtime = mtime_getter()
+        if mtime is None:
+            return ("mtime_unknown", f"取不到來源修改時間，保留來源: {rel_path}")
+        age = time.time() - float(mtime)
+        if age < self.delete_source_min_age:
+            return (
+                "within_min_age",
+                f"來源檔距上次修改僅 {int(age)} 秒（隔離期 {int(self.delete_source_min_age)} 秒），"
+                f"可能還在被寫入，保留來源: {rel_path}",
+            )
+        return None
 
     def _hash_local_file(self, local_file):
         """計算本地端檔案目前內容的 SHA-256（只讀本機磁碟，不牽涉網路），
@@ -1061,6 +1126,72 @@ class SFTPDownloader(SFTPBase):
         os.replace(part_file, target_file)
         return "downloaded"
 
+    def _delete_remote_source(self, remote_file, rel_path, listed_attr=None):
+        """下載完成後刪除遠端來源檔（delete_source 啟用時）。回傳 "deleted"／"failed"／"kept"。
+
+        只在 _download_one_file 回報 downloaded／skipped 之後才呼叫 —— 兩者都代表本地已經有
+        一份完整的同一版內容（skipped 是比對過大小／版本紀錄的結果），刪掉遠端不會弄丟資料。
+        失敗只記警告：內容已經拿到手，不該因為清不掉來源而讓整個任務被判失敗、下一趟又全部重跑。
+
+        注意這會影響**所有**讀同一個遠端目錄的人（船隊共用來源目錄時，別船就再也拿不到了），
+        所以預設關閉，只該開在「這台機器是該來源唯一消費者」的日誌回收任務上。
+        """
+        def remote_mtime():
+            # 走訪時拿到的屬性夠用就不再多打一次 stat（慢鏈路上那一次來回就是主要成本）。
+            try:
+                attr = self._resolve_remote_attr(remote_file, listed_attr)
+            except (OSError, EOFError, paramiko.SSHException):
+                return None
+            return getattr(attr, "st_mtime", None)
+
+        kept = self._delete_source_kept_reason(rel_path, remote_mtime)
+        if kept is not None:
+            reason, summary = kept
+            self.logger.info(diagnostic_message(
+                "SOURCE_DELETE_SKIPPED",
+                summary,
+                direction="download",
+                reason=reason,
+                file=rel_path,
+                remote_file=remote_file,
+                action="keep_source",
+            ))
+            return "kept"
+        try:
+            self.sftp.remove(remote_file)
+        except FileNotFoundError:
+            # 已經不在了（別的任務先刪、或上一趟刪成功但還沒記錄）——目的已經達成。
+            self.logger.info(diagnostic_message(
+                "SOURCE_DELETED",
+                f"遠端來源檔已不存在，無需刪除: {rel_path}",
+                direction="download",
+                reason="already_absent",
+                file=rel_path,
+                remote_file=remote_file,
+                action="delete_source",
+            ))
+            return "deleted"
+        except (OSError, EOFError, paramiko.SSHException) as e:
+            self.logger.warning(diagnostic_message(
+                "SOURCE_DELETE_FAILED",
+                f"刪除遠端來源檔失敗（不影響已下載的內容）: {rel_path}: {format_exception(e)}",
+                direction="download",
+                file=rel_path,
+                remote_file=remote_file,
+                error=format_exception(e),
+                action="keep_source",
+            ))
+            return "failed"
+        self.logger.info(diagnostic_message(
+            "SOURCE_DELETED",
+            f"已刪除遠端來源檔: {rel_path}",
+            direction="download",
+            file=rel_path,
+            remote_file=remote_file,
+            action="delete_source",
+        ))
+        return "deleted"
+
     def _build_jobs(self):
         """把 remote_path / local_path 正規化成一組 (job_sources, local_root) 工作。
 
@@ -1095,6 +1226,7 @@ class SFTPDownloader(SFTPBase):
         multi_job = len(jobs) > 1  # 配對或依 basename 展開時皆為多組獨立工作
 
         downloaded, skipped, failed = 0, 0, []
+        deleted, kept, delete_failed = 0, 0, 0  # delete_source 啟用時才會動
         current_local_root = None  # 中止時要把哪一組工作的 manifest 寫回（見收尾的 finally）
         try:
             if self.wait_for_network:
@@ -1178,6 +1310,17 @@ class SFTPDownloader(SFTPBase):
                                 skipped += 1
                             else:
                                 downloaded += 1
+                            # _delete_remote_source 自己吞掉所有刪除錯誤、只記警告，刻意不讓它
+                            # 冒到下面的 except：刪不掉來源不是傳輸錯誤，不該觸發重連並把整個檔案
+                            # 重下一次（內容此時已經完整落地了）。
+                            if self.delete_source:
+                                outcome = self._delete_remote_source(remote_file, rel_path, listed_attr)
+                                if outcome == "deleted":
+                                    deleted += 1
+                                elif outcome == "kept":
+                                    kept += 1
+                                else:
+                                    delete_failed += 1
                             break
                         except PermissionError as e:
                             self.logger.error(diagnostic_message(
@@ -1263,12 +1406,21 @@ class SFTPDownloader(SFTPBase):
             if current_local_root is not None:
                 self._flush_manifest(current_local_root)
 
+        # 刪除統計接在「失敗 N」**之後**：monitor/log_monitor.py 與 run_selected_transfers.py
+        # 都用 re.search 抓到失敗數就停，後面接什麼都不影響它們解析。
+        tail = ""
+        if self.delete_source:
+            tail = f"，已刪除來源 {deleted}"
+            if kept:
+                tail += f"，保留 {kept}"
+            if delete_failed:
+                tail += f"，刪除失敗 {delete_failed}"
         if multi_job:
             self.logger.info(
-                f"=== 下載任務結束（{len(jobs)} 組）：成功 {downloaded}，略過 {skipped}，失敗 {len(failed)} ==="
+                f"=== 下載任務結束（{len(jobs)} 組）：成功 {downloaded}，略過 {skipped}，失敗 {len(failed)}{tail} ==="
             )
         else:
-            self.logger.info(f"=== 下載任務結束：成功 {downloaded}，略過 {skipped}，失敗 {len(failed)} ===")
+            self.logger.info(f"=== 下載任務結束：成功 {downloaded}，略過 {skipped}，失敗 {len(failed)}{tail} ===")
         if failed:
             self.logger.info("失敗清單：" + ", ".join(failed))
 

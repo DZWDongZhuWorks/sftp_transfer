@@ -449,6 +449,88 @@ class SFTPUploader(SFTPBase):
             self.logger.warning(f"設定遠端 {done_name} 權限/mtime 失敗(不影響上傳內容): {e}")
         return "uploaded"
 
+    def _delete_local_source(self, local_file, rel_path):
+        """上傳完成後刪除本地來源檔（delete_source 啟用時）。回傳 "deleted"／"failed"／"kept"。
+
+        只在 _upload_one_file 回報 uploaded／skipped 之後才呼叫 —— 兩者都代表遠端已經有一份
+        完整的同一版內容（skipped 是遠端大小與本地相同、且版本紀錄相符的結果），刪掉本地不會
+        弄丟資料。失敗只記警告：內容已經送達，不該因為清不掉來源而讓整個任務被判失敗。
+
+        刪成功時一併把該檔的版本紀錄移除。留著只會讓 manifest 隨著日誌檔名一直長大（來源檔
+        已經不在，那筆紀錄永遠不會再被比對到）。刪失敗則刻意保留，下一趟才會判定為「已完整
+        上傳」而直接略過、只重試刪除，不會把同一個檔再上傳一次。被過濾條件留下來的也保留紀錄，
+        道理相同：下一趟該檔已經夠舊時，會走「略過傳輸 → 刪除」這條路收掉。
+        """
+        # 絕不刪掉本次執行自己正在寫的 log：logs/ 就是最典型的來源目錄，而這個檔案在收尾時
+        # 還要被寫入（結束統計）與上傳（upload_log）。unlink 之後 handler 仍寫得進去，只是寫進
+        # 一個沒有名字的 inode，於是整趟的記錄安靜地消失 —— 最難查的那種故障。
+        if self.log_file and os.path.abspath(str(local_file)) == os.path.abspath(str(self.log_file)):
+            self.logger.info(diagnostic_message(
+                "SOURCE_DELETE_SKIPPED",
+                f"保留本次執行自己的 log，不刪除: {rel_path}",
+                direction="upload",
+                reason="active_log_file",
+                file=rel_path,
+                action="keep_source",
+            ))
+            return "kept"
+
+        def local_mtime():
+            try:
+                return local_file.stat().st_mtime
+            except OSError:
+                return None
+
+        kept = self._delete_source_kept_reason(rel_path, local_mtime)
+        if kept is not None:
+            reason, summary = kept
+            self.logger.info(diagnostic_message(
+                "SOURCE_DELETE_SKIPPED",
+                summary,
+                direction="upload",
+                reason=reason,
+                file=rel_path,
+                local_file=str(local_file),
+                action="keep_source",
+            ))
+            return "kept"
+        try:
+            os.remove(local_file)
+        except FileNotFoundError:
+            # 已經不在了（別的任務先刪、或 logrotate 搬走）——目的已經達成。
+            self.logger.info(diagnostic_message(
+                "SOURCE_DELETED",
+                f"本地來源檔已不存在，無需刪除: {rel_path}",
+                direction="upload",
+                reason="already_absent",
+                file=rel_path,
+                local_file=str(local_file),
+                action="delete_source",
+            ))
+        except OSError as e:
+            self.logger.warning(diagnostic_message(
+                "SOURCE_DELETE_FAILED",
+                f"刪除本地來源檔失敗（不影響已上傳的內容）: {rel_path}: {format_exception(e)}",
+                direction="upload",
+                file=rel_path,
+                local_file=str(local_file),
+                error=format_exception(e),
+                action="keep_source",
+            ))
+            return "failed"
+        else:
+            self.logger.info(diagnostic_message(
+                "SOURCE_DELETED",
+                f"已刪除本地來源檔: {rel_path}",
+                direction="upload",
+                file=rel_path,
+                local_file=str(local_file),
+                action="delete_source",
+            ))
+        if self._manifest.pop(rel_path, None) is not None:
+            self._manifest_dirty = True  # 收尾一次寫回，見 _flush_manifest
+        return "deleted"
+
     def _build_jobs(self):
         """把 local_path / remote_path 正規化成一組 (job_sources, remote_root) 工作。
 
@@ -496,6 +578,7 @@ class SFTPUploader(SFTPBase):
         multi_job = len(jobs) > 1  # 配對或依 basename 展開時皆為多組獨立工作
 
         uploaded, skipped, failed = 0, 0, []
+        deleted, kept, delete_failed = 0, 0, 0  # delete_source 啟用時才會動
         current_local_root = None  # 中止時要把哪一份 manifest 寫回（見收尾的 finally）
         try:
             if self.wait_for_network:
@@ -561,6 +644,17 @@ class SFTPUploader(SFTPBase):
                                     skipped += 1
                                 else:
                                     uploaded += 1
+                                # _delete_local_source 自己吞掉所有刪除錯誤、只記警告，刻意不讓它
+                                # 冒到下面的 except：刪不掉來源不是傳輸錯誤，不該觸發重連並把整個
+                                # 檔案重傳一次（內容此時已經完整送達遠端了）。
+                                if self.delete_source:
+                                    outcome = self._delete_local_source(local_file, rel_path)
+                                    if outcome == "deleted":
+                                        deleted += 1
+                                    elif outcome == "kept":
+                                        kept += 1
+                                    else:
+                                        delete_failed += 1
                                 break
                             except PermissionError as e:
                                 self.logger.error(diagnostic_message(
@@ -644,12 +738,21 @@ class SFTPUploader(SFTPBase):
             if current_local_root is not None:
                 self._flush_manifest(current_local_root)
 
+        # 刪除統計接在「失敗 N」**之後**：monitor/log_monitor.py 與 run_selected_transfers.py
+        # 都用 re.search 抓到失敗數就停，後面接什麼都不影響它們解析。
+        tail = ""
+        if self.delete_source:
+            tail = f"，已刪除來源 {deleted}"
+            if kept:
+                tail += f"，保留 {kept}"
+            if delete_failed:
+                tail += f"，刪除失敗 {delete_failed}"
         if multi_job:
             self.logger.info(
-                f"=== 上傳任務結束（{len(jobs)} 組）：成功 {uploaded}，略過 {skipped}，失敗 {len(failed)} ==="
+                f"=== 上傳任務結束（{len(jobs)} 組）：成功 {uploaded}，略過 {skipped}，失敗 {len(failed)}{tail} ==="
             )
         else:
-            self.logger.info(f"=== 上傳任務結束：成功 {uploaded}，略過 {skipped}，失敗 {len(failed)} ===")
+            self.logger.info(f"=== 上傳任務結束：成功 {uploaded}，略過 {skipped}，失敗 {len(failed)}{tail} ===")
         if failed:
             self.logger.info("失敗清單：" + ", ".join(failed))
 

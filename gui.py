@@ -449,6 +449,11 @@ class SFTPDownloaderGUI:
             remote_log_dir=self.remote_log_dir_var.get().strip() or None,
             duplicate_mode=self.duplicate_mode_var.get(),
             duplicate_suffix=self.duplicate_suffix_var.get().strip() or "copy",
+            # 刻意不做成勾選框：刪來源是不可逆的，只認設定檔明寫的 delete_source
+            # （與 ignore_file / retry_count 一樣由設定檔帶入，畫面上沒有對應欄位）。
+            delete_source=bool(self.settings.get("delete_source", False)),
+            delete_source_min_age_minutes=self.settings.get("delete_source_min_age_minutes"),
+            delete_source_pattern=self.settings.get("delete_source_pattern"),
             logger=logger,
             log_file=log_file,
         )

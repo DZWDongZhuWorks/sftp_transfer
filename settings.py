@@ -115,6 +115,12 @@ SETTINGS_TEMPLATE = {
     "log_dir": "logs",
     "duplicate_mode": "overwrite",
     "duplicate_suffix": "copy",
+    # 傳輸完畢後刪除來源檔：下載＝刪遠端來源、上傳＝刪本地來源。預設關閉，只給日誌搬運任務用。
+    "delete_source": False,
+    # 隔離期（分鐘）：來源檔距上次修改不足這麼久就保留不刪，擋掉「還在被寫入」的來源。
+    "delete_source_min_age_minutes": 10,
+    # 只刪檔名符合這些 glob 的來源（字串或字串陣列，空＝不限）。語意同 cleanup_old_files.py 的 pattern。
+    "delete_source_pattern": [],
 }
 
 

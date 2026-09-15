@@ -23,6 +23,7 @@ from typing import Dict, List, Optional, Tuple
 import argparse
 import csv
 import html
+import multiprocessing
 import os
 import re
 import subprocess
@@ -374,16 +375,71 @@ def _device_from_filename(filename: str) -> str:
     return stem or "unknown"
 
 
-def collect_logs(log_dir, mode: str = "all") -> List[RunRecord]:
+# 解析是這支工具唯一的重活：船隊實測 31,876 份 log（993 MB）單執行緒要 96 秒，而目錄
+# 走訪加 stat 只佔 0.7 秒 —— 幾乎全花在逐列剖析 CSV。那是純 CPU 的工作，GIL 讓 thread
+# 幫不上忙，只有 process pool 吃得到多核（本機 12 核實測 8 倍：6,000 份 18.9 秒 → 2.4 秒）。
+_PARALLEL_MIN_FILES = 200   # 更少的話，開 pool 的成本比省下來的還多
+_PARALLEL_MAX_WORKERS = 12  # 再多的邊際效益很小（12 核實測 8→2.75 秒、12→2.38 秒），記憶體卻線性增加
+_PARSE_CHUNK = 64           # 每個 worker 一次領這麼多份，攤掉 pickle 往返
+
+
+def _worker_count(total: int, workers: Optional[int] = None) -> int:
+    """要開幾個解析行程。workers 由呼叫端（測試）指定時一律照辦。"""
+    if workers is not None:
+        return max(1, int(workers))
+    if total < _PARALLEL_MIN_FILES:
+        return 1
+    return max(1, min(os.cpu_count() or 1, _PARALLEL_MAX_WORKERS))
+
+
+def _parse_all(paths: List[Path], workers: Optional[int] = None):
+    """依 paths 的順序產出每一份的解析結果（None ＝ 不是本工具的 log）。
+
+    用 fork 而不是 spawn：spawn 會在子行程重新 import 這個模組，而它同時是可執行腳本，
+    重新 import 等於再跑一次 argparse。fork 只有 Linux 有（船岸兩端都是 Ubuntu），
+    取不到就退回單執行緒 —— 結果一模一樣，只是慢。
+
+    pool 中途壞掉（worker 被 OOM killer 收掉之類）也一樣退回單執行緒把**剩下的**補完：
+    imap 保證順序，已經產出幾份就是已經走到哪裡，不會重複也不會漏。監視工具不該因為
+    平行化本身的意外而整個掛掉 —— 它的職責是把船隊狀態顯示出來。
+    """
+    done = 0
+    if _worker_count(len(paths), workers) > 1:
+        try:
+            ctx = multiprocessing.get_context("fork")
+        except ValueError:      # 平台沒有 fork
+            ctx = None
+        if ctx is not None:
+            try:
+                with ctx.Pool(_worker_count(len(paths), workers)) as pool:
+                    for rec in pool.imap(parse_log_file, paths, chunksize=_PARSE_CHUNK):
+                        done += 1
+                        yield rec
+            except Exception:   # noqa: BLE001 —— 平行化是最佳化，失敗就退回，不改結果
+                pass
+    for path in paths[done:]:
+        yield parse_log_file(path)
+
+
+def collect_logs(log_dir, mode: str = "all", progress=None,
+                 workers: Optional[int] = None) -> List[RunRecord]:
     """遞迴掃描 log_dir 下所有 *.csv，解析成 RunRecord 清單並依 mode 過濾。
 
     用 rglob 是為了涵蓋遠端 sftp_logs 下載後的巢狀結構
     （download/{vsl}/{ipc}/{component}/*.csv）；平面目錄（如既有 logs/）同樣適用。
+
+    progress(done, total) 每解析完一份呼叫一次，另在開工前先以 (0, total) 呼叫一次 ——
+    全船隊要跑十幾秒，呼叫端（TUI）得先知道總數才畫得出進度，否則畫面就是一片黑。
+    限流是呼叫端的事，這裡只如實回報。workers 只給測試指定，預設由 _worker_count 決定。
     """
     log_dir = Path(log_dir)
+    paths = sorted(log_dir.rglob("*.csv"))
+    if progress is not None:
+        progress(0, len(paths))
     records: List[RunRecord] = []
-    for path in sorted(log_dir.rglob("*.csv")):
-        rec = parse_log_file(path)
+    for done, rec in enumerate(_parse_all(paths, workers), start=1):
+        if progress is not None:
+            progress(done, len(paths))
         if rec is None:
             continue
         if mode != "all" and rec.mode != mode:

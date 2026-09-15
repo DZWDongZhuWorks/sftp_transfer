@@ -79,6 +79,55 @@ def test_load_tree_quiets_sync_output(tmp_path):
     sync.assert_called_once_with("sync.json", quiet=True)
 
 
+def test_load_tree_passes_progress_down_to_collect_logs(tmp_path):
+    """進度回呼要真的接到資料層，否則載入畫面永遠停在 0。"""
+    args = SimpleNamespace(
+        sync_config=None, log_dir=tmp_path, mode="all", stale_hours=24,
+        vessel=None, ipc=None, component=None, status="all",
+    )
+    seen = []
+    tui.load_tree(args, NOW, progress=lambda done, total: seen.append((done, total)))
+    assert seen == [(0, 0)]      # 空目錄也要先報一次總數
+
+
+# --- 載入畫面（全船隊要十幾秒，不能是一片黑）------------------------------
+def test_loading_line_shape():
+    assert tui.loading_line(0, 0, 0) == "沒有找到任何 log 檔"
+    # 前 1 秒不估剩餘時間：一開場的估值會從天文數字往下跳，比不寫還讓人不安
+    assert tui.loading_line(100, 31876, 0.4) == "解析 100/31,876 份 log（0%）｜已 0 秒"
+    assert tui.loading_line(12800, 31876, 5.0) == (
+        "解析 12,800/31,876 份 log（40%）｜已 5 秒｜剩約 7 秒"
+    )
+    # 解析完還要彙整、建樹，那段沒有進度可報
+    assert tui.loading_line(31876, 31876, 12.0) == "已解析 31,876 份 log，正在彙整…"
+
+
+def test_loading_bar_is_pure_ascii_and_clamped():
+    assert tui.loading_bar(0, 100, 12) == "[" + "-" * 10 + "]"
+    assert tui.loading_bar(50, 100, 12) == "[" + "#" * 5 + "-" * 5 + "]"
+    assert tui.loading_bar(100, 100, 12) == "[" + "#" * 10 + "]"
+    assert tui.loading_bar(999, 100, 12) == "[" + "#" * 10 + "]"   # 不會溢出
+    assert tui.loading_bar(1, 100, 2) == ""                        # 窄到畫不下就不畫
+    assert tui.disp_width(tui.loading_bar(3, 10)) == tui._LOADING_BAR_W
+
+
+def test_loading_progress_throttles_but_always_draws_first_and_last():
+    """回呼是每份 log 叫一次（全船隊 3 萬多次），不限流會把時間花在畫面上。"""
+    drawn = []
+    clock = [100.0]
+    with mock.patch.object(tui, "_draw_loading",
+                           side_effect=lambda _s, _d, done, total, _e: drawn.append(done)), \
+         mock.patch.object(tui.time, "monotonic", side_effect=lambda: clock[0]):
+        tick = tui._loading_progress(object(), "fleet_logs")
+        tick(0, 1000)                    # 總數剛數完：一定要畫
+        for done in range(1, 500):       # 同一瞬間的 499 次回呼只該畫第一次之後的 0 次
+            tick(done, 1000)
+        clock[0] += tui._LOADING_REDRAW_SEC + 0.01
+        tick(500, 1000)                  # 過了限流間隔才再畫一次
+        tick(1000, 1000)                 # 最後一次無論如何都要畫
+    assert drawn == [0, 500, 1000]
+
+
 def _html_args(tmp_path, html):
     return SimpleNamespace(
         sync_config=None, log_dir=tmp_path, mode="all", stale_hours=24,

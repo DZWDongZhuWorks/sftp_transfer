@@ -4,6 +4,7 @@
 不需網路：於 tmp_path 寫入含 BOM 的合成 CSV log，直接驗證解析、彙整與呈現。
 """
 import csv
+import multiprocessing
 import os
 from pathlib import Path
 import subprocess
@@ -689,6 +690,79 @@ def test_run_record_version_info_defaults_to_empty():
 
 
 # --- 船機時鐘偏差 ----------------------------------------------------------
+class TestParallelCollect:
+    """平行解析：只加快，不改結果（船隊實測 96 秒 → 12 秒）。"""
+
+    def _dir(self, tmp_path, n=12):
+        for i in range(n):
+            direction, verb = ("download", "下載") if i % 2 == 0 else ("upload", "上傳")
+            write_log(
+                tmp_path / ("%s_WH%03d_IPC-1_ecdis_%d.csv" % ("D" if i % 2 == 0 else "U", i, i)),
+                "WH%03d_IPC-1_ecdis" % i,
+                [("2026-09-15 10:00:00", "INFO", "=== SFTP %s任務開始 ===" % verb),
+                 ("2026-09-15 10:00:00", "INFO", "=== %s任務結束：成功 1，略過 0，失敗 0 ===" % verb)],
+            )
+        (tmp_path / "not_ours.csv").write_text("a,b\n1,2\n", encoding="utf-8")
+        return tmp_path
+
+    def test_parallel_and_sequential_agree(self, tmp_path):
+        """逐檔比對而不是只比數量：順序也要一致，aggregate 的穩定排序靠它。"""
+        d = self._dir(tmp_path)
+        assert collect_logs(d, workers=4) == collect_logs(d, workers=1)
+        assert collect_logs(d, mode="upload", workers=4) == collect_logs(d, mode="upload", workers=1)
+        assert len(collect_logs(d, workers=4)) == 12      # 非本工具的 CSV 仍被濾掉
+
+    def test_progress_reports_total_before_parsing_and_ends_at_total(self, tmp_path):
+        """呼叫端要先知道總數才畫得出進度條，所以開工前先報一次 (0, total)。"""
+        seen = []
+        d = self._dir(tmp_path)
+        collect_logs(d, progress=lambda done, total: seen.append((done, total)), workers=1)
+        assert seen[0] == (0, 13)                          # 12 份 log + 1 份不是我們的
+        assert seen[-1] == (13, 13)
+        assert [x for x, _ in seen] == sorted(x for x, _ in seen)   # 單調遞增
+
+    def test_falls_back_to_single_process_when_fork_is_unavailable(self, tmp_path):
+        """沒有 fork（或 pool 開不起來）只是慢，不能少解析任何一份。"""
+        d = self._dir(tmp_path)
+        expected = collect_logs(d, workers=1)
+        with mock.patch.object(multiprocessing, "get_context", side_effect=ValueError):
+            assert collect_logs(d, workers=4) == expected
+
+    def test_pool_failure_midway_finishes_the_rest(self, tmp_path):
+        """pool 中途壞掉就把剩下的補完 —— 監視工具不該因為最佳化本身而掛掉。"""
+        from monitor.log_monitor import _parse_all
+        d = self._dir(tmp_path)
+        paths = sorted(Path(d).rglob("*.csv"))
+
+        class _HalfBrokenPool:
+            def __init__(self, *a, **k):
+                pass
+
+            def __enter__(self):
+                return self
+
+            def __exit__(self, *a):
+                return False
+
+            def imap(self, func, items, chunksize=1):
+                for i, item in enumerate(items):
+                    if i == 3:
+                        raise OSError("worker 被收掉了")
+                    yield func(item)
+
+        ctx = mock.Mock(Pool=_HalfBrokenPool)
+        with mock.patch.object(multiprocessing, "get_context", return_value=ctx):
+            got = list(_parse_all(paths, workers=4))
+        assert got == [parse_log_file(p) for p in paths]    # 前 3 份出自 pool，其餘補完
+
+    def test_worker_count_scales_down_for_small_dirs(self):
+        from monitor.log_monitor import _worker_count, _PARALLEL_MIN_FILES, _PARALLEL_MAX_WORKERS
+        assert _worker_count(10) == 1                       # 開 pool 比自己解析還貴
+        assert _worker_count(_PARALLEL_MIN_FILES) >= 1
+        assert _worker_count(10_000) <= _PARALLEL_MAX_WORKERS
+        assert _worker_count(10, workers=3) == 3            # 呼叫端指定就照辦
+
+
 class TestClockOffset:
     """兩個獨立的鐘：CSV 時間戳是船機寫的，檔案 mtime 是岸端寫的。"""
 

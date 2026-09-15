@@ -1012,14 +1012,14 @@ def clamp_hscroll(max_width: int, view_w: int, hoff: int) -> int:
 # ---------------------------------------------------------------------------
 # 資料載入
 # ---------------------------------------------------------------------------
-def load_tree(args, now: datetime, sync_handler=None):
+def load_tree(args, now: datetime, sync_handler=None, progress=None):
     if getattr(args, "sync_config", None):
         if sync_handler is None:
             # 非 curses 呼叫仍不可讓 main.py 的輸出直接污染目前終端機。
             sync_logs(args.sync_config, quiet=True)
         else:
             sync_handler(args.sync_config)
-    records = collect_logs(args.log_dir, mode=args.mode)
+    records = collect_logs(args.log_dir, mode=args.mode, progress=progress)
     devices = aggregate_by_device(records, now=now, stale_hours=args.stale_hours)
     devices = _apply_filters(devices, args.vessel, args.ipc, args.component, args.status)
     return build_tree(devices)
@@ -1173,6 +1173,73 @@ def _sync_with_progress(stdscr, sync_config) -> bool:
         quiet=True,
         output_callback=show,
     )
+
+
+# 全船隊 31,876 份 log 平行解析要十幾秒，在那之前畫面上什麼都沒有 —— 看起來就像當掉。
+# 這一段的存在只為了「讓人看得出它在動」：總數、已解析、百分比與粗估剩餘時間。
+_LOADING_REDRAW_SEC = 0.2   # 每秒最多重畫 5 次：再密只是把時間花在畫面上
+_LOADING_BAR_W = 30
+
+
+def loading_line(done: int, total: int, elapsed: float) -> str:
+    """載入畫面那一行字（純函式）。
+
+    剩餘時間要等有樣本才估得準，所以前 1 秒不寫（一開場的估值會從天文數字往下跳，
+    比不寫還讓人不安）。解析完成後還要彙整、建樹，那段沒有進度可報，就直說在彙整。
+    """
+    if total <= 0:
+        return "沒有找到任何 log 檔"
+    if done >= total:
+        return f"已解析 {total:,} 份 log，正在彙整…"
+    pct = int(done * 100 / total)
+    text = f"解析 {done:,}/{total:,} 份 log（{pct}%）｜已 {int(elapsed)} 秒"
+    if done and elapsed >= 1:
+        text += f"｜剩約 {int(elapsed / done * (total - done))} 秒"
+    return text
+
+
+def loading_bar(done: int, total: int, width: int = _LOADING_BAR_W) -> str:
+    """純 ASCII 進度條：終端機字型不一定有方塊字，# 到哪裡都畫得出來。"""
+    if width <= 2:
+        return ""
+    inner = width - 2
+    filled = inner if total <= 0 else min(inner, int(done * inner / max(total, 1)))
+    return "[" + "#" * filled + "-" * (inner - filled) + "]"
+
+
+def _draw_loading(stdscr, log_dir, done: int, total: int, elapsed: float) -> None:
+    """載入專用畫面，形狀比照 _draw_sync：標題一行、內容一行、底部一行提示。"""
+    stdscr.erase()
+    maxy, maxx = stdscr.getmaxyx()
+    width = max(0, maxx - 1)
+    title = f" 正在讀取 {log_dir}…" if log_dir else " 正在讀取 log…"
+    _addstr(stdscr, 0, 0, fit_display(title, width)[0], curses.A_BOLD)
+    if maxy > 2:
+        _addstr(stdscr, 2, 0, fit_display(" " + loading_bar(done, total), width)[0])
+        _addstr(stdscr, 3, 0, fit_display(" " + loading_line(done, total, elapsed), width)[0])
+    if maxy > 1:
+        _addstr(stdscr, maxy - 1, 0,
+                pad_display(" 讀完自動進入監視畫面", width), curses.A_REVERSE)
+    stdscr.refresh()
+
+
+def _loading_progress(stdscr, log_dir):
+    """給 collect_logs 的進度回呼：限流後畫在 curses 上。
+
+    回呼是每解析完一份就叫一次（全船隊 3 萬多次），所以這裡要自己限流；但第一次
+    （done=0，總數剛數完）與最後一次一定畫，不然畫面會停在舊數字上。
+    """
+    started = time.monotonic()
+    last = [0.0]
+
+    def tick(done, total):
+        now = time.monotonic()
+        if done and done < total and (now - last[0]) < _LOADING_REDRAW_SEC:
+            return
+        last[0] = now
+        _draw_loading(stdscr, log_dir, done, total, now - started)
+
+    return tick
 
 
 def _attr(status):
@@ -1564,6 +1631,7 @@ def _main_loop(stdscr, args):
             args,
             now,
             sync_handler=lambda config: _sync_with_progress(stdscr, config),
+            progress=_loading_progress(stdscr, getattr(args, "log_dir", "")),
         )
         seed_expanded(tree, state)
         state.now = now

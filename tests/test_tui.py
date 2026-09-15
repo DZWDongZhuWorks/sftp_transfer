@@ -330,6 +330,92 @@ def test_parent_key():
     assert tui.parent_key(("M", "download")) is None
 
 
+def _two_vessel_tree(tmp_path):
+    """兩艘船、各兩台 IPC：分層展開才看得出「整層」與「單一支線」的差別。"""
+    return _tree(tmp_path, [
+        ("A_IPC-1_ecdis", "download", RECENT, 5, 0, 0),
+        ("A_IPC-2_radar", "download", RECENT, 5, 0, 0),
+        ("B_IPC-1_ecdis", "download", RECENT, 5, 0, 0),
+        ("B_IPC-2_radar", "download", RECENT, 5, 0, 0),
+    ])
+
+
+def test_expand_and_collapse_one_level_at_a_time(tmp_path):
+    tree = _two_vessel_tree(tmp_path)
+    st = tui.TuiState()
+    tui.seed_expanded(tree, st)  # 全健康 → 不預設展開
+
+    def kinds():
+        return sorted(set(r.kind for r in tui.flatten_tree(tree, st, NOW)))
+
+    assert tui.expanded_depth(st, tree) == 0 and kinds() == ["mode"]
+    assert tui.expand_level(st, tree) is True
+    assert tui.expanded_depth(st, tree) == 1 and kinds() == ["mode", "vessel"]
+    assert tui.expand_level(st, tree) is True
+    assert tui.expanded_depth(st, tree) == 2 and kinds() == ["ipc", "mode", "vessel"]
+    assert tui.expand_level(st, tree) is True
+    assert tui.expanded_depth(st, tree) == 3 and kinds() == ["device", "ipc", "mode", "vessel"]
+    assert tui.expand_level(st, tree) is False   # 已到底，不再有下一層
+
+    assert tui.collapse_level(st) is True
+    assert tui.expanded_depth(st, tree) == 2 and kinds() == ["ipc", "mode", "vessel"]
+    assert tui.collapse_level(st) is True
+    assert tui.collapse_level(st) is True
+    assert tui.expanded_depth(st, tree) == 0 and kinds() == ["mode"]
+    assert tui.collapse_level(st) is False      # 已全收
+
+
+def test_expand_level_keeps_manually_opened_branch(tmp_path):
+    # 手動點開一條支線之後按 E：那條支線要留著（只加不減），層數也不因它跳號
+    tree = _two_vessel_tree(tmp_path)
+    st = tui.TuiState()
+    deep = ("I", "download", "A", "IPC-1")
+    tui.reveal(st, deep + ("x",))   # 展開 deep 的祖先
+    st.expanded.add(deep)
+    assert tui.expanded_depth(st, tree) == 1   # 只有方向層是「整層展開」
+    tui.expand_level(st, tree)                 # 補齊船隻層
+    assert deep in st.expanded
+    assert tui.expanded_depth(st, tree) == 2   # 船隻層補滿後 IPC 層也剛好整層展開
+
+
+def test_collapse_level_drops_stale_keys(tmp_path):
+    # 船隊變動後留在 expanded 裡的舊 key 也要收得掉，否則「全部收合」永遠達不到
+    tree = _two_vessel_tree(tmp_path)
+    st = tui.TuiState()
+    tui.expand_all(st, tree)
+    st.expanded.add(("I", "download", "GONE", "IPC-9"))
+    while tui.collapse_level(st):
+        pass
+    assert st.expanded == set()
+
+
+def test_set_level_jumps_to_exact_depth(tmp_path):
+    tree = _two_vessel_tree(tmp_path)
+    st = tui.TuiState()
+    tui.expand_all(st, tree)
+    st.expanded.add(("I", "download", "GONE", "IPC-9"))
+
+    tui.set_level(st, tree, 1)                  # 跳層是絕對值：手動支線一併歸零
+    assert tui.expanded_depth(st, tree) == 1
+    assert ("I", "download", "GONE", "IPC-9") not in st.expanded
+    assert sorted(set(r.kind for r in tui.flatten_tree(tree, st, NOW))) == ["mode", "vessel"]
+
+    tui.set_level(st, tree, 3)
+    assert tui.expanded_depth(st, tree) == 3
+    tui.set_level(st, tree, 0)
+    assert st.expanded == set()
+    tui.set_level(st, tree, 9)                  # 超過最底層就停在最底層
+    assert tui.expanded_depth(st, tree) == 3
+
+
+def test_level_notice_names_the_current_depth(tmp_path):
+    tree = _two_vessel_tree(tmp_path)
+    st = tui.TuiState()
+    assert tui.level_notice(st, tree) == "展開層級：方向"
+    tui.set_level(st, tree, 3)
+    assert tui.level_notice(st, tree) == "展開層級：裝置"
+
+
 def test_key_action():
     # 【q 只關窗格，離開只走 Esc】連按 q 退好幾層之後，多出來的那一下會落在最外層；
     # q 若在那裡等於離開，整個監視畫面就這樣沒了。與 scheduler/dashboard 同一套規則。
@@ -342,7 +428,11 @@ def test_key_action():
     assert tui.key_action(curses.KEY_ENTER) == "enter"
     assert tui.key_action(curses.KEY_RIGHT) == "expand"
     assert tui.key_action(ord("/")) == "search"
-    assert tui.key_action(ord("E")) == "expand_all"
+    assert tui.key_action(ord("E")) == "expand_level"
+    assert tui.key_action(ord("C")) == "collapse_level"
+    assert tui.key_action(ord("0")) == "level_0"
+    assert tui.key_action(ord("3")) == "level_3"
+    assert tui.key_action(ord("4")) is None   # 只有三層群組，第四個數字沒有意義
     assert tui.key_action(ord("z")) is None
 
 
@@ -1187,7 +1277,7 @@ def test_footer_hint_and_body_height_follow_view():
     flat, grouped = tui.TuiState(flat=True), tui.TuiState()
     assert "f分群" in tui.footer_hint(flat) and "全展收" not in tui.footer_hint(flat)
     assert "o欄位/O升降" in tui.footer_hint(flat)
-    assert "E/C全展收" in tui.footer_hint(grouped) and "f平坦" in tui.footer_hint(grouped)
+    assert "E/C層展收" in tui.footer_hint(grouped) and "f平坦" in tui.footer_hint(grouped)
     # 平坦多一行凍結欄名
     assert tui.body_height(24, flat) == 20
     assert tui.body_height(24, grouped) == 21

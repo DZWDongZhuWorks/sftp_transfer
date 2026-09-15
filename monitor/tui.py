@@ -48,6 +48,10 @@ _SYNC_LINE_LIMIT = 20
 _ANSI_ESCAPE = re.compile(r"\x1b\[[0-?]*[ -/]*[@-~]")
 _ENTER_KEYS = (10, 13, curses.KEY_ENTER)
 _SORT_CYCLE = ["船隻名稱", "更新時間", "嚴重度", "裝置名稱", "版本", "時鐘偏差"]
+# 樹的群組層級：key 的第一格 ↔ 目錄層級（裝置是葉節點，沒有展開狀態）
+_GROUP_LEVELS = ("M", "V", "I")
+# 展到第 N 層時「看得到的最深一種列」，給 E/C/0～3 的提示用
+_LEVEL_LABEL = ("方向", "船隻", "IPC", "裝置")
 _MODE_ARROW = {"download": "↓", "upload": "↑"}
 # 版本欄寬：`0.10.0+811a5c3-dirty` 是目前最長的形狀（20 欄），塞不下就截斷 ——
 # 版號與 commit 前綴才是辨識用的，-dirty 被切掉仍看得出是哪一版。
@@ -493,6 +497,73 @@ def all_group_keys(tree) -> List[tuple]:
     return keys
 
 
+def group_keys_at(tree, level: int) -> List[tuple]:
+    """第 level 層（0＝方向、1＝船隻、2＝IPC）所有群組的 key。"""
+    if not 0 <= level < len(_GROUP_LEVELS):
+        return []
+    tag = _GROUP_LEVELS[level]
+    return [k for k in all_group_keys(tree) if k[0] == tag]
+
+
+def expanded_depth(state: TuiState, tree) -> int:
+    """「整層都展開」展到第幾層：0＝只剩方向列，3＝連裝置列都看得到。
+
+    只認整層：某一層有任何群組還收著就停在那裡。手動展開的單一支線不會讓層數跳號，
+    否則按一次 C 會把使用者辛苦點開的那條路一起收掉。
+    """
+    depth = 0
+    for lv in range(len(_GROUP_LEVELS)):
+        keys = group_keys_at(tree, lv)
+        if keys and all(k in state.expanded for k in keys):
+            depth = lv + 1
+        else:
+            break
+    return depth
+
+
+def expand_level(state: TuiState, tree) -> bool:
+    """往下展開一層（最淺的「還沒整層展開」那層）；已到底回 False。
+
+    只做加法：使用者先前手動展開的深層支線留著，E 不會把它們收回去。
+    """
+    for lv in range(len(_GROUP_LEVELS)):
+        keys = group_keys_at(tree, lv)
+        if not keys:
+            continue
+        if not all(k in state.expanded for k in keys):
+            state.expanded.update(keys)
+            return True
+    return False
+
+
+def collapse_level(state: TuiState) -> bool:
+    """收掉最深的那一層（含手動展開的支線）；已全部收合回 False。
+
+    依 state.expanded 的內容判斷而不看樹：船隊變動後留在集合裡的舊 key 也會一起收掉，
+    否則它們會讓「已全部收合」永遠達不到。
+    """
+    for lv in reversed(range(len(_GROUP_LEVELS))):
+        tag = _GROUP_LEVELS[lv]
+        keys = {k for k in state.expanded if k and k[0] == tag}
+        if keys:
+            state.expanded.difference_update(keys)
+            return True
+    return False
+
+
+def set_level(state: TuiState, tree, level: int) -> None:
+    """直接跳到第 level 層：淺於它的整層展開，其餘（含手動支線）一律收合。"""
+    level = max(0, min(len(_GROUP_LEVELS), level))
+    state.expanded.clear()
+    for lv in range(level):
+        state.expanded.update(group_keys_at(tree, lv))
+
+
+def level_notice(state: TuiState, tree) -> str:
+    """E/C/0～3 之後說一句「現在展到哪」——不然使用者只看得到畫面跳動。"""
+    return f"展開層級：{_LEVEL_LABEL[expanded_depth(state, tree)]}"
+
+
 def seed_expanded(tree, state: TuiState) -> None:
     """首次見到的群組：依 group_is_problem 設預設展開；已見過的保留用戶操作。"""
     def consider(key, summary):
@@ -669,10 +740,12 @@ def key_action(ch: int) -> Optional[str]:
         return "collapse"
     if ch in _ENTER_KEYS or ch == ord(" "):
         return "enter"
-    if ch == ord("E"):
-        return "expand_all"
+    if ch == ord("E"):                 # 一次一層，不是一次到底 —— 見 expand_level
+        return "expand_level"
     if ch == ord("C"):
-        return "collapse_all"
+        return "collapse_level"
+    if ord("0") <= ch <= ord("3"):     # 直接跳到某一層（0＝全收、3＝全展）
+        return "level_%d" % (ch - ord("0"))
     if ch == ord("p"):
         return "only_problem"
     if ch == ord("v"):
@@ -956,7 +1029,8 @@ _HELP_LINES = [
     "排序      o 循環欄位（船隻名稱 / 更新時間 / 嚴重度 / 裝置名稱 / 版本）、O 切換升降冪",
     "          預設 船隻名稱↓（分群模式下這欄排的是船群，其餘欄位排裝置列）",
     "          更新時間↑ 最久未更新在前（找失聯裝置）",
-    "全部      E 全部展開、C 全部收合（僅分群模式看得到效果）",
+    "分層展收  E 往下展一層、C 收掉最深一層；0～3 直接跳到 方向/船隻/IPC/裝置 層",
+    "          （僅分群模式看得到效果；E 只加不減，手動展開的支線會留著）",
     "版本      v 顯示/隱藏版本欄（該次傳輸的程式碼版本；沒宣告版號的專案顯示 —）",
     "          版本排序是把同版本的船聚在一起，不是比新舊（0.10.0 會排在 0.9.0 前）",
     "過濾      / 搜尋（Esc 清除）、m 循環方向、s 循環狀態、p 只看異常",
@@ -1164,7 +1238,7 @@ def footer_hint(state: TuiState) -> str:
     if state.flat:
         return (" ↑↓移動  Enter明細  f分群  o欄位/O升降  /搜尋  m方向  s狀態"
                 "  p異常  v版本  r重載  ?說明  Esc離開")
-    return (" ↑↓移動  Enter開合/明細  ←→收展  E/C全展收  f平坦  o/O排序"
+    return (" ↑↓移動  Enter開合/明細  ←→收展  E/C層展收  0-3跳層  f平坦  o/O排序"
             "  /搜尋  m方向  s狀態  p異常  v版本  r重載  ?說明  Esc離開")
 
 
@@ -1548,10 +1622,19 @@ def _main_loop(stdscr, args):
                     )
                 else:
                     toggle(state, r.key)
-        elif act == "expand_all":
-            expand_all(state, tree)
-        elif act == "collapse_all":
-            collapse_all(state)
+        elif act == "expand_level":
+            if not expand_level(state, tree):
+                state.notice = "已經展開到最底層（裝置）"
+            else:
+                state.notice = level_notice(state, tree)
+        elif act == "collapse_level":
+            if not collapse_level(state):
+                state.notice = "已經全部收合"
+            else:
+                state.notice = level_notice(state, tree)
+        elif act.startswith("level_"):
+            set_level(state, tree, int(act[len("level_"):]))
+            state.notice = level_notice(state, tree)
         elif act == "toggle_flat":
             toggle_flat(state)
         elif act == "sort_field":

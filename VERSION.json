@@ -1,7 +1,7 @@
 {
-  "version": "0.19.1",
-  "date": "2026-09-15",
-  "notes": "接續 0.19.0:時鐘徽章的 ⏱ 在終端機裡是變形的,改用 ⌚。【症狀】TUI 群組徽章與 CLI/TUI 摘要前綴的 ⏱(U+23F1)畫出來被橫向壓扁 —— 不是跟隔壁的字疊在一起,是字本身變形。【原因】U+23F1 的 east_asian_width 是「N」,終端機照這個只配給它 1 欄;但這台機器上有這個字的字型只有 Noto Color Emoji(fc-list :charset=23f1 只回它一個),那是方形的彩色字,方形塞進一格寬的格子就被壓扁。程式內部的 _char_width 管的是「它跟隔壁字的距離」,終端機配幾欄不看我們的算法 —— 所以先加一個空白那一版沒有用,只是在變形的字旁邊多留了一格。【改法】換成 east_asian_width 本來就是 W 的 ⌚(U+231A):終端機配 2 欄、字型也是方形,比例就對了,而且 unicodedata 與終端機對同一個字達成共識,_char_width 不必為它開特例(上一版試過的白名單一併拿掉)。徽章、摘要前綴、HTML 三處一致,符號後面保留一個空白(HTML 版本來就有)。_char_width 上方留註解說明:畫面上的符號只能挑 EAW=W 的表情符號,回報 N 的那些(⏱ U+23F1、🕰 U+1F570…)不能用,免得日後又換回去。驗證:pytest 651 條全過(徽章、摘要、HTML 三處斷言隨之更新);monitor/README.md 的範例一併改。",
+  "version": "0.19.2",
+  "date": "2026-09-16",
+  "notes": "新增 run_web_ota_gpg_prefix_download.sh:只抓 web OTA 的解包密鑰 gpg_prefix.txt 一個檔。【為什麼需要】web 的船端 OTA 工具自 2026-09 起由 share/scheduler 維護(tool/web-ota/),隨 scheduler 自更新散佈;但密鑰仍由 web 每次進版更新到岸端的 STANDARD/web_ota/ —— 兩條不同的岸端路徑。不補這一條,船上永遠收不到更新後的密鑰,全船隊的 web 更新會停在「解不開」。【為什麼不同步整個 STANDARD/web_ota/】那會連工具一起拉下來,與 tool/web-ota/ 變成兩份各自漂移的複本,而症狀是查問題的人跑到舊的那一份。downloader.py 的 _collect_remote_files 會先 stat 遠端路徑,不是目錄就只抓那一個檔(第 751-756 行),所以 remote_path 直接指到檔案即可,不必靠 ignore 規則去湊。【duplicate_mode=overwrite 而不是鏡像】overwrite 沒有刪除語意,某次抓取失敗時舊密鑰留在原地;若用會刪除的鏡像,密鑰在岸端短暫缺席就會讓全船隊下一輪一起變 needs_manual。【local_path 用 {nvme}】資料碟沒掛載時 _resolve_nvme() 中止該任務而不是 fallback 到主碟 —— 密鑰落在主碟上的話,資料碟船永遠讀不到。腳本比照其他 run_*_download.sh source _dev_guard.sh,所以 CLINK 上一律略過(實測 exit 0)。 config/scheduler_download_ignore.txt 補上 .web_ota_fingerprint:那是 update 相位寫在工具目錄裡的執行期產物。scheduler 自更新是 duplicate_mode=overwrite,萬一那個檔被發佈上岸,開發機的版號會蓋到全船隊,每艘船都以為 env 是最新的,組裝從此靜默不發生。無斜線的樣式在任意層級都比對得到(gitignore.py 的 anchored = \"/\" in body)。 【設定檔本身不在版控裡】config/ 整個被 .gitignore 擋掉(裡面有明碼帳密),它的散佈路徑是岸端同步 —— sftp_download_settings.json 是 STANDARD/share/sftp_transfer → \".\" recursive + overwrite,而 config/ **不在** sftp_download_ignore.txt 裡。所以那份設定要生效,得放上 STANDARD 的 config/。為了讓它在版控裡至少是可審的,內容寫在腳本檔頭。驗證:pytest 651 條全過;設定的 {nvme} 與 {vsl_name} 佔位符實機解析正確。",
   "stamp_exclude": [
     "*.whl"
   ]

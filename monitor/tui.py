@@ -197,8 +197,9 @@ def _badge(s, show_clock: bool = True) -> str:
     時鐘偏差只掛在 vessel / IPC 兩層（show_clock）：那是「一台機器一個鐘」的自然歸屬。
     mode 層是整支船隊，取最歪的那一台等於永遠都在報同一艘船，變成常駐雜訊。
 
-    船群那一列報的是「這艘船最歪的一台 IPC」而不是全船的典型值：這顆徽章的用途是在
-    收合狀態下把問題頂出來，只有一台 IPC 壞掉的船正是它要抓的（見 GroupSummary）。
+    IPC 那一列報的是那台機器**最新一筆** log 的偏差（不分是哪個 project），船群那一列
+    報的是「這艘船最歪的一台 IPC」而不是全船的典型值：這顆徽章的用途是在收合狀態下把
+    問題頂出來，只有一台 IPC 壞掉的船正是它要抓的（見 GroupSummary）。
     """
     parts = [f"裝置 {s.total}", f"正常 {s.ok}"]
     if s.stale:
@@ -347,10 +348,10 @@ def sort_devices(devices: list, key: str, desc: bool) -> list:
 
 
 def group_clock_magnitude(group) -> float:
-    """群組（船／IPC）的時鐘排序值：群內最歪那台機器的偏差絕對值。
+    """群組（船／IPC）的時鐘排序值：徽章上那個數字的絕對值。
 
-    summary.clock_offset 本身就是「群內最歪的那台」（見 log_monitor.GroupSummary），
-    這裡只是取絕對值 —— 理由同 sort_value：快 8 小時與慢 8 小時一樣糟。徽章、預設展開
+    summary.clock_offset 在 IPC 層是那台機器最新一筆 log 的偏差、在船層是底下最歪的那台
+    IPC（見 log_monitor.GroupSummary），這裡只是取絕對值 —— 理由同 sort_value：快 8 小時與慢 8 小時一樣糟。徽章、預設展開
     與這個排序因此看的是同一個數字，排到最前面的船，那一列的 ⌚ 就是它被排上來的原因。
 
     取不到偏差的群組當 0（＝正常），沿用「無從判斷就不製造警報」的一貫做法

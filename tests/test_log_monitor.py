@@ -789,16 +789,32 @@ class TestClockOffset:
         rec = RunRecord(path=Path("x.csv"), device_name="d", mode="download")
         assert rec.clock_offset is None
 
-    def test_device_offset_is_the_median_of_recent_runs(self, tmp_path):
-        """單次會被「上傳排隊」這種一次性延遲帶偏，中位數不會。"""
+    def test_device_offset_is_the_latest_run(self, tmp_path):
+        """校完時的下一份 log 就要翻正：偏差是階梯式的，舊樣本只會拖住畫面。
+
+        重現 WH322/IPC-1：連續歪 +8 小時，2026-09-16 校回 GMT 之後最新一筆只差 10 秒。
+        取中位數的話這裡會是 +8 小時，要再累積 6 次執行才翻面。
+        """
         for i, (ship, arrived) in enumerate([
-            ("2026-09-15 10:00:00", "2026-09-15 09:00:00"),   # +1h
-            ("2026-09-14 10:00:00", "2026-09-14 09:00:00"),   # +1h
-            ("2026-09-13 10:00:00", "2026-09-13 02:00:00"),   # +8h（異常值）
+            ("2026-09-13 02:26:33", "2026-09-12 18:25:48"),   # +8h
+            ("2026-09-13 16:57:48", "2026-09-13 08:57:13"),   # +8h
+            ("2026-09-16 14:48:23", "2026-09-16 14:48:34"),   # 校時後：-11 秒
         ]):
             self._log(tmp_path, "D_WH322_IPC-1_ecdis_%d.csv" % i, ship, arrived)
-        devices = aggregate_by_device(collect_logs(tmp_path), now=datetime(2026, 9, 15, 12), stale_hours=72)
-        assert devices[0].clock_offset == 3600.0
+        devices = aggregate_by_device(collect_logs(tmp_path), now=datetime(2026, 9, 16, 15), stale_hours=72)
+        assert devices[0].clock_offset == -11.0
+
+    def test_device_offset_falls_back_when_the_latest_run_has_no_clock(self, tmp_path):
+        """最新那筆缺一邊的鐘時往回找：一次 mtime 讀取失敗不該讓整台機器變成「—」。"""
+        records = [
+            RunRecord(path=Path("old.csv"), device_name="WH322_IPC-1_ecdis", mode="download",
+                      ended_at=datetime(2026, 9, 15, 10), arrived_at=datetime(2026, 9, 15, 9)),
+            RunRecord(path=Path("new.csv"), device_name="WH322_IPC-1_ecdis", mode="download",
+                      ended_at=None, arrived_at=datetime(2026, 9, 15, 11)),
+        ]
+        devices = aggregate_by_device(records, now=datetime(2026, 9, 15, 12), stale_hours=72)
+        assert devices[0].latest.path.name == "new.csv"      # 最新的仍然是它
+        assert devices[0].clock_offset == 3600.0             # 時鐘退回上一筆
 
     def test_stale_uses_arrival_not_the_ship_clock(self, tmp_path):
         """船機時鐘快 8 小時時，用船機時間算會少算 8 小時而漏報過期。"""

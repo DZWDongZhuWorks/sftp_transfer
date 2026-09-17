@@ -844,8 +844,10 @@ class TestClockOffset:
         (-45, "-45秒", "ok"),
         (299, "+4分", "ok"),          # 門檻是「超過」5 分鐘
         (301, "+5分", "warn"),
-        (-1800, "-30分", "warn"),
-        (3599, "+59分", "warn"),
+        (-600, "-10分", "warn"),
+        (1200, "+20分", "warn"),      # 門檻是「超過」20 分鐘
+        (1201, "+20分", "bad"),
+        (-1800, "-30分", "bad"),
         (28823, "+8時00分", "bad"),   # WH322 IPC-1 的真實形狀
         (-172800, "-2天", "bad"),
     ])
@@ -974,18 +976,34 @@ class TestClockOffset:
         vessel = self._fleet_with_one_broken_ipc(tmp_path)
         assert "⌚ 時鐘 +9時53分" in _html_badges(vessel.summary)
 
-    def test_warn_level_does_not_force_the_group_open(self, tmp_path):
-        """42% 的 IPC 都超過 5 分鐘門檻，warn 也算問題的話等於預設展開半棵樹。"""
+    def _warn_level_ipc(self, tmp_path, arrived):
         write_log(
             tmp_path / "D_WH271_IPC-1_ecdis_0.csv",
             "WH271_IPC-1_ecdis",
             [("2026-09-15 10:00:00", "INFO", "=== SFTP 下載任務開始 ==="),
              ("2026-09-15 10:00:00", "INFO", "=== 下載任務結束：成功 1，略過 0，失敗 0 ===")],
-            arrived_at="2026-09-15 09:30:00",   # 快 30 分鐘 → warn
+            arrived_at=arrived,
         )
         devices = aggregate_by_device(collect_logs(tmp_path), now=datetime(2026, 9, 15, 10), stale_hours=72)
-        ipc = build_tree(devices)[0].vessels[0].ipcs[0]
-        assert ipc.summary.clock_offset == 1800
+        return build_tree(devices)[0].vessels[0].ipcs[0]
+
+    def test_warn_level_does_not_force_the_group_open(self, tmp_path):
+        """41% 的 IPC 都超過 5 分鐘門檻，warn 也算問題的話等於預設展開半棵樹。"""
+        ipc = self._warn_level_ipc(tmp_path, "2026-09-15 09:50:00")   # 快 10 分鐘 → warn
+        assert ipc.summary.clock_offset == 600
         assert group_is_problem(ipc.summary) is False
+
+    def test_warn_level_still_shows_on_the_project_row(self, tmp_path):
+        """warn 也要進摘要欄:否則 IPC 徽章掛著 +20分、底下每個 project 卻一列都看不到。"""
         from monitor.log_monitor import _detail_str
-        assert _detail_str(ipc.devices[0]) == ""    # warn 不擠進摘要欄
+        ipc = self._warn_level_ipc(tmp_path, "2026-09-15 09:50:00")
+        assert _detail_str(ipc.devices[0]) == "⌚ 時鐘+10分"
+        # 平坦模式有專屬的時鐘欄，同一個值不印兩次
+        assert _detail_str(ipc.devices[0], with_clock=False) == ""
+
+    def test_bad_threshold_is_twenty_minutes(self, tmp_path):
+        """20 分鐘以上＝需要有人去看:群組預設展開。"""
+        ipc = self._warn_level_ipc(tmp_path, "2026-09-15 09:39:00")   # 快 21 分鐘 → bad
+        assert ipc.summary.clock_offset == 21 * 60
+        assert clock_level(ipc.summary.clock_offset) == "bad"
+        assert group_is_problem(ipc.summary) is True

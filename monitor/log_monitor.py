@@ -71,11 +71,11 @@ _SEVERITY = {"aborted": 4, "incomplete": 3, "partial": 3, "stale": 2, "success":
 #
 # 正值＝船機時鐘比岸端**快**。
 CLOCK_WARN_SECONDS = 300.0    # 5 分鐘：實測 p95 的單次偏差是 4 分鐘，正常的船不會誤報
-CLOCK_BAD_SECONDS = 3600.0    # 1 小時：這個量級通常是時區設錯或 RTC 沒電，不是漂移
+CLOCK_BAD_SECONDS = 1200.0    # 20 分鐘：超過這個量級就不是漂移能解釋的，要有人去看
 # 裝置層只看**最新一次**執行。時鐘偏差幾乎都是階梯式的（時區設錯、RTC 沒電、手動校時），
 # 不是連續漂移，所以校完之後舊樣本只會拖住畫面：WH322/IPC-1 在 2026-09-16 校回 GMT，最新
 # 一筆已經是 -9 秒，但最近 10 次的中位數仍是 +8時00分，要再跑 6 趟才翻面。改看最新一筆的
-# 代價是單次的上傳排隊延遲不再被磨掉 —— 那是分鐘級的雜訊，而門檻是 5 分鐘／1 小時，吃得下。
+# 代價是單次的上傳排隊延遲不再被磨掉 —— 那是分鐘級的雜訊，而門檻是 5 分鐘／20 分鐘，吃得下。
 
 
 # ---------------------------------------------------------------------------
@@ -616,9 +616,10 @@ def group_is_problem(summary: GroupSummary) -> bool:
     底下最歪的那台 IPC。所以一艘船只要有一台 IPC 的鐘現在是壞的，那艘船就會自己打開 ——
     否則它藏在收合的船群裡，誰也不會去點開；而校好之後下一份 log 就會自己收回去。
 
-    時鐘只在 **bad**（> 1 小時）才算問題，warn 不算：船隊實測 42% 的 IPC 偏差超過 5
-    分鐘，把 warn 也算進來等於預設展開將近一半的樹，那個畫面沒有人看得下去。超過 1
-    小時的只有 1%，而那個量級通常是時區設錯或 RTC 沒電 —— 值得一開畫面就攤在眼前。
+    時鐘只在 **bad**（> 20 分鐘）才算問題，warn 不算：船隊實測 41% 的 IPC 偏差超過 5
+    分鐘，把 warn 也算進來等於預設展開將近一半的樹，那個畫面沒有人看得下去。超過 20
+    分鐘的是 18%（門檻還是 1 小時時只有 0.3%），所以這個旋鈕轉緊一格，預設展開的船就
+    從 0 艘變成 21 艘 —— 調門檻時要一起看這個數字。
     """
     return bool(summary.bad or summary.stale) or clock_level(summary.clock_offset) == "bad"
 
@@ -845,17 +846,18 @@ def _counts_str(rec: RunRecord) -> str:
 
 
 def _detail_str(dev: DeviceStatus, with_clock: bool = True) -> str:
-    """摘要欄。時鐘**嚴重**歪掉時擺在最前面，其餘情況不擠進來。
+    """摘要欄。時鐘歪掉（warn 以上）時擺在最前面，正常則不擠進來。
 
-    只有 bad（> 1 小時）才進摘要：warn 等級有 42% 的 IPC 命中，每列都掛一個標記會把
-    真正的錯誤訊息推到看不見的地方。warn 由群組節點的徽章與平坦模式的時鐘欄負責呈現。
+    門檻以上一律進摘要，與群組徽章、平坦模式的時鐘欄同一條線 —— 否則會出現「IPC 徽章
+    掛著 +20分，底下四個 project 卻一列都看不到」的落差，而那個落差沒有人猜得到是門檻
+    造成的。代價是 warn 等級有 44% 的裝置列命中，摘要欄真正的錯誤訊息會被往右推一段。
 
     `with_clock=False` 給**已經有專屬時鐘欄**的檢視用（TUI 平坦模式）：同一個值印兩次
     只是把真正的訊息往右推。沒有那一欄的檢視（分群模式、CLI、HTML）維持預設。
     """
     rec = dev.latest
     prefix = ""
-    if with_clock and clock_level(dev.clock_offset) == "bad":
+    if with_clock and clock_level(dev.clock_offset) != "ok":
         prefix = f"⌚ 時鐘{format_clock_offset(dev.clock_offset)} "
     if rec.abort_reason:
         return f"{prefix}中止：{rec.abort_reason}"

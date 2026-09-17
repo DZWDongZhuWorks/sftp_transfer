@@ -72,8 +72,10 @@ _SEVERITY = {"aborted": 4, "incomplete": 3, "partial": 3, "stale": 2, "success":
 # 正值＝船機時鐘比岸端**快**。
 CLOCK_WARN_SECONDS = 300.0    # 5 分鐘：實測 p95 的單次偏差是 4 分鐘，正常的船不會誤報
 CLOCK_BAD_SECONDS = 3600.0    # 1 小時：這個量級通常是時區設錯或 RTC 沒電，不是漂移
-# 取最近幾次執行的中位數。單次會被「上傳排隊」這種一次性延遲帶偏，中位數不會。
-CLOCK_SAMPLE_RUNS = 10
+# 裝置層只看**最新一次**執行。時鐘偏差幾乎都是階梯式的（時區設錯、RTC 沒電、手動校時），
+# 不是連續漂移，所以校完之後舊樣本只會拖住畫面：WH322/IPC-1 在 2026-09-16 校回 GMT，最新
+# 一筆已經是 -9 秒，但最近 10 次的中位數仍是 +8時00分，要再跑 6 趟才翻面。改看最新一筆的
+# 代價是單次的上傳排隊延遲不再被磨掉 —— 那是分鐘級的雜訊，而門檻是 5 分鐘／1 小時，吃得下。
 
 
 # ---------------------------------------------------------------------------
@@ -145,25 +147,14 @@ def clock_level(seconds: Optional[float]) -> str:
     return "ok"
 
 
-def _median(values: List[float]) -> Optional[float]:
-    """中位數；空清單回 None。刻意不用 statistics.median —— 它對空清單會拋例外。"""
-    if not values:
-        return None
-    ordered = sorted(values)
-    mid = len(ordered) // 2
-    if len(ordered) % 2:
-        return ordered[mid]
-    return (ordered[mid - 1] + ordered[mid]) / 2
-
-
 def _worst_offset(values: List[float]) -> Optional[float]:
     """群組層的時鐘彙總：絕對值最大的那一個（保留正負號）。空清單回 None。
 
     比絕對值是因為快 8 小時與慢 8 小時一樣糟；回傳時保留正負號，畫面上才看得出是快是慢。
     等值時取先出現的那個，次序由資料層（devices 的既有排序）決定，結果才穩定。
 
-    單一裝置的偏差本身已是最近數次執行的中位數（見 aggregate_by_device），一次性的上傳
-    排隊延遲在那一層就被磨掉了，所以這裡取最大值不會被單次雜訊帶跑。
+    傳進來的是每台裝置**最新一次**執行的偏差（見 aggregate_by_device），所以這裡取最大值
+    等於「群內最歪的那台現在有多歪」；上傳排隊那種分鐘級的單次雜訊撐不到 1 小時的門檻。
     """
     worst: Optional[float] = None
     for v in values:
@@ -185,7 +176,7 @@ class DeviceStatus:
     last_seen: Optional[datetime]
     is_stale: bool
     history: List[RunRecord] = field(default_factory=list)
-    # 最近 CLOCK_SAMPLE_RUNS 次執行的時鐘偏差中位數（正＝船機快）。無從判斷時為 None。
+    # 最新一次執行的時鐘偏差（正＝船機快）。無從判斷時為 None。
     clock_offset: Optional[float] = None
 
     @property
@@ -481,11 +472,13 @@ def aggregate_by_device(
         last_seen = latest.arrived_at or latest.started_at
         is_stale = last_seen is None or (now - last_seen) > stale_delta
         vessel, ipc, component = parse_device_name(device_name)
-        offsets = [
-            rec.clock_offset
-            for rec in recs_sorted[:CLOCK_SAMPLE_RUNS]
-            if rec.clock_offset is not None
-        ]
+        # 時鐘取**最新一次**執行（見檔頭 CLOCK_* 的說明）。recs_sorted 是照 arrived_at
+        # ——岸端的鐘——排的，船機時鐘跳動不會弄亂「哪一筆最新」。最新那筆恰好缺一邊的鐘
+        # 時往回找：一次 mtime 讀取失敗不該讓整台機器的時鐘變成「—」。
+        clock_offset = next(
+            (rec.clock_offset for rec in recs_sorted if rec.clock_offset is not None),
+            None,
+        )
         devices.append(
             DeviceStatus(
                 device_name=device_name,
@@ -497,7 +490,7 @@ def aggregate_by_device(
                 last_seen=last_seen,
                 is_stale=is_stale,
                 history=recs_sorted,
-                clock_offset=_median(offsets),
+                clock_offset=clock_offset,
             )
         )
 

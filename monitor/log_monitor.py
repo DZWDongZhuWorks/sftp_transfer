@@ -148,19 +148,47 @@ def clock_level(seconds: Optional[float]) -> str:
 
 
 def _worst_offset(values: List[float]) -> Optional[float]:
-    """群組層的時鐘彙總：絕對值最大的那一個（保留正負號）。空清單回 None。
+    """vessel / mode 層的時鐘彙總：絕對值最大的那一個（保留正負號）。空清單回 None。
 
     比絕對值是因為快 8 小時與慢 8 小時一樣糟；回傳時保留正負號，畫面上才看得出是快是慢。
-    等值時取先出現的那個，次序由資料層（devices 的既有排序）決定，結果才穩定。
+    等值時取先出現的那個，次序由資料層（既有排序）決定，結果才穩定。
 
-    傳進來的是每台裝置**最新一次**執行的偏差（見 aggregate_by_device），所以這裡取最大值
-    等於「群內最歪的那台現在有多歪」；上傳排隊那種分鐘級的單次雜訊撐不到 1 小時的門檻。
+    傳進來的是**各台 IPC 的鐘**（見 _latest_offset），不是個別 project 的值 —— 一艘船
+    有幾個鐘就比幾個數字，「最糟的那台機器」才是這顆徽章要回答的問題。
     """
     worst: Optional[float] = None
     for v in values:
         if worst is None or abs(v) > abs(worst):
             worst = v
     return worst
+
+
+def _latest_offset(devices: List["DeviceStatus"]) -> Optional[float]:
+    """IPC 層的時鐘：整台機器**最新一筆** log 的偏差，不分它來自哪個 project。
+
+    鐘是**機器**的屬性，同一台 IPC 上的所有 project 讀的是同一個鐘，所以最有價值的樣本
+    就是最新的那一筆 —— 哪個 project 產生的不重要，哪一筆最新才重要。
+
+    為什麼這一層不跟 vessel 層一樣取最歪的：那會讓一個早就停擺的任務永遠代表這台機器。
+    WH322/IPC-1 的 shipboard_alert 停在 2026-09-04（那時這台機器確實歪 8 小時），同一台
+    機器的另外 8 個 project 在 2026-09-16 校時後都只差 10 秒 —— 取最歪的話，那台機器會
+    被一份兩週前的 log 永遠釘在紅色。vessel 層取最歪則仍然對：那一層比的是**不同機器**
+    的鐘，一艘船只要有一台歪掉就該被頂出來。
+
+    依 clock_sample_at（偏差樣本自己的抵達時間，岸端的鐘）排序，取不到的裝置略過。
+    """
+    newest: Optional[DeviceStatus] = None
+    for d in devices:
+        if d.clock_offset is None:
+            continue
+        if newest is None or _sample_key(d) > _sample_key(newest):
+            newest = d
+    return None if newest is None else newest.clock_offset
+
+
+def _sample_key(device: "DeviceStatus") -> datetime:
+    """_latest_offset 的排序鍵：樣本的抵達時間，缺席者排最後（datetime.min）。"""
+    return device.clock_sample_at or datetime.min
 
 
 @dataclass
@@ -178,6 +206,10 @@ class DeviceStatus:
     history: List[RunRecord] = field(default_factory=list)
     # 最新一次執行的時鐘偏差（正＝船機快）。無從判斷時為 None。
     clock_offset: Optional[float] = None
+    # 上面那個偏差是哪一刻的樣本（該筆 log 的 arrived_at，岸端的鐘）。IPC 層要在同一台
+    # 機器的多個 project 之間比「誰最新」，比的是這個而不是 latest —— 兩者只在退回上一筆
+    # 時會不同，但正是那時候不能拿錯。
+    clock_sample_at: Optional[datetime] = None
 
     @property
     def display_status(self) -> str:
@@ -475,9 +507,8 @@ def aggregate_by_device(
         # 時鐘取**最新一次**執行（見檔頭 CLOCK_* 的說明）。recs_sorted 是照 arrived_at
         # ——岸端的鐘——排的，船機時鐘跳動不會弄亂「哪一筆最新」。最新那筆恰好缺一邊的鐘
         # 時往回找：一次 mtime 讀取失敗不該讓整台機器的時鐘變成「—」。
-        clock_offset = next(
-            (rec.clock_offset for rec in recs_sorted if rec.clock_offset is not None),
-            None,
+        clock_sample = next(
+            (rec for rec in recs_sorted if rec.clock_offset is not None), None
         )
         devices.append(
             DeviceStatus(
@@ -490,7 +521,8 @@ def aggregate_by_device(
                 last_seen=last_seen,
                 is_stale=is_stale,
                 history=recs_sorted,
-                clock_offset=clock_offset,
+                clock_offset=None if clock_sample is None else clock_sample.clock_offset,
+                clock_sample_at=None if clock_sample is None else clock_sample.arrived_at,
             )
         )
 
@@ -522,13 +554,18 @@ class GroupSummary:
     stale: int = 0
     bad: int = 0
     worst: str = "success"  # 群內 display_status 最嚴重者
-    # 群內**最歪**那台機器的時鐘偏差（正＝船機快；保留正負號）。時鐘是**機器**的屬性
-    # 不是任務的屬性 —— 同一台 IPC 上的所有元件共用同一個鐘（實測歪掉時都是整台一起
-    # 歪），所以這個值在 IPC 層就是那台機器的鐘；vessel 層則是「這艘船最歪的一台」。
+    # 時鐘偏差（正＝船機快；保留正負號）。鐘是**機器**的屬性不是任務的屬性，所以兩層
+    # 兩種取法，各自回答不同的問題：
     #
-    # 取最歪而不是中位數：這個值的用途是**在收合狀態下把問題頂出來**（徽章、預設展開、
-    # 排序），中位數會反過來把它藏起來。實測 WH622 三台 IPC 只有 IPC-2 歪 +9時53分，
-    # 中位數是 -2 秒 —— 照中位數呈現，整艘船看起來完全正常，那台機器要展開兩層才找得到。
+    #   IPC 層  ＝ 這台機器**最新一筆** log 的偏差（_latest_offset），不分是哪個 project。
+    #             同一台機器的各 project 讀的是同一個鐘，所以問的是「它現在準不準」。
+    #   vessel 層＝ 底下**最歪的那台 IPC**（_worst_offset）。那一層比的是不同機器的鐘，
+    #             問的是「這艘船有沒有哪台歪掉」—— 一台壞掉就該在收合狀態下被頂出來。
+    #             實測 WH622 三台 IPC 只有 IPC-2 歪 +9時53分，取典型值的話整艘船看起來
+    #             完全正常，那台機器要展開兩層才找得到。
+    #
+    # mode 層沿用 vessel 的取法（最歪的那艘船），但畫面上刻意不顯示 —— 那是整支船隊，
+    # 永遠在報同一艘船，會變成常駐雜訊。
     clock_offset: Optional[float] = None
 
 
@@ -553,7 +590,8 @@ class ModeGroup:
     vessels: List[VesselGroup]
 
 
-def _summarize(devices: List[DeviceStatus]) -> GroupSummary:
+def _summarize(devices: List[DeviceStatus], clock_offset: Optional[float]) -> GroupSummary:
+    """狀態計數由群內裝置彙總；時鐘則由呼叫端按層級決定（見 GroupSummary.clock_offset）。"""
     s = GroupSummary(total=len(devices))
     worst_sev = -1
     for d in devices:
@@ -567,15 +605,16 @@ def _summarize(devices: List[DeviceStatus]) -> GroupSummary:
         sev = _SEVERITY.get(st, 0)
         if sev > worst_sev:
             worst_sev, s.worst = sev, st
-    s.clock_offset = _worst_offset([d.clock_offset for d in devices if d.clock_offset is not None])
+    s.clock_offset = clock_offset
     return s
 
 
 def group_is_problem(summary: GroupSummary) -> bool:
     """群組是否含需關注的裝置（過期 / 失敗 / 中止 / 未完成 / 時鐘嚴重歪掉）→ 預設展開。
 
-    時鐘看的是群內最歪那台（見 GroupSummary.clock_offset），所以一艘船只要有一台 IPC
-    的鐘壞掉，那艘船就會自己打開 —— 否則它藏在收合的船群裡，誰也不會去點開。
+    時鐘看的是 GroupSummary.clock_offset：IPC 層是那台機器最新一筆 log 的偏差、船層是
+    底下最歪的那台 IPC。所以一艘船只要有一台 IPC 的鐘現在是壞的，那艘船就會自己打開 ——
+    否則它藏在收合的船群裡，誰也不會去點開；而校好之後下一份 log 就會自己收回去。
 
     時鐘只在 **bad**（> 1 小時）才算問題，warn 不算：船隊實測 42% 的 IPC 偏差超過 5
     分鐘，把 warn 也算進來等於預設展開將近一半的樹，那個畫面沒有人看得下去。超過 1
@@ -611,17 +650,39 @@ def build_tree(devices: List[DeviceStatus]) -> List[ModeGroup]:
                     devs, key=lambda d: (-_SEVERITY.get(d.display_status, 0), d.component)
                 )
                 ipcs.append(
-                    IpcGroup(name=ipc, summary=_summarize(devs_sorted), devices=devs_sorted)
+                    IpcGroup(
+                        name=ipc,
+                        summary=_summarize(devs_sorted, _latest_offset(devs_sorted)),
+                        devices=devs_sorted,
+                    )
                 )
                 vessel_devices.extend(devs_sorted)
             ipcs.sort(key=lambda g: _group_sort_key(g.summary, g.name))
+            # 船層比的是**各台 IPC 的鐘**，不是個別 project 的值 —— 拿 vessel_devices 去比
+            # 會讓同一台機器上一個早就停擺的 project 代表那台機器（見 _latest_offset）。
             vessels.append(
-                VesselGroup(name=vessel, summary=_summarize(vessel_devices), ipcs=ipcs)
+                VesselGroup(
+                    name=vessel,
+                    summary=_summarize(
+                        vessel_devices,
+                        _worst_offset([g.summary.clock_offset for g in ipcs
+                                       if g.summary.clock_offset is not None]),
+                    ),
+                    ipcs=ipcs,
+                )
             )
             mode_devices.extend(vessel_devices)
         vessels.sort(key=lambda g: _group_sort_key(g.summary, g.name))
         mode_groups.append(
-            ModeGroup(mode=mode, summary=_summarize(mode_devices), vessels=vessels)
+            ModeGroup(
+                mode=mode,
+                summary=_summarize(
+                    mode_devices,
+                    _worst_offset([g.summary.clock_offset for g in vessels
+                                   if g.summary.clock_offset is not None]),
+                ),
+                vessels=vessels,
+            )
         )
     return mode_groups
 

@@ -873,6 +873,69 @@ class TestClockOffset:
         from monitor.log_monitor import _detail_str
         assert _detail_str(ipc.devices[0]).startswith("⌚ 時鐘+8時00分")
 
+    def test_ipc_takes_the_newest_log_across_projects_not_the_worst_one(self, tmp_path):
+        """IPC 層取整台機器**最新一筆**，不是最歪的那個 project。
+
+        WH322/IPC-1 的真實形狀：shipboard_alert 停在 2026-09-04（那時確實歪 8 小時），
+        同一台機器的 device_monitor_report 在 09-16 校時後只差 8 秒。取最歪的話，那台
+        機器會被一份兩週前的 log 永遠釘在紅色。
+        """
+        for comp, ship, arrived in (
+            ("shipboard_alert",      "2026-09-04 14:50:54", "2026-09-04 06:43:50"),  # +8時07分
+            ("device_monitor_report", "2026-09-16 18:09:35", "2026-09-16 18:09:43"),  # -8 秒
+        ):
+            write_log(
+                tmp_path / ("U_WH322_IPC-1_%s_0.csv" % comp),
+                "WH322_IPC-1_%s" % comp,
+                [(ship, "INFO", "=== SFTP 上傳任務開始 ==="),
+                 (ship, "INFO", "=== 上傳任務結束：成功 1，略過 0，失敗 0 ===")],
+                arrived_at=arrived,
+            )
+        devices = aggregate_by_device(collect_logs(tmp_path), now=datetime(2026, 9, 16, 19), stale_hours=72)
+        ipc = build_tree(devices)[0].vessels[0].ipcs[0]
+        assert ipc.summary.clock_offset == -8                    # 取最歪的話會是 +29224
+        assert clock_level(ipc.summary.clock_offset) == "ok"
+        # 那台停擺的 uploader 自己仍然誠實地掛著當時的偏差
+        worst = next(d for d in ipc.devices if d.component == "shipboard_alert")
+        assert worst.clock_offset == 8 * 3600 + 7 * 60 + 4
+
+    def test_vessel_compares_ipc_clocks_not_individual_projects(self, tmp_path):
+        """船層比的是**各台 IPC 的鐘**：IPC-1 上那份停擺的 log 不該代表整艘船。"""
+        rows = [
+            ("IPC-1", "shipboard_alert",       "2026-09-04 14:50:54", "2026-09-04 06:43:50"),
+            ("IPC-1", "device_monitor_report", "2026-09-16 18:09:35", "2026-09-16 18:09:43"),
+            ("IPC-2", "device_monitor_report", "2026-09-16 18:00:09", "2026-09-16 18:00:00"),
+        ]
+        for ipc, comp, ship, arrived in rows:
+            write_log(
+                tmp_path / ("U_WH322_%s_%s_0.csv" % (ipc, comp)),
+                "WH322_%s_%s" % (ipc, comp),
+                [(ship, "INFO", "=== SFTP 上傳任務開始 ==="),
+                 (ship, "INFO", "=== 上傳任務結束：成功 1，略過 0，失敗 0 ===")],
+                arrived_at=arrived,
+            )
+        devices = aggregate_by_device(collect_logs(tmp_path), now=datetime(2026, 9, 16, 19), stale_hours=72)
+        vessel = build_tree(devices)[0].vessels[0]
+        assert vessel.summary.clock_offset == 9                  # IPC-2 的 +9 秒最歪
+        assert clock_level(vessel.summary.clock_offset) == "ok"
+
+    def test_ipc_clock_sample_is_the_record_the_offset_came_from(self, tmp_path):
+        """排「誰最新」用的是偏差樣本自己的抵達時間，不是 latest —— 退回上一筆時兩者不同。"""
+        records = [
+            RunRecord(path=Path("a_old.csv"), device_name="WH322_IPC-1_aaa", mode="download",
+                      ended_at=datetime(2026, 9, 15, 10), arrived_at=datetime(2026, 9, 15, 9)),
+            RunRecord(path=Path("a_new.csv"), device_name="WH322_IPC-1_aaa", mode="download",
+                      ended_at=None, arrived_at=datetime(2026, 9, 15, 23)),   # 最新，但沒有鐘
+            RunRecord(path=Path("b.csv"), device_name="WH322_IPC-1_bbb", mode="download",
+                      ended_at=datetime(2026, 9, 15, 12, 0, 5), arrived_at=datetime(2026, 9, 15, 12)),
+        ]
+        devices = aggregate_by_device(records, now=datetime(2026, 9, 16), stale_hours=72)
+        aaa = next(d for d in devices if d.component == "aaa")
+        assert aaa.clock_offset == 3600                          # 退回上一筆
+        assert aaa.clock_sample_at == datetime(2026, 9, 15, 9)   # 樣本的時間，不是 23:00
+        ipc = build_tree(devices)[0].vessels[0].ipcs[0]
+        assert ipc.summary.clock_offset == 5                     # bbb 的樣本才是最新的
+
     def _fleet_with_one_broken_ipc(self, tmp_path):
         """WH622 的真實形狀：三台 IPC 只有 IPC-2 歪了將近 10 小時，另兩台差幾秒。"""
         for ipc, arrived in (

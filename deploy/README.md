@@ -175,6 +175,50 @@ python3 deploy/automation_health_check.py
 
 `deploy_offline.sh` 會優先使用船端的 `python3.10`，沒有時使用 `python3`。
 
+### 免人工輸入密碼（密碼檔）
+
+階段 A 有兩種密碼要人在鍵盤前輸入，性質完全不同：
+
+| 密碼 | 用在哪 | 船隊共用（隨 OTA） | 單機覆寫（OTA 碰不到） |
+| --- | --- | --- | --- |
+| 本機 `sudo` | A3 clink 遷移 / A4 docker 群組 / A4b polkit + GDM / A6 sudoers / A8 tmux | `config/deploy_sudo_pass.txt` | `~/.nssms_deploy_pass` |
+| 遠端主機 | A9 `ssh-copy-id`（照片同步金鑰，僅實體 IPC-2） | `config/deploy_remote_pass.txt` | `~/.nssms_remote_pass` |
+
+兩個位置都會找，**單機覆寫優先**；也可以用 `--sudo-pass-file` / `--ssh-pass-file`
+或 `NSSMS_SUDO_PASS_FILE` / `NSSMS_SSH_PASS_FILE` 直接指定。檔案不存在、或密碼都不
+對時，一律退回原本的人工輸入——這個功能只省打字，不改變任何一步該不該做。
+
+在**發布端（CLINK）**建立船隊共用的那一份：
+
+```bash
+mkdir -p config
+printf '%s\n' '主要密碼' '次要密碼' '另一台的密碼' > config/deploy_sudo_pass.txt
+chmod 600 config/deploy_sudo_pass.txt
+```
+
+sudo 密碼檔可以放**多組**密碼，一行一個（空白行略過），腳本由上往下逐個試到通過為
+止。船隊各機的帳密並不一致（有的機器有主／次兩組，有的機器帳號與密碼相同），多組候
+選讓同一份檔案能帶著跑完整批。遠端密碼檔**只取第一行**：`sudo -v` 試錯不花成本，而
+`ssh-copy-id` 試錯會真的去連遠端主機，多試幾次可能撞上對方的登入失敗鎖定。
+
+驗證（`--check-only` 也會驗密碼檔，而 `sudo -v` 不改變機器上的任何東西）：
+
+```bash
+./deploy/deploy_offline.sh --check-only
+```
+
+看到 `[ OK ] sudo 憑證已預先取得(第 N 組密碼)` 就表示整段階段 A 不會再問本機密碼。
+
+> **`config/` 是 git ignored，但會經 OTA 散佈。** CLINK 的 `config/` 會上傳到
+> `STANDARD/share/sftp_transfer/config`，再被各船下載覆蓋——這正是它被選為船隊共用
+> 位置的理由（改一次、全船隊都有），但也表示 `git diff` 乾淨不代表沒有東西要發佈。
+> 另外 SFTP 是鏡像語意、**權限會跟著傳**，所以發布端那一份務必是 `600`；存成 `664`
+> 的話整個船隊都會拿到 `664`（船上會自動收緊並警告，但該修的是源頭）。
+
+> **不要把密碼寫死在 `deploy_offline.sh` 裡。** 它在版本控制裡，而且全程 `tee` 進
+> `logs/`，而 `logs/` 會被 fleet log 收上岸——那兩個地方都刪不乾淨。密碼檔的內容只
+> 由一支臨時 askpass helper 讀取，不進命令列參數（`ps` 看得到），也不進任何一行記錄。
+
 ### 部署會留下哪些檔案
 
 `logs/` 下每次部署會多三份，三份的用途不同：

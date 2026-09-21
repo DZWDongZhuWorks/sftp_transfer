@@ -39,3 +39,10 @@ fleet_logs/
 .claude/
 .agents/
 .codex/
+
+# 部署用的密碼檔(deploy_offline.sh)。正式位置是 config/deploy_sudo_pass.txt 與
+# config/deploy_remote_pass.txt,而 config/ 上面那條就已經 ignore 掉整個目錄了
+# (注意:ignored 不等於不散佈 —— config/ 會經 OTA 傳到全船隊)。
+# 下面兩條只是保險:有人把密碼檔放到 repo 根目錄時仍然不會被 commit。
+.nssms_deploy_pass
+.nssms_remote_pass

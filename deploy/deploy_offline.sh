@@ -64,6 +64,33 @@
 #   ./deploy_offline.sh --check-only    # 驗證平台與 tmux payload，不安裝、不修改 HOME/systemd/dpkg
 #   ./deploy_offline.sh --venv /path/to/venv        # 自訂 venv 路徑
 #   ./deploy_offline.sh --python /path/python # 指定船端既有的 Python
+#   ./deploy_offline.sh --sudo-pass-file <路徑>  # 指定本機 sudo 的密碼檔
+#   ./deploy_offline.sh --ssh-pass-file  <路徑>  # 指定遠端主機(A9)的密碼檔
+#
+# 免人工輸入密碼(選用):
+#   階段 A 有兩種密碼要人在鍵盤前輸入 —— 本機 sudo(A3/A4/A4b/A6/A8)與遠端主機
+#   (A9 的 ssh-copy-id)。兩者都可以改由事先放好的密碼檔提供。沒指定路徑時依序找:
+#       1) ~/.nssms_deploy_pass          單機覆寫(OTA 碰不到，某一台特有的密碼放這)
+#       2) config/deploy_sudo_pass.txt   船隊共用(隨 OTA 散佈，改一次全船隊都有)
+#   遠端主機的對應是 ~/.nssms_remote_pass 與 config/deploy_remote_pass.txt。
+#   放好就會自動採用。檔案不存在、或密碼都不對時，一律退回原本的人工輸入 —— 這個
+#   功能只是省掉打字，不改變任何一步該不該做。
+#
+#   sudo 密碼檔可以放**多組**密碼,一行一個(空白行略過),腳本會由上往下逐個試到通過
+#   為止。船隊各機的帳密並不一致(有的機器有主/次兩組、有的機器帳號與密碼相同),多組
+#   候選讓同一份檔案能帶著跑完整批,不必每台改一次:
+#       mkdir -p config
+#       printf '%s\n' '主要密碼' '次要密碼' '另一台的密碼' > config/deploy_sudo_pass.txt
+#       chmod 600 config/deploy_sudo_pass.txt
+#   遠端密碼檔只取第一行 —— `sudo -v` 試錯不花成本,ssh-copy-id 試錯則會真的去連遠端,
+#   多試幾次可能撞上對方的登入失敗鎖定。
+#
+#   **config/ 在 git 是 ignored,但會經 OTA 散佈**(CLINK 的 config/ 上傳到 STANDARD,
+#   各船下載覆蓋)。所以放在那裡的密碼檔是「改一次、全船隊都有」,同時 git diff 乾淨
+#   也不代表沒有東西要發佈。SFTP 是鏡像語意、權限會跟著傳,所以發布端那一份務必是
+#   600 —— 存成 664 的話整個船隊都會拿到 664(船上會自動收緊並警告,但該修的是源頭)。
+#   **不要把密碼寫死在這支腳本裡**:它在版本控制裡,而且全程 tee 進 logs/(那個目錄會
+#   被 fleet log 收上岸)。密碼檔至少是 ignored 的、也不會被寫進任何一行記錄。
 #
 # 特性：
 #   * venv 安裝全程 --no-index，永不連 PyPI（階段 C 的 SFTP 下載另當別論）。
@@ -74,6 +101,8 @@
 #   * 全程輸出（stdout + stderr）逐字寫進 logs/deploy_offline_<時間>.log，與兩支巡檢器
 #     的 Markdown 報告放在同一個 logs/。報告記結果，這一份記過程；船上回報問題寄它。
 #   * tmux 依平台選用 Bionic/Jammy deb；缺 sudo 時安全停止，不使用 rootless 解包。
+#   * 密碼(若使用密碼檔)只經由 askpass helper 讀檔交給 sudo / ssh，絕不出現在命令列
+#     參數或輸出裡 —— 命令列參數 ps 看得到，而輸出會整份落進 logs/。
 # ---------------------------------------------------------------------------
 set -euo pipefail
 
@@ -112,6 +141,25 @@ TMUX_STATUS="未執行"
 # 照片同步金鑰的設定結果。同上：stage_summary 會讀它，而該 stage 在非 IPC-2 上會提早
 # return —— 雖然它 return 前一定已賦值，仍在 file scope 先給值，理由與 TMUX_STATUS 相同。
 SSH_KEY_STATUS="未執行"
+
+# --- 免人工輸入密碼(見下方「密碼檔」一節)----------------------------------
+# 空字串＝沒有指定，會依序找下面兩個預設位置；兩個都不存在時，行為與本功能加入前
+# 完全相同(照樣在終端機問)。
+SUDO_PASS_FILE="${NSSMS_SUDO_PASS_FILE:-}"
+SSH_PASS_FILE="${NSSMS_SSH_PASS_FILE:-}"
+# 船隊共用的那一份:config/ 在 git 是 ignored(.gitignore:26)，但**會經 OTA 散佈** ——
+# CLINK 的 config/ 會上傳到 STANDARD，再被各船下載覆蓋。所以放在這裡的密碼檔是
+# 「改一次、全船隊都有」，這正是它該在的位置(config/ 本來就放明碼密碼的設定檔)。
+FLEET_SUDO_PASS_FILE="${PROJECT_DIR}/config/deploy_sudo_pass.txt"
+FLEET_SSH_PASS_FILE="${PROJECT_DIR}/config/deploy_remote_pass.txt"
+# 單機覆寫:OTA 會覆蓋 config/，所以某一台特有的密碼要放在 OTA 碰不到的地方。
+# 這一份先試(見 sudo_auth_setup)——機器自己的設定贏過船隊共用的那份。
+LOCAL_SUDO_PASS_FILE="${HOME}/.nssms_deploy_pass"
+LOCAL_SSH_PASS_FILE="${HOME}/.nssms_remote_pass"
+ASKPASS_DIR=""            # mktemp -d 出來的 0700 目錄；EXIT 時整個刪掉
+SUDO_ASKPASS_HELPER=""    # 非空＝本機 sudo 走密碼檔
+SSH_ASKPASS_HELPER=""     # 非空＝A9 的 ssh-copy-id 走密碼檔
+MADE_ASKPASS=""           # make_askpass 的回傳值(見該函式:不能用命令替換取回)
 
 # --- 顏色輸出 --------------------------------------------------------------
 if [ -t 1 ]; then
@@ -194,8 +242,17 @@ start_transcript() {
   # $! 取到的是最外層那支 tee（stamp_lines 在內層程序替換裡，不影響這個值）。tee 收工
   # 時內層才會看到 EOF，所以等它就等於等整條鏈 —— 這也是下面只 wait 一個 PID 的理由。
   TRANSCRIPT_TEE_PID=$!   # bash >= 5.1 會把程序替換的 PID 放進 $!；舊版取不到就少了等待
-  trap stop_transcript EXIT
+  trap on_exit EXIT
 }
+
+# EXIT 要收的兩件事。askpass helper 先刪:它是密碼檔的替身,任何離開路徑(set -e 中止、
+# Ctrl-C、正常結束)都不該把它留在 /tmp。刪完才還原 fd 與等 tee —— 反過來的話,還原
+# fd 那一步若卡住,helper 就留下了。
+#
+# 這道 trap 由 start_transcript 與 sudo_auth_setup 各設一次(同一個 handler,重設無害):
+# 記錄檔開不起來時 start_transcript 會提早 return,那條路徑上仍然要有人負責刪 helper。
+# shellcheck disable=SC2317  # 由 trap ... EXIT 呼叫,shellcheck 看不到那條路徑
+on_exit() { askpass_cleanup; stop_transcript; }
 
 # shellcheck disable=SC2317  # 由上面的 trap ... EXIT 呼叫,shellcheck 看不到那條路徑
 stop_transcript() {
@@ -264,6 +321,240 @@ mutating() {  # $1... = 動作說明
   fi
 }
 
+# --- 密碼檔:免人工輸入 sudo 與遠端主機密碼 --------------------------------
+# 這支腳本原本有兩種密碼要人在鍵盤前輸入，性質完全不同:
+#   1) 本機 sudo    —— clink 遷移 / gpio / docker 群組 / polkit / GDM / sudoers / tmux
+#   2) 遠端主機密碼 —— 只有 A9 的 ssh-copy-id(照片同步金鑰，僅實體 IPC-2)
+# 兩者都可以改由事先放好的密碼檔提供，讓整段階段 A 不必有人守在鍵盤前一題一題打。
+#
+# 為什麼是密碼檔而不是寫死在這支腳本裡:這支腳本在版本控制裡，而且全程 tee 進 logs/
+# (那個目錄會被 fleet log 收上岸)。寫死等於把密碼寫進 commit 歷史與每一份部署記錄，
+# 而那兩個地方都刪不乾淨。密碼檔則是 ignored 的、也從不出現在任何一行輸出裡。
+#
+# 密碼檔本身仍然會散佈:預設位置之一的 config/ 雖然 git ignored，卻是隨 OTA 傳到全船
+# 隊的(那正是它被選為預設位置的理由 —— 改一次全船隊都有)。所以它的內容要當成「整個
+# 船隊共用的祕密」看待，單台機器特有的密碼請改放 $HOME 那一份，OTA 不會覆蓋它。
+#
+# 沒有密碼檔時一切行為與本功能加入前完全相同(照樣在終端機問)——這是刻意的:船上多數
+# 機器仍是一台一台人工部署，密碼檔是給「同一批機器要連續部署很多台」的場合用的。
+
+# 密碼檔能不能用。刻意嚴格:權限不對就拒用、退回人工輸入，而不是將就 —— 一個 0644 的
+# 密碼檔比「要多打一次密碼」危險得多，而這裡是唯一會發現它的時機。
+passfile_usable() {  # $1=路徑 $2=用途(訊息用) → rc 0=可用
+  local f="$1" what="$2" mode=""
+  [ -n "$f" ] || return 1
+  if [ ! -f "$f" ]; then
+    warn "找不到${what}密碼檔:$f(改為人工輸入)"
+    return 1
+  fi
+  if [ ! -O "$f" ]; then
+    warn "${what}密碼檔不屬於 $(id -un):$f(改為人工輸入)"
+    return 1
+  fi
+  mode="$(stat -c '%a' -- "$f" 2>/dev/null || true)"
+  # *00 ＝ 群組與其他人都沒有任何權限(600 / 400 / 700 都算)。
+  #
+  # 權限過寬時自動收緊，而不是拒用。理由是 OTA:SFTP 的上下載是鏡像語意，會把權限
+  # 一起帶過去(uploader 的 sftp.chmod / downloader 的 os.chmod)——所以發布端若不小心
+  # 存成 664，整個船隊會一起拿到 664 的密碼檔。與其讓每一台各自失敗，不如每一台各自
+  # 修好並說一聲;真正該修的是發布端那一份，訊息也這麼寫。
+  # 讀不到權限時一律拒用:寧可多打一次密碼，也不要在看不見的狀態下用它。
+  case "$mode" in
+    *00) ;;
+    "")  warn "無法判讀${what}密碼檔的權限:$f(改為人工輸入)"; return 1 ;;
+    *)   warn "${what}密碼檔權限過寬($mode):$f"
+         if [ "$CHECK_ONLY" -eq 1 ]; then
+           # --check-only 不改機器上的任何東西，連這個也不例外(見 mutating)。
+           warn "--check-only 不動它;正式部署時會自動收緊為 600。"
+         elif chmod 600 -- "$f" 2>/dev/null; then
+           ok "已把${what}密碼檔收緊為 600:$f"
+           warn "發布端(CLINK)那一份也要 chmod 600，否則下次 OTA 會再把 $mode 傳回來。"
+         else
+           warn "收緊權限失敗，改為人工輸入。請手動執行:chmod 600 $f"
+           return 1
+         fi ;;
+  esac
+  # 空檔等於沒有密碼。用管線判斷而不是 $(cat)，密碼才不會被放進任何一個變數 ——
+  # 變數會在 set -x 或往後某個 echo 裡漏出來。
+  if ! grep -q '[^[:space:]]' -- "$f"; then
+    warn "${what}密碼檔是空的:$f(改為人工輸入)"
+    return 1
+  fi
+  # 放在版本控制的目錄裡遲早會被 commit 上去。config/ 是唯一的例外:它整個目錄都在
+  # .gitignore 裡，而且本來就是放明碼密碼設定檔的地方。其餘位置一律警告(不擋 ——
+  # 那是操作者的機器、他的決定)。
+  case "$(readlink -m -- "$f")" in
+    "$PROJECT_DIR"/config/*) ;;
+    "$SHARE_DIR"/*)
+      warn "${what}密碼檔放在版本控制的目錄底下:$f"
+      warn "建議移到 $FLEET_SUDO_PASS_FILE(隨 OTA 散佈)或 \$HOME，避免被 commit。"
+      ;;
+  esac
+  return 0
+}
+
+# 密碼檔裡有幾個候選密碼(一行一個，空白行不算)。
+# 為什麼要多個候選:同一批船機的帳密並不一致 —— 有的機器有主/次兩組密碼，有的機器
+# 帳號與密碼相同。一台一台改檔案等於沒有省到事，所以改成「把船隊會用到的幾組都寫進
+# 同一份檔案，由腳本逐個試」，一份檔案就能帶著跑完整批。
+passfile_count() {  # $1=路徑
+  # grep -c 在「一行都沒有」時會印 0 **並且** 回非零，所以 `|| printf 0` 會印出兩個 0。
+  # 接住它但不補印，空字串再由下面那行補成 0 —— 呼叫端拿到的一定是個數字(它要拿去做
+  # 算術比較，空字串會讓 set -e 下的 [ ] 直接中止部署)。
+  local n; n="$(grep -c '[^[:space:]]' -- "$1" 2>/dev/null || true)"
+  printf '%s\n' "${n:-0}"
+}
+
+# 產生一支 askpass helper。它只做一件事:把密碼檔的第 N 個非空白行印出來。密碼本身
+# 不寫進 helper，helper 裡只有密碼檔的路徑 —— sudo/ssh 真的需要密碼時才去讀那個檔，
+# 所以密碼在檔案系統上仍然只有一份、只有一個權限要顧。
+# 順手去掉結尾的 CR:在 Windows 上編輯過的密碼檔會多一個，而那是最難查的一種「密碼
+# 明明是對的卻一直失敗」。
+#
+# 結果放進 MADE_ASKPASS 而不是印到 stdout:`h=$(make_askpass ...)` 會讓整個函式跑在
+# 子 shell 裡，於是它對 ASKPASS_DIR 的賦值不會回到這裡 —— 每呼叫一次就多一個 mktemp
+# 目錄，而 askpass_cleanup 只認得最後(其實是一個都不認得)那一個，helper 就留在 /tmp 了。
+make_askpass() {  # $1=密碼檔路徑 $2=helper 檔名 $3=第幾個候選(預設 1) → 結果放進 MADE_ASKPASS
+  if [ -z "$ASKPASS_DIR" ]; then
+    ASKPASS_DIR="$(mktemp -d "${TMPDIR:-/tmp}/nssms-askpass.XXXXXX")"
+    chmod 700 "$ASKPASS_DIR"
+  fi
+  local helper="${ASKPASS_DIR}/$2" nth="${3:-1}"
+  # helper 的內容全部是字面值，只有密碼檔路徑與候選序號靠 printf 帶進去(%q 轉義，
+  # 路徑含空白也不會壞)。密碼本身從不進入 helper，需要時才由它去讀那個檔。
+  {
+    printf '%s\n' '#!/usr/bin/env bash'
+    printf '%s\n' '# 由 deploy_offline.sh 產生；該腳本離開時連同上層目錄一起刪除。'
+    printf '%s\n' '# 印出密碼檔的第 N 個非空白行(去掉結尾的 CR，讓 Windows 上編過的檔也能用)。'
+    printf 'grep %q -- %q | sed -n %qp | tr -d %q\n' '[^[:space:]]' "$1" "$nth" '\r\n'
+  } >"$helper"
+  chmod 700 "$helper"
+  MADE_ASKPASS="$helper"
+}
+
+# shellcheck disable=SC2317  # 由 trap ... EXIT 呼叫,shellcheck 看不到那條路徑
+askpass_cleanup() {
+  [ -n "$ASKPASS_DIR" ] || return 0
+  rm -rf -- "$ASKPASS_DIR"
+  ASKPASS_DIR=""
+}
+
+# 預先取得 sudo 憑證。這是整個機制的關鍵:腳本裡每一處需要 root 的地方，判斷方式都是
+# `sudo -n true`(本檔與 install_tmux_offline.sh 皆然)—— 憑證一旦快取住，它們全部自動
+# 通過，一個呼叫點都不必改。
+#
+# 但 sudo 的 timestamp 預設只有 15 分鐘，而階段 A 中間夾著好幾題 [Y/n]，操作者慢一點
+# 就會超時。所以除了預先快取，成功時還會定義一個同名的 sudo 函式自動補上 -A(沒有
+# SUDO_ASKPASS 時 `sudo -A` 會直接失敗，所以這個函式只在成功時才定義)——超時後的那次
+# sudo 會再問一次 askpass，而不是回頭問終端機。export -f 讓子安裝器也吃得到同一套:
+# install_tmux_offline.sh / install_udisks_mount_policy.sh / install_gdm_autologin.sh
+# 都是 bash，而它們自己也會呼叫 sudo。
+#
+# 【--check-only 也會跑這一段】`sudo -v` 不改變機器上的任何東西(只動 sudo 自己的
+# timestamp)，而「密碼檔到底能不能用」正是 --check-only 該回答的問題之一 —— 帶著
+# 隨身碟去部署一整批之前，先在一台上用 --check-only 驗一次比什麼都值得。
+sudo_auth_setup() {
+  trap on_exit EXIT        # 記錄檔開不起來時 start_transcript 沒設成，這裡補一次
+  local files=() f total helper n
+
+  # 明確指定(參數或環境變數)就只用那一個:路徑打錯要當場看得見，不該安靜地改用別份。
+  # 沒指定時找兩個預設位置，單機覆寫排在船隊共用之前 —— 某一台有自己的密碼時，先試
+  # 對的那一組，不必先讓船隊共用那份白試一輪(每一次失敗都是遠端 auth log 上的一筆)。
+  if [ -n "$SUDO_PASS_FILE" ]; then
+    files=("$SUDO_PASS_FILE")
+  else
+    # 預設位置都不存在是常態(多數機器仍是一台一台人工部署)，不值得印一行警告。
+    if [ -e "$LOCAL_SUDO_PASS_FILE" ]; then files+=("$LOCAL_SUDO_PASS_FILE"); fi
+    if [ -e "$FLEET_SUDO_PASS_FILE" ]; then files+=("$FLEET_SUDO_PASS_FILE"); fi
+  fi
+  SUDO_PASS_FILE=""
+  [ "${#files[@]}" -gt 0 ] || return 0
+
+  for f in "${files[@]}"; do
+    passfile_usable "$f" "本機 sudo " || continue
+    total="$(passfile_count "$f")"
+    info "本機 sudo 密碼改由密碼檔提供:$f(${total} 組候選)"
+    n=1
+    while [ "$n" -le "$total" ]; do
+      make_askpass "$f" sudo-askpass.sh "$n"
+      helper="$MADE_ASKPASS"
+      export SUDO_ASKPASS="$helper"
+      # 這裡是**兩次**呼叫，不是一次寫錯:它們做的是兩件不同的事。
+      #
+      # 第一次帶 -k 是「試這一組對不對」。-k 讓 sudo 忽略既有快取，否則前一次 sudo 留
+      # 下的 timestamp 會讓任何一組密碼都「看起來成功」—— 密碼檔寫錯就要到 15 分鐘後
+      # 的某個 stage 中間才爆開，而那時 systemd 已經改了一半。逐組試也靠它:沒有 -k，
+      # 第二組會直接吃到第一組的快取。
+      #
+      # 第二次不帶 -k 是「把憑證真的存起來」。man sudo:-k 與其他選項併用時,sudo 會
+      # 忽略快取**而且不更新 timestamp** —— 所以只跑第一次的話,密碼驗過了卻沒有留下
+      # 任何憑證,後面每一處 `sudo -n true` 仍然會失敗(install_tmux_offline.sh:196、
+      # 本檔的 GDM/sudoers 探測都靠它判斷有沒有 root)。這個 bug 只有實跑才抓得到:
+      # 第一次呼叫的離開碼是 0,看起來一切正常。
+      #
+      # 2>/dev/null 蓋掉 sudo 的 "Sorry, try again" —— 試錯是預期行為，不是故障。
+      if command sudo -k -A -v 2>/dev/null; then
+        command sudo -A -v 2>/dev/null || true   # 建立 timestamp(見上)
+        ok "sudo 憑證已預先取得(第 ${n} 組密碼)，階段 A 不會再問本機密碼。"
+        SUDO_PASS_FILE="$f"
+        SUDO_ASKPASS_HELPER="$helper"
+        # 定義在函式內，但 bash 的函式定義一律是全域的 —— 於是「只有成功時才有這個函式」
+        # 這件事得以成立(沒有 SUDO_ASKPASS 時 `sudo -A` 會直接失敗，不能無條件定義)。
+        # shellcheck disable=SC2317
+        sudo() { command sudo -A "$@"; }
+        export -f sudo
+        return 0
+      fi
+      n=$((n + 1))
+    done
+    warn "$f 的 ${total} 組密碼都不適用於本機。"
+  done
+  # 全部落空。這裡刻意不中止部署:密碼檔只是省打字，不是必要條件。
+  warn "沒有可用的 sudo 密碼 —— 改為人工輸入。"
+  warn "(本機帳號是 $(id -un);船隊共用那份請確認含有它那一組，或改放 $LOCAL_SUDO_PASS_FILE。)"
+  unset SUDO_ASKPASS
+  command sudo -k 2>/dev/null || true   # 別把失敗的試錯狀態留給後面的 sudo -n 探測
+}
+
+# 遠端主機密碼(只給 A9 的 ssh-copy-id)。這裡只準備 helper，真正用它的是
+# run_ssh_key_installer —— 因為多數機器(非實體 IPC-2)根本走不到那一步。
+ssh_auth_setup() {
+  local files=() f
+  if [ -n "$SSH_PASS_FILE" ]; then
+    files=("$SSH_PASS_FILE")
+  else
+    if [ -e "$LOCAL_SSH_PASS_FILE" ]; then files+=("$LOCAL_SSH_PASS_FILE"); fi
+    if [ -e "$FLEET_SSH_PASS_FILE" ]; then files+=("$FLEET_SSH_PASS_FILE"); fi
+  fi
+  SSH_PASS_FILE=""
+  [ "${#files[@]}" -gt 0 ] || return 0
+
+  for f in "${files[@]}"; do
+    passfile_usable "$f" "遠端主機" || continue
+    # 遠端這邊只取第一組，也只用第一個可用的檔。sudo 那邊可以逐個試是因為 `sudo -v`
+    # 便宜又沒有副作用;ssh-copy-id 試錯則會真的去連遠端主機，多試幾次可能撞上對方的
+    # 登入失敗鎖定 —— 而那會連帶讓照片同步整個停擺，代價遠大於省下的一次輸入。
+    make_askpass "$f" ssh-askpass.sh 1
+    SSH_ASKPASS_HELPER="$MADE_ASKPASS"
+    SSH_PASS_FILE="$f"
+    info "遠端主機密碼改由密碼檔提供:$f(取第 1 組)"
+    return 0
+  done
+}
+
+# 階段 A 結束時收掉。兩個理由:
+#   * 階段 C 會把服務拉起來(reboot_launcher → tmux session)，那些行程會活很久 ——
+#     不該讓它們繼承一個指向暫存 helper 的 SUDO_ASKPASS，或一個被 export 的 sudo 函式。
+#   * helper 留著沒有用處:階段 A 之後不再有需要密碼的步驟(只剩 `sudo -n` 的唯讀探測)。
+# 憑證的 timestamp 不在這裡作廢 —— 那是 sudo 自己的 15 分鐘，行為與人工輸入時一致。
+sudo_auth_teardown() {
+  unset -f sudo 2>/dev/null || true
+  unset SUDO_ASKPASS
+  SUDO_ASKPASS_HELPER=""
+  SSH_ASKPASS_HELPER=""
+  askpass_cleanup
+}
+
 # --- 解析參數 --------------------------------------------------------------
 parse_args() {
   while [ $# -gt 0 ]; do
@@ -277,6 +568,8 @@ parse_args() {
       --no-launch)   RUN_LAUNCH=0 ;;
       --venv)        VENV_DIR="${2:?--venv 需要一個路徑參數}"; shift ;;
       --python)      PYTHON_BIN="${2:?--python 需要一個路徑參數}"; shift ;;
+      --sudo-pass-file) SUDO_PASS_FILE="${2:?--sudo-pass-file 需要一個路徑參數}"; shift ;;
+      --ssh-pass-file)  SSH_PASS_FILE="${2:?--ssh-pass-file 需要一個路徑參數}"; shift ;;
       -h|--help)     usage ;;
       *) err "未知參數：$1"; echo "執行 --help 查看用法" >&2; exit 2 ;;
     esac
@@ -1365,7 +1658,7 @@ stage_ssh_key() {
   fi
 
   mutating "產生 SSH 金鑰並複製公鑰到遠端主機"
-  run_rc bash "$SSH_KEY_INSTALLER"
+  run_ssh_key_installer
   SSH_KEY_RC="$RC"
   case "$SSH_KEY_RC" in
     0) ok "照片同步的免密碼登入已設定完成。"
@@ -1376,6 +1669,31 @@ stage_ssh_key() {
        warn "常見原因：遠端主機沒開機、IP 不符、密碼輸入錯誤。日後可重跑：bash $SSH_KEY_INSTALLER"
        SSH_KEY_STATUS="失敗（exit=$SSH_KEY_RC）" ;;
   esac
+}
+
+# 跑 install_setup_ssh_key.sh。沒有密碼檔時就是原本那一行(ssh-copy-id 自己去問人)。
+#
+# 有密碼檔時不能用「把密碼從 stdin 餵進去」—— ssh 不讀 stdin 的密碼，它自己開
+# /dev/tty。正規做法是 SSH_ASKPASS，但兩個平台的觸發條件不同，這裡兩邊都滿足:
+#   * OpenSSH >= 8.4(Jammy 是 8.9):SSH_ASKPASS_REQUIRE=force 就會用 askpass，有 tty 也算。
+#   * OpenSSH <  8.4(Bionic 是 7.6):只有「沒有控制終端機**且** DISPLAY 有值」才會用 ——
+#     所以用 setsid 把控制終端機拿掉，並補一個 DISPLAY。
+# setsid 要加 -w，否則它立刻回傳 0，安裝結果就永遠是「成功」(--wait 自 util-linux 2.24
+# 起有，Bionic/Jammy 都遠超過)。缺 setsid 時退回只靠 REQUIRE=force —— 在 Bionic 上
+# 那等於沒有密碼檔，所以會先說一聲。
+run_ssh_key_installer() {
+  if [ -z "$SSH_ASKPASS_HELPER" ]; then
+    run_rc bash "$SSH_KEY_INSTALLER"
+    return
+  fi
+  if command -v setsid >/dev/null 2>&1; then
+    run_rc env SSH_ASKPASS="$SSH_ASKPASS_HELPER" SSH_ASKPASS_REQUIRE=force \
+      DISPLAY="${DISPLAY:-:0}" setsid -w bash "$SSH_KEY_INSTALLER"
+  else
+    warn "缺少 setsid：只能靠 SSH_ASKPASS_REQUIRE=force(需要 OpenSSH 8.4 以上)。"
+    run_rc env SSH_ASKPASS="$SSH_ASKPASS_HELPER" SSH_ASKPASS_REQUIRE=force \
+      DISPLAY="${DISPLAY:-:0}" bash "$SSH_KEY_INSTALLER"
+  fi
 }
 
 # --- 是否於部署完成後立即執行完整啟動流程（只收集決定，執行在最後面） ------
@@ -2011,6 +2329,10 @@ main() {
   banner_and_preflight
 
   # ---- 階段 A：一次性人工設定（所有需要輸入的東西都在這一段）----
+  # 密碼檔(若有)在最前面就驗完:它決定後面那幾步要不要停下來問人。放這裡也讓「密碼
+  # 錯了」在任何系統變更之前就被說出來，而不是改到一半才卡住。
+  sudo_auth_setup
+  ssh_auth_setup
   announce_check_only
   stage_vessel_info                  # A1 身分檔（含殘留接管旗標的判讀）
   compute_identity                   # 由身分檔推導 DEPLOY_ROLE / DEPLOY_VSL_UPPER
@@ -2032,6 +2354,9 @@ main() {
   # 【--check-only 不宣告這件事】它沒有 venv 那段無人干預的長流程,操作者本來就在鍵盤前;
   # 而交船狀態那一段要問他「要不要一併跑完整狀態面板」。宣告了就會被 ask_yn 當場擋下。
   [ "$CHECK_ONLY" -eq 1 ] || NO_MORE_INPUT=1
+  # 密碼檔的任務到此為止:後面只剩 `sudo -n` 的唯讀探測，而階段 C 會拉起長命的服務 ——
+  # 不該讓它們繼承 SUDO_ASKPASS 或那個被 export 的 sudo 函式。
+  sudo_auth_teardown
 
   # ---- 階段 B：sftp_transfer 專屬 venv（離線、無人干預）----
   stage_wheelhouse_and_venv

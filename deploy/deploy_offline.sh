@@ -157,7 +157,9 @@ FLEET_SSH_PASS_FILE="${PROJECT_DIR}/config/deploy_remote_pass.txt"
 LOCAL_SUDO_PASS_FILE="${HOME}/.nssms_deploy_pass"
 LOCAL_SSH_PASS_FILE="${HOME}/.nssms_remote_pass"
 ASKPASS_DIR=""            # mktemp -d 出來的 0700 目錄；EXIT 時整個刪掉
-SUDO_ASKPASS_HELPER=""    # 非空＝本機 sudo 走密碼檔
+# 只有 ssh 這一條需要記住 helper 的路徑:它是由 run_ssh_key_installer 在呼叫安裝器時
+# 明確傳進去的(見該函式)。sudo 那一條不需要對應的變數 —— 它靠的是 export 出去的
+# SUDO_ASKPASS 與同名的 sudo 函式,沒有任何一處要回頭問「當初那支 helper 在哪」。
 SSH_ASKPASS_HELPER=""     # 非空＝A9 的 ssh-copy-id 走密碼檔
 MADE_ASKPASS=""           # make_askpass 的回傳值(見該函式:不能用命令替換取回)
 
@@ -497,7 +499,6 @@ sudo_auth_setup() {
         command sudo -A -v 2>/dev/null || true   # 建立 timestamp(見上)
         ok "sudo 憑證已預先取得(第 ${n} 組密碼)，階段 A 不會再問本機密碼。"
         SUDO_PASS_FILE="$f"
-        SUDO_ASKPASS_HELPER="$helper"
         # 定義在函式內，但 bash 的函式定義一律是全域的 —— 於是「只有成功時才有這個函式」
         # 這件事得以成立(沒有 SUDO_ASKPASS 時 `sudo -A` 會直接失敗，不能無條件定義)。
         # shellcheck disable=SC2317
@@ -550,7 +551,6 @@ ssh_auth_setup() {
 sudo_auth_teardown() {
   unset -f sudo 2>/dev/null || true
   unset SUDO_ASKPASS
-  SUDO_ASKPASS_HELPER=""
   SSH_ASKPASS_HELPER=""
   askpass_cleanup
 }

@@ -219,6 +219,54 @@ sudo 密碼檔可以放**多組**密碼，一行一個（空白行略過），�
 > `logs/`，而 `logs/` 會被 fleet log 收上岸——那兩個地方都刪不乾淨。密碼檔的內容只
 > 由一支臨時 askpass helper 讀取，不進命令列參數（`ps` 看得到），也不進任何一行記錄。
 
+### 每日自動補裝（`--unattended`）
+
+**OTA 只送程式碼，不送安裝動作。** `update_booster` 會把最新的這支腳本拉到船上，但沒有
+任何東西會去執行它；開機時的 `update_booster --apply-only` 也只重跑三支安裝器
+（`install_timers` / `install_autostart` / `install_services`）。所以**後續新增的、需要
+root 的一次性設定**——clink 遷移 + gpio 群組、docker 群組、udisks 掛載授權、GDM 自動
+登入、tmux 離線補齊、sudoers 白名單——永遠傳不到已部署的船上，除非有人再跑一次
+`deploy_offline.sh`。
+
+`--unattended` 補上這個缺口，由 scheduler 的 `nssms-deploy-reconcile.timer` 每天 07:30
+呼叫一次。它跑的是與人工部署**同一份** stage 清單，所以：
+
+> **日後新增一個安裝項目，只要在 `deploy_offline.sh` 裡加一個 stage，它就會隨 OTA 散到
+> 全船隊並自動套用。** 不需要改第二個地方。
+
+與人工部署的差異（其餘完全相同）：
+
+| 差異 | 理由 |
+| --- | --- |
+| 隱含 `--no-launch` | 絕不碰階段 C，也就不會去搶 launcher 的鎖 |
+| 跳過常駐服務 | `install_services.sh` 是**無條件 restart**，每天呼叫等於每天重啟 heartbeat / alarm-controller / board-server / button。那一項由開機時的 `update_booster` 負責（`nssms-reboot` 每 5 天，最壞 5 天內收斂） |
+| 跳過 `health_check.py` | 它會跑 pytest 與一次真正的 SFTP 連線測試，對每日排程太重 |
+| 不寫 transcript | 改由 unit 外層的 `lib/unit_log.sh` 輪替（每日 + 14 代）。每天一份 `deploy_offline_*.log` 沒有任何清理規則涵蓋，而那個目錄也不會被收上岸 |
+| 身分檔無效時中止 | 沒有身分就判不出實體 IPC，會在錯的機器上裝錯的東西 |
+| 單項失敗不中止整輪 | tmux 裝不起來、離線包不完整，都不該讓與它們無關的 sudoers、群組、polkit 一起停擺 |
+
+**離開碼**（這是岸上唯一看得到的訊號——船上的 `logs/` 不會被收上岸、journald 重開機就清空）：
+
+| 碼 | 意義 | 要修的是 |
+| --- | --- | --- |
+| 0 | 全部就緒或已補齊 | — |
+| 1 | 有項目做了但失敗 | 那支安裝器 |
+| 2 | 參數錯（例如與 `--check-only` 併用） | 呼叫端 |
+| 3 | 有項目因為拿不到 sudo 而沒做 | **密碼檔** |
+
+非 0 會讓 systemd 把 unit 標成 failed，而 `automation_health_check.py` 的
+`check_failed_units` 會把它撿起來。
+
+> **前提：密碼檔要先到船上。** 這個機制完全建立在 `config/deploy_sudo_pass.txt` 上（見
+> 上一節）。沒有它，reconcile 每天會空轉並以離開碼 3 結束。上線順序應該是：先確認密碼檔
+> 已隨 OTA 送達，再放 timer。
+
+手動跑一次（會真的補裝，不是演習）：
+
+```bash
+bash deploy/deploy_offline.sh --unattended
+```
+
 ### 部署會留下哪些檔案
 
 `logs/` 下每次部署會多三份，三份的用途不同：

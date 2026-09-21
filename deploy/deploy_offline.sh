@@ -66,8 +66,39 @@
 #   ./deploy_offline.sh --python /path/python # 指定船端既有的 Python
 #   ./deploy_offline.sh --sudo-pass-file <路徑>  # 指定本機 sudo 的密碼檔
 #   ./deploy_offline.sh --ssh-pass-file  <路徑>  # 指定遠端主機(A9)的密碼檔
+#   ./deploy_offline.sh --unattended             # 每日自動補裝（由 timer 呼叫，見下）
 #
-# 免人工輸入密碼(選用):
+# 每日自動補裝(--unattended):
+#   OTA 只送程式碼，不送安裝動作。update_booster 會把最新的這支腳本拉到船上，但沒有
+#   任何東西會去執行它;開機時的 `update_booster --apply-only` 也只重跑三支安裝器
+#   (install_timers / install_autostart / install_services)。所以**後續新增的、需要
+#   root 的一次性設定**——clink 遷移 + gpio 群組、docker 群組、udisks 掛載授權、
+#   GDM 自動登入、tmux 離線補齊、sudoers 白名單——永遠傳不到已部署的船上,除非有人
+#   再跑一次這支腳本。`stage_scheduler_units` 那段 sudoers 的歷史教訓就是這個形狀。
+#
+#   --unattended 就是那個缺口的補丁,由 scheduler 的 nssms-deploy-reconcile.timer
+#   每天呼叫一次。它與人工部署跑的是**同一份** stage 清單 —— 所以日後新增一個安裝
+#   項目,只要在這支腳本裡加一個 stage,它就會隨 OTA 散到全船隊並自動套用。
+#
+#   與人工部署的差異(其餘完全相同):
+#     * 隱含 --no-launch:絕不碰階段 C(啟動流程),也就不會去搶 launcher 的鎖
+#     * 跳過常駐服務:install_services.sh 是無條件 restart,每天呼叫等於每天重啟
+#       heartbeat / alarm-controller / board-server / button。那一項由開機時的
+#       update_booster 負責(nssms-reboot 每 5 天,最壞 5 天內收斂)
+#     * 跳過 health_check.py(它跑 pytest 與真正的 SFTP 連線,對每日排程太重)
+#     * 不寫 transcript:改由 unit 外層的 lib/unit_log.sh 輪替(每日 + 14 代)
+#     * 身分檔無效時中止:沒有身分就判不出實體 IPC,會在錯的機器上裝錯的東西
+#     * 單項失敗不中止整輪(tmux、preflight)——記錄下來,其餘照巡
+#
+#   離開碼:
+#     0  全部就緒或已補齊
+#     1  有項目做了但失敗(要修的是那支安裝器)
+#     2  參數錯(例如與 --check-only 併用)
+#     3  有項目因為拿不到 sudo 而沒做(要修的是密碼檔,見下一節)
+#   非 0 會讓 systemd 把 unit 標成 failed —— 那是岸上唯一看得到的訊號,因為船上的
+#   logs/ 不會被收上岸、journald 重開機就清空。
+#
+# 免人工輸入密碼(選用,但 --unattended 依賴它):
 #   階段 A 有兩種密碼要人在鍵盤前輸入 —— 本機 sudo(A3/A4/A4b/A6/A8)與遠端主機
 #   (A9 的 ssh-copy-id)。兩者都可以改由事先放好的密碼檔提供。沒指定路徑時依序找:
 #       1) ~/.nssms_deploy_pass          單機覆寫(OTA 碰不到，某一台特有的密碼放這)
@@ -128,6 +159,16 @@ PYTHON_BIN=""          # 空字串＝自動偵測（優先 python3.10，其次 p
 # 以 --skip-tests 關閉：不裝測試套件，且轉傳 --skip-tests 讓 health_check 略過。
 INSTALL_TESTS=1
 CHECK_ONLY=0
+# --unattended:由每日 timer(nssms-deploy-reconcile)呼叫的無人模式。見檔頭「每日自動補裝」。
+# UNATTENDED_FAIL 累計「原本會中止整份部署、在無人模式下降級成一筆記錄」的失敗次數，
+# 收尾時決定離開碼 —— systemd 看得到的失敗才是岸上看得到的失敗。
+UNATTENDED=0
+UNATTENDED_FAIL=0
+# 需要 root 卻拿不到 sudo 而被擋下的項目數。與 UNATTENDED_FAIL 刻意分開:
+# 「做了但失敗」要修的是那支安裝器，「想做但沒授權」要修的是密碼檔 —— 兩種修法完全
+# 不同，折成同一個數字等於把唯一能讓岸上動手的線索丟掉。
+UNATTENDED_BLOCKED=0
+UNATTENDED_SKIP_VENV=0
 SKIP_VERIFY=0
 RECREATE=0
 RUN_HEALTH=1
@@ -219,6 +260,15 @@ stamp_lines() {
 }
 
 start_transcript() {
+  # --unattended 每天跑一次，而 transcript 是「一次一檔、不覆蓋、不自動清理」的形狀 ——
+  # 每年就是 365 個孤兒檔，而 cleanup_rules.json 裡沒有任何一條涵蓋 deploy_offline_*.log。
+  # 更關鍵的是這個目錄**並不會被收上岸**:岸端的 log_monitor 拉的是 /fleet/.../sftp_logs
+  # (各次傳輸自己的 CSV)，不是這裡。所以 transcript 對無人模式既沒有岸端價值、又要付
+  # 磁碟代價。無人模式的記錄改由 unit 外層的 lib/unit_log.sh 負責 —— 它自帶每日輪替、
+  # 1 MiB 上限與 14 代保留，是這個 repo 對「長期每日產出」既有的答案。
+  if [ "$UNATTENDED" -eq 1 ]; then
+    return 0
+  fi
   local dir="${PROJECT_DIR}/logs"
   # 測試會真的把這支腳本跑起來(--check-only),而記錄檔預設寫進**專案的** logs/ ——
   # 那個目錄會被 fleet log 收走上傳。WH102-2 就出現過這個形狀:船上的 logs/ 躺著一份
@@ -321,6 +371,39 @@ mutating() {  # $1... = 動作說明
     err "內部錯誤：--check-only 下不該執行變更動作：$*"
     exit 1
   fi
+}
+
+# --- 「需要密碼的步驟做不做得成」-------------------------------------------
+# 階段 A 有 8 處原本寫成 `[ ! -t 0 ] → 略過`。那些閘門真正想表達的條件不是「有沒有
+# 終端機」，而是**「能不能在沒有人的情況下取得 sudo」** —— 每一處的原註解都寫著理由是
+# 「無法輸入 sudo 密碼」。密碼檔機制出現之後，這兩件事不再等價：systemd user session
+# 沒有 tty，但 askpass 照樣拿得到 sudo。
+#
+# 沒有密碼檔時這個函式退回 `[ -t 0 ]`，所有行為與密碼檔功能加入前**完全相同**。
+sudo_obtainable() {
+  if [ -t 0 ] || [ -n "${SUDO_ASKPASS:-}" ]; then return 0; fi
+  # 記在這裡而不是每個呼叫點:漏記一處就等於那一項被靜默略過，而「靜默」正是這整件事
+  # 要根治的毛病。每個 stage 只會評估一次這個條件，所以不會重複計數。
+  [ "$UNATTENDED" -eq 1 ] && UNATTENDED_BLOCKED=$((UNATTENDED_BLOCKED + 1))
+  return 1
+}
+
+# 遠端主機密碼(只有 A9 的 ssh-copy-id 要)。與上面刻意分開:兩者是不同的祕密，
+# 有本機 sudo 不代表有遠端主機的密碼。
+ssh_pass_obtainable() { [ -t 0 ] || [ -n "$SSH_ASKPASS_HELPER" ]; }
+
+# 在 --unattended 下把「原本會中止整份部署」的失敗降級成一筆記錄。
+#   rc 0 = 已記錄，呼叫端應該 return（跳過這一項，繼續巡下一項）
+#   rc 1 = 不是無人模式，呼叫端照原本的 exit
+# 為什麼要降級:每日排程因為某一項裝不起來就整支中止，等於後面所有項目都跟著停擺，
+# 而那些項目多半與失敗的那一項無關。失敗本身不會被吞掉 —— 它進 UNATTENDED_FAIL，
+# 最後反映在離開碼上，systemd 會把整個 unit 標成 failed（automation_health_check 的
+# check_failed_units 會看到）。
+unattended_note_fail() {  # $1=一句話說明
+  [ "$UNATTENDED" -eq 1 ] || return 1
+  UNATTENDED_FAIL=$((UNATTENDED_FAIL + 1))
+  warn "--unattended：記錄失敗並繼續 —— $1"
+  return 0
 }
 
 # --- 密碼檔:免人工輸入 sudo 與遠端主機密碼 --------------------------------
@@ -562,6 +645,7 @@ parse_args() {
       --with-tests)  INSTALL_TESTS=1 ;;
       --skip-tests)  INSTALL_TESTS=0 ;;
       --check-only)  CHECK_ONLY=1 ;;
+      --unattended)  UNATTENDED=1; RUN_LAUNCH=0 ;;
       --skip-verify) SKIP_VERIFY=1 ;;
       --recreate)    RECREATE=1 ;;
       --no-health-check) RUN_HEALTH=0 ;;
@@ -575,6 +659,13 @@ parse_args() {
     esac
     shift
   done
+
+  # --unattended 與 --check-only 是相反的承諾(一個要改機器、一個保證不改)。同時給等於
+  # 沒有說清楚要哪一個,拒絕比猜好。
+  if [ "$UNATTENDED" -eq 1 ] && [ "$CHECK_ONLY" -eq 1 ]; then
+    err "--unattended 與 --check-only 不能同時使用（前者要補裝，後者保證不改機器）。"
+    exit 2
+  fi
 
   if [ -z "$PYTHON_BIN" ]; then
     # 固定系統路徑優先，避免操作者從已啟用的 venv 內執行時，PATH 的 python3
@@ -745,9 +836,20 @@ banner_and_preflight() {
 
   if [ "$preflight_failures" -ne 0 ]; then
     err "離線部署 preflight 共發現 $preflight_failures 個問題；未執行任何持久變更。"
-    exit "$preflight_rc"
+    # 無人模式降級:preflight 驗的是**離線包**(wheelhouse / virtualenv bootstrap /
+    # tmux deb)。一次不完整的 SFTP 下載少一個 .whl，就會讓 sudoers、docker 群組、
+    # polkit 這些與離線包毫無關係的項目一起永遠補不上 —— 而那幾項正是這個模式存在的
+    # 唯一理由。所以這裡只放棄階段 B，階段 A 照巡。
+    if [ "$UNATTENDED" -eq 1 ]; then
+      warn "--unattended：階段 B（venv）本輪略過，階段 A 的一次性設定照常補裝。"
+      UNATTENDED_SKIP_VENV=1
+      UNATTENDED_FAIL=$((UNATTENDED_FAIL + 1))
+    else
+      exit "$preflight_rc"
+    fi
+  else
+    ok "雙平台 tmux 離線資產 preflight 通過。"
   fi
-  ok "雙平台 tmux 離線資產 preflight 通過。"
 
   # 【--check-only 刻意不在這裡結束】6668f85(Bionic/Jammy 的 tmux 離線安裝)曾在這裡加一個
   # exit 0,於是 --check-only 只走完 preflight 就回家 —— 而階段 A 那 15 處「只回報、不動作」
@@ -950,6 +1052,15 @@ stage_vessel_info() {
     else
       warn "保留接管旗標。本機將繼續以 emer 角色啟動。"
     fi
+  elif [ "$UNATTENDED" -eq 1 ]; then
+    # 身分檔是所有角色判定的根（require_base_ipc / effective_role 都讀它）。沒有它，
+    # 後面每一個「這台該不該裝」的判斷都會 fail-open 成 ipc1 —— 那會在錯的機器上裝錯
+    # 的東西。所以這是無人模式唯一的硬中止:做不了正確的事，就什麼都不要做。
+    err "船舶基本資訊檔無效或不存在（rc=$VESSEL_RC），--unattended 不以問答建立。"
+    err "這台機器需要先由人跑一次 deploy_offline.sh 建立身分:$VESSEL_INFO"
+    UNATTENDED_FAIL=$((UNATTENDED_FAIL + 1))
+    stage_summary_unattended
+    exit 1
   elif [ "$VESSEL_RC" -eq 3 ]; then
     warn "找不到船舶基本資訊檔，將以互動問答建立。"
     create_vessel_info
@@ -1035,9 +1146,9 @@ stage_autostart() {
     [ "$AUTOSTART_RC" -eq 0 ] \
       && AUTOSTART_STATUS="現況正常$DRYRUN_NOTE" \
       || AUTOSTART_STATUS="現況有問題（rc=$AUTOSTART_RC）$DRYRUN_NOTE"
-  elif [ ! -t 0 ]; then
-    # 非互動終端機：不擅自更動 systemd / linger，僅提示手動指令。
-    warn "非互動終端機，略過開機自動執行設定。"
+  elif ! sudo_obtainable; then
+    # 取不到 sudo：不擅自更動 systemd / linger，僅提示手動指令。
+    warn "無人可輸入 sudo 密碼（無終端機且無密碼檔），略過開機自動執行設定。"
     warn "如需設定，請手動執行：bash $AUTOSTART_INSTALLER"
     AUTOSTART_STATUS="略過（非互動終端機）"
   elif ask_yn "  是否設定開機自動啟動 scheduler（reboot_launcher.sh）？[Y/n] " Y; then
@@ -1109,8 +1220,8 @@ stage_clink_migration() {
       done)"
     gpio_needed && warn "使用者 $(id -un) 尚未加入 gpio 群組（nssms-button 需要）。"
     MIGRATE_STATUS="待遷移$DRYRUN_NOTE"
-  elif [ ! -t 0 ]; then
-    warn "非互動終端機，略過 clink_* 遷移（需 sudo）。"
+  elif ! sudo_obtainable; then
+    warn "無人可輸入 sudo 密碼（無終端機且無密碼檔），略過 clink_* 遷移。"
     warn "如需遷移，請手動執行："
     warn "  sudo systemctl disable --now ${LEGACY_UNITS[*]}"
     warn "  sudo rm -f /etc/systemd/system/clink_{alarm_controller,board_server,button}.service"
@@ -1183,8 +1294,8 @@ stage_docker_group() {
       4) DOCKER_GROUP_STATUS="docker 未安裝$DRYRUN_NOTE" ;;
       *) DOCKER_GROUP_STATUS="未加入$DRYRUN_NOTE" ;;
     esac
-  elif [ ! -t 0 ]; then
-    warn "非互動終端機，略過 docker 群組設定（需 sudo）。"
+  elif ! sudo_obtainable; then
+    warn "無人可輸入 sudo 密碼（無終端機且無密碼檔），略過 docker 群組設定。"
     warn "如需設定，請手動執行：bash $DOCKER_GROUP_INSTALLER"
     DOCKER_GROUP_STATUS="略過（非互動終端機）"
   else
@@ -1299,8 +1410,8 @@ stage_unattended_boot() {
       warn "資料碟掛載授權的前提不成立（polkit 0.106+ 或帳號問題）——安裝器會說明原因:"
       warn "  bash $MOUNT_POLICY_INSTALLER --status"
       MOUNT_POLICY_STATUS="前提不成立（未安裝）"
-    elif [ ! -t 0 ]; then
-      warn "非互動終端機，略過資料碟掛載授權（需 sudo）。"
+    elif ! sudo_obtainable; then
+      warn "無人可輸入 sudo 密碼（無終端機且無密碼檔），略過資料碟掛載授權。"
       warn "如需安裝，請手動執行:sudo bash $MOUNT_POLICY_INSTALLER"
       MOUNT_POLICY_STATUS="略過（非互動終端機）"
     elif ask_yn "  安裝資料碟掛載的 polkit 授權？不裝的話,autologin=false 的機台每次開機都掛不上碟（需輸入一次密碼）[Y/n] " Y; then
@@ -1347,8 +1458,8 @@ stage_unattended_boot() {
       warn "GDM 自動登入的前提不成立（這台可能不是 GDM,或設定檔沒有 [daemon] 段）:"
       warn "  bash $GDM_AUTOLOGIN_INSTALLER --status"
       GDM_AUTOLOGIN_STATUS="前提不成立（未設定）"
-    elif [ ! -t 0 ]; then
-      warn "非互動終端機，略過 GDM 自動登入設定（需 sudo）。"
+    elif ! sudo_obtainable; then
+      warn "無人可輸入 sudo 密碼（無終端機且無密碼檔），略過 GDM 自動登入設定。"
       warn "如需設定，請手動執行:sudo bash $GDM_AUTOLOGIN_INSTALLER"
       GDM_AUTOLOGIN_STATUS="略過（非互動終端機）"
     else
@@ -1411,8 +1522,8 @@ stage_scheduler_units() {
     else
       SERVICES_STATUS="略過（找不到安裝腳本）"
     fi
-  elif [ ! -t 0 ]; then
-    warn "非互動終端機，略過週期排程設定。"
+  elif ! sudo_obtainable; then
+    warn "無人可輸入 sudo 密碼（無終端機且無密碼檔），略過週期排程設定。"
     warn "如需設定，請手動執行：bash $TIMERS_INSTALLER"
     warn "reboot / teamviewer 需 sudo 白名單，見 $SUDOERS_SRC 檔頭安裝說明。"
     SCHED_STATUS="略過（非互動終端機）"
@@ -1494,7 +1605,14 @@ stage_scheduler_units() {
     #     舊 clink_* 的停用**必須排在這之前**（見上方一次性遷移段）：舊的 system unit 還
     #     活著時，新 unit 會撞 port。這裡只負責裝。
     echo ""
-    if [ ! -f "$SERVICES_INSTALLER" ]; then
+    if [ "$UNATTENDED" -eq 1 ]; then
+      # install_services.sh 是**無條件 restart**（沒有內容比對，見其檔頭）。每天呼叫
+      # 一次等於每天重啟 heartbeat / alarm-controller / board-server / button。
+      # 這一項不需要每日 reconcile 來補:開機時的 update_booster --apply-only 已經會跑
+      # 它，而 nssms-reboot 每 5 天一次 —— 新增的常駐服務最慢 5 天內就會裝起來。
+      info "--unattended：跳過常駐服務（避免每天重啟；開機時的 update_booster 會處理）。"
+      SERVICES_STATUS="略過（--unattended 不碰常駐服務）"
+    elif [ ! -f "$SERVICES_INSTALLER" ]; then
       warn "找不到 $SERVICES_INSTALLER ，略過常駐服務安裝。"
       SERVICES_STATUS="略過（找不到安裝腳本）"
     else
@@ -1560,10 +1678,14 @@ stage_tmux() {
   warn "本機的 tmux 不可用 —— 所有 session 型專案（shm / radar / wave / ecdis / flag）都起不來。"
   if [ "$TMUX_RC" -ne 5 ]; then
     err "tmux 狀態或離線資產異常（exit=$TMUX_RC），停止部署。"
+    if unattended_note_fail "tmux 狀態或離線資產異常（exit=$TMUX_RC）"; then
+      TMUX_STATUS="不可用（exit=$TMUX_RC）"
+      return
+    fi
     exit "$TMUX_RC"
   fi
-  if [ ! -t 0 ]; then
-    info "非互動終端機：只有 sudo 已預先授權時才能安裝 tmux。"
+  if ! [ -t 0 ]; then
+    info "無人在鍵盤前：只有 sudo 已預先授權（密碼檔或既有憑證）時才裝得起來。"
   elif ! ask_yn "  現在以隨附的 deb 離線安裝 tmux？（需輸入一次密碼）[Y/n] " Y; then
     err "tmux 是完整部署的必要條件；使用者取消安裝，停止部署。"
     exit 1
@@ -1573,6 +1695,10 @@ stage_tmux() {
   TMUX_RC="$RC"
   if [ "$TMUX_RC" -ne 0 ]; then
     err "tmux 安裝失敗（exit=$TMUX_RC），停止部署。"
+    if unattended_note_fail "tmux 安裝失敗（exit=$TMUX_RC）"; then
+      TMUX_STATUS="安裝失敗（exit=$TMUX_RC）"
+      return
+    fi
     exit "$TMUX_RC"
   fi
   ok "tmux 已安裝並通過 session 能力測試（dpkg）。"
@@ -1641,10 +1767,10 @@ stage_ssh_key() {
     return
   fi
 
-  if [ ! -t 0 ]; then
-    # 非互動：ssh-copy-id 需要遠端密碼，沒有 tty 就無從輸入。比照 gpio / docker 群組
-    # 那兩步的處理 —— 放棄並印出手動指令，而不是跑一個必定失敗的 ssh-copy-id。
-    warn "非互動終端機，略過金鑰設定（ssh-copy-id 需輸入遠端主機密碼）。"
+  if ! ssh_pass_obtainable; then
+    # 取不到遠端主機密碼(沒有人、也沒有遠端密碼檔)就放棄並印出手動指令，而不是跑一個
+    # 必定失敗的 ssh-copy-id。注意這裡問的是**遠端**密碼 —— 有本機 sudo 不算數。
+    warn "無人可輸入遠端主機密碼（無終端機且無遠端密碼檔），略過金鑰設定。"
     warn "如需設定，請手動執行：bash $SSH_KEY_INSTALLER"
     SSH_KEY_STATUS="略過（非互動終端機）"
     return
@@ -1755,6 +1881,10 @@ stage_launch_decision() {
 
 
 stage_wheelhouse_and_venv() {
+  if [ "${UNATTENDED_SKIP_VENV:-0}" -eq 1 ]; then
+    warn "preflight 未通過，本輪不動 venv（見上方說明）。"
+    return 0
+  fi
   if [ ! -d "$WHEELHOUSE" ]; then
     err "wheelhouse 目錄不存在：$WHEELHOUSE"; exit 1
   fi
@@ -2017,7 +2147,12 @@ stage_launch_exec() {
 # --- 部署後自動健康檢查 ----------------------------------------------------
 stage_health_check() {
   HEALTH_RC=0
-  if [ "$RUN_HEALTH" -eq 1 ]; then
+  if [ "$UNATTENDED" -eq 1 ]; then
+    # health_check.py 會跑 pytest 與一次真正的 SFTP 連線測試 —— 對每天一次的排程太重，
+    # 而且它檢查的是「sftp_transfer 這個專案跑不跑得動」，與「有沒有東西沒裝」無關。
+    # 要看那個的是下一段的 automation_health_check。
+    HEALTH_STATUS="略過（--unattended）"
+  elif [ "$RUN_HEALTH" -eq 1 ]; then
     if [ -f "$SCRIPT_DIR/health_check.py" ]; then
       echo ""
       info "自動執行健康檢查（能力測試 + SFTP 連線 + 健康報告）..."
@@ -2055,7 +2190,11 @@ stage_automation_check() {
     echo ""
     info "執行隱性自動化存活巡檢（compact）..."
     if [ -f "$AUTOMATION_CHECKER" ]; then
-      run_rc "$PYTHON_BIN" "$AUTOMATION_CHECKER" --compact --fail-on-warn
+      # 無人模式加 --no-report:每天一份 Markdown 報告會無止境累積，而結果本來就進了
+      # transcript(那份有清理規則、也會被 fleet log 收上岸)。
+      AUTOMATION_ARGS=(--compact --fail-on-warn)
+      [ "$UNATTENDED" -eq 1 ] && AUTOMATION_ARGS+=(--no-report)
+      run_rc "$PYTHON_BIN" "$AUTOMATION_CHECKER" "${AUTOMATION_ARGS[@]}"
       AUTOMATION_RC="$RC"
       case "$AUTOMATION_RC" in
         0)
@@ -2198,6 +2337,36 @@ stage_summary() {
   echo "==========================================================="
 }
 
+# --- --unattended 的精簡總結 ----------------------------------------------
+# 為什麼不重用 stage_summary:那一份是寫給「剛部署完、人還站在機器前」的操作者看的，
+# 有一整段「接下來請重開機並驗證」的指引。每天跑一次的排程沒有那個人，而 transcript
+# 會被 fleet log 收上岸 —— 岸上要的是「今天補了什麼、還缺什麼」，不是操作指引。
+stage_summary_unattended() {
+  echo ""
+  echo "──────── 每日補裝結果（--unattended）────────"
+  printf "  開機自動執行    ：%s\n" "${AUTOSTART_STATUS:-未執行}"
+  printf "  週期排程 timer  ：%s\n" "${SCHED_STATUS:-未執行}"
+  printf "  sudo 白名單     ：%s\n" "${SUDOERS_STATUS:-未執行}"
+  printf "  常駐服務        ：%s\n" "${SERVICES_STATUS:-未執行}"
+  printf "  clink_* 遷移    ：%s\n" "${MIGRATE_STATUS:-未執行}"
+  printf "  docker 群組     ：%s\n" "${DOCKER_GROUP_STATUS:-未執行}"
+  printf "  資料碟掛載授權  ：%s\n" "${MOUNT_POLICY_STATUS:-未執行}"
+  printf "  GDM 自動登入    ：%s\n" "${GDM_AUTOLOGIN_STATUS:-未執行}"
+  printf "  tmux            ：%s\n" "${TMUX_STATUS:-未執行}"
+  printf "  照片同步金鑰    ：%s\n" "${SSH_KEY_STATUS:-未執行}"
+  echo "──────────────────────────────"
+  if [ "$UNATTENDED_FAIL" -gt 0 ]; then
+    err "本次有 $UNATTENDED_FAIL 項失敗（做了但沒成）—— 離開碼 1，unit 會被標成 failed。"
+  elif [ "$UNATTENDED_BLOCKED" -gt 0 ]; then
+    warn "本次有 $UNATTENDED_BLOCKED 項因為拿不到 sudo 而沒做 —— 離開碼 3。"
+    warn "這台機器無法自行補裝需要 root 的設定;要修的是密碼檔，不是安裝器。"
+  else
+    ok "本次沒有失敗、也沒有被擋下的項目。"
+  fi
+  [ -n "${TRANSCRIPT:-}" ] && info "完整記錄：$TRANSCRIPT"
+  return 0
+}
+
 # --- 交船狀態（--check-only 與正式部署收尾共用）----------------------------
 # 【為什麼要獨立這一段,而不是把兩行塞進部署總結】部署總結回答的是「這次跑了什麼」——
 # 每一欄都是本次執行的動作結果(已安裝 / 使用者略過 / 失敗)。這一段回答的是另一個問題:
@@ -2333,6 +2502,13 @@ main() {
   # 錯了」在任何系統變更之前就被說出來，而不是改到一半才卡住。
   sudo_auth_setup
   ssh_auth_setup
+  # 沒有密碼檔時 sudo_auth_setup 是刻意安靜的（多數機器仍人工部署）。但在無人模式下，
+  # 「安靜」等於這台船每天空轉而沒有人知道 —— 而 transcript 不會上岸，離開碼是唯一的
+  # 訊號。所以這裡把它講明白，並由收尾的 exit 3 讓 systemd 標成 failed。
+  if [ "$UNATTENDED" -eq 1 ] && [ -z "${SUDO_ASKPASS:-}" ]; then
+    warn "════ 沒有可用的 sudo 密碼檔 —— 需要 root 的項目本輪全部補不了 ════"
+    warn "放一份 $FLEET_SUDO_PASS_FILE（隨 OTA 散佈）或 $LOCAL_SUDO_PASS_FILE 即可。"
+  fi
   announce_check_only
   stage_vessel_info                  # A1 身分檔（含殘留接管旗標的判讀）
   compute_identity                   # 由身分檔推導 DEPLOY_ROLE / DEPLOY_VSL_UPPER
@@ -2366,6 +2542,21 @@ main() {
   stage_launch_exec                  # 刻意在 venv 之後（SFTP 下載要用它）
   stage_health_check                 # 也刻意在啟動之後（否則巡檢的 tmux 段沒有意義）
   stage_automation_check
+
+  if [ "$UNATTENDED" -eq 1 ]; then
+    stage_summary_unattended
+    # 離開碼是這支 timer 唯一能讓岸上「不必讀 log 就知道出事」的管道 —— transcript
+    # 不上岸、journald 重開機就清空，所以這裡刻意**不**比照正式部署固定回 0。
+    #   0  全部就緒或已補齊
+    #   1  有項目做了但失敗（要修那支安裝器）
+    #   3  有項目因為拿不到 sudo 而沒做（要修密碼檔）
+    # 非 0 會讓 systemd 把 unit 標成 failed，而 automation_health_check 的
+    # check_failed_units 會把它撿起來。
+    [ "$UNATTENDED_FAIL" -eq 0 ] || exit 1
+    [ "$UNATTENDED_BLOCKED" -eq 0 ] || exit 3
+    exit 0
+  fi
+
   stage_summary
   stage_deployment_state             # 這次跑了什麼(總結)之外,這台現在是什麼狀態
 

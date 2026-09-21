@@ -1117,3 +1117,124 @@ class WheelhouseLayoutTests(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class UnattendedReconcileTests(unittest.TestCase):
+    """`--unattended`（每日補裝）的契約。
+
+    這個模式由 scheduler 的 nssms-deploy-reconcile.timer 每天呼叫一次，跑的是與人工
+    部署**同一份** stage 清單。它的價值全部建立在「與人工部署共用知識來源」上，所以
+    這一組測試守的不是功能，而是那幾條讓它不會變成第二份清單、也不會每天搞壞船的界線。
+    """
+
+    SOURCE = (Path(__file__).resolve().parents[1] / "deploy" / "deploy_offline.sh").read_text(
+        encoding="utf-8"
+    )
+
+    def _stage_body(self, name):
+        """抽出某個 stage 函式的函式體（到下一個 column-0 函式定義為止）。"""
+        start = self.SOURCE.index("\n{}() {{".format(name))
+        rest = self.SOURCE[start + 1 :]
+        end = re.search(r"^[a-z_]+\(\) \{", rest[len(name) + 5 :], re.M)
+        return rest[: len(name) + 5 + end.start()] if end else rest
+
+    def test_mutually_exclusive_with_check_only(self):
+        """一個要改機器、一個保證不改。同時給是說不清楚要哪個，拒絕比猜好。"""
+        proc = run_bash(
+            "bash deploy/deploy_offline.sh --unattended --check-only </dev/null"
+        )
+        self.assertEqual(proc.returncode, 2, proc.stdout)
+        self.assertIn("不能同時使用", proc.stdout)
+
+    def test_implies_no_launch(self):
+        """絕不碰階段 C。啟動流程會去搶 launcher 的鎖，而那支鎖的等待上限是 2100 秒 ——
+        一支 TimeoutStartSec=1800 的 timer 撞上去就是每天一次 systemd 逾時。"""
+        self.assertIn("--unattended)  UNATTENDED=1; RUN_LAUNCH=0 ;;", self.SOURCE)
+
+    def test_never_touches_resident_services(self):
+        """install_services.sh 是無條件 restart（沒有內容比對），每天呼叫等於每天重啟
+        heartbeat / alarm-controller / board-server / button。這是這個模式最貴的一條
+        界線 —— 少了它，一次重構就會讓全船隊的告警控制器每天斷一次。"""
+        body = self._stage_body("stage_scheduler_units")
+        # 只看會**改機器**的那一次;同一個 stage 裡另有一次帶 --check-only 的唯讀探測。
+        run_line = [
+            ln
+            for ln in body.splitlines()
+            if ln.strip() == 'run_rc bash "$SERVICES_INSTALLER"'
+        ]
+        self.assertEqual(len(run_line), 1, "install_services 的變更呼叫點應該只有一處")
+        # 用行號比，不用字元位置:同一個 stage 裡先出現的是 --check-only 那次唯讀探測。
+        lines = body.splitlines()
+        call_at = next(
+            i for i, ln in enumerate(lines) if ln.strip() == 'run_rc bash "$SERVICES_INSTALLER"'
+        )
+        guard_at = next(
+            i
+            for i, ln in enumerate(lines[:call_at])
+            if ln.strip() == 'if [ "$UNATTENDED" -eq 1 ]; then'
+        )
+        self.assertLess(
+            guard_at, call_at, "無人模式的守衛必須排在 install_services 的變更呼叫之前"
+        )
+
+    def test_single_item_failure_does_not_abort_the_round(self):
+        """tmux 裝不起來不該讓 sudoers、群組、polkit 這些無關的項目一起停擺。
+        stage_tmux 裡每一個 exit 都必須先問過 unattended_note_fail。"""
+        body = self._stage_body("stage_tmux")
+        lines = body.splitlines()
+        for idx, line in enumerate(lines):
+            if not re.match(r"\s*exit ", line):
+                continue
+            window = "\n".join(lines[max(0, idx - 6) : idx])
+            if "ask_yn" in window:
+                # 「使用者選 n」那一條:它在無人模式下走不到（沒有 tty 就不會進 ask_yn
+                # 分支，而是走上面那條 info 後 fall-through）。加守衛只會是死碼。
+                continue
+            self.assertIn(
+                "unattended_note_fail",
+                window,
+                "stage_tmux 的 `{}` 之前沒有無人模式的降級".format(line.strip()),
+            )
+
+    def test_does_not_ask_for_vessel_info(self):
+        """身分檔是所有角色判定的根。無人模式下沒有它就該中止，而不是走互動問答
+        （那會撞上 create_vessel_info 的 exit 1，訊息還會誤導成「非互動終端機」）。"""
+        body = self._stage_body("stage_vessel_info")
+        self.assertLess(
+            body.index('elif [ "$UNATTENDED" -eq 1 ]; then'),
+            body.index("create_vessel_info"),
+            "無人模式的分支必須排在 create_vessel_info 之前",
+        )
+
+    def test_writes_no_transcript(self):
+        """每天一份 deploy_offline_*.log 而 cleanup_rules.json 裡沒有規則涵蓋它，
+        一年就是 365 個孤兒檔 —— 而那個目錄也不會被收上岸。記錄改由 unit_log.sh 負責。"""
+        body = self._stage_body("start_transcript")
+        self.assertLess(
+            body.index('if [ "$UNATTENDED" -eq 1 ]; then'),
+            body.index('local dir="${PROJECT_DIR}/logs"'),
+            "無人模式必須在算出記錄路徑之前就 return",
+        )
+
+    def test_gate_uses_sudo_obtainable_not_tty(self):
+        """那 8 道閘門真正的條件是「能不能不靠人取得 sudo」，不是「有沒有 tty」。
+        這條守的是**日後新增 stage 的人**：手寫 `[ ! -t 0 ]` 會讓新項目永遠補不到船上。"""
+        stages = (
+            "stage_autostart",
+            "stage_clink_migration",
+            "stage_docker_group",
+            "stage_unattended_boot",
+            "stage_scheduler_units",
+        )
+        for name in stages:
+            body = self._stage_body(name)
+            self.assertIn("sudo_obtainable", body, "{} 沒有用 sudo_obtainable".format(name))
+            self.assertNotIn(
+                "[ ! -t 0 ]", body, "{} 仍在用 tty 當閘門".format(name)
+            )
+
+    def test_blocked_is_not_the_same_as_failed(self):
+        """「做了但失敗」要修安裝器，「想做但沒授權」要修密碼檔 —— 兩種修法完全不同。
+        折成同一個離開碼等於把唯一能讓岸上動手的線索丟掉。"""
+        self.assertIn('[ "$UNATTENDED_FAIL" -eq 0 ] || exit 1', self.SOURCE)
+        self.assertIn('[ "$UNATTENDED_BLOCKED" -eq 0 ] || exit 3', self.SOURCE)

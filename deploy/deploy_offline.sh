@@ -2151,7 +2151,7 @@ stage_health_check() {
     # health_check.py 會跑 pytest 與一次真正的 SFTP 連線測試 —— 對每天一次的排程太重，
     # 而且它檢查的是「sftp_transfer 這個專案跑不跑得動」，與「有沒有東西沒裝」無關。
     # 要看那個的是下一段的 automation_health_check。
-    HEALTH_STATUS="略過（--unattended）"
+    info "--unattended：略過 health_check.py（見上）。"
   elif [ "$RUN_HEALTH" -eq 1 ]; then
     if [ -f "$SCRIPT_DIR/health_check.py" ]; then
       echo ""

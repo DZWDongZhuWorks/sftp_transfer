@@ -108,6 +108,7 @@ class FakeSFTPClient:
         self.mkdir_calls = []
         self.chmod_calls = []   # 記錄 (path, mode),供保留權限相關測試檢查
         self.remove_calls = []  # 記錄被刪除的遠端路徑,供 delete_source 相關測試檢查
+        self.rmdir_calls = []   # 記錄被移除的遠端空目錄,供 remote_retention 的測試檢查
         self.truncate_calls = []  # 記錄 (path, size),供續傳切回檢查點的測試檢查
         self.utime_calls = []   # 記錄 (path, (atime, mtime))
 
@@ -169,6 +170,15 @@ class FakeSFTPClient:
             raise FileNotFoundError(f"No such file: {path}")
         self.remove_calls.append(path)
         del self.files[path]
+
+    def rmdir(self, path):
+        """對應 paramiko.SFTPClient.rmdir：只移除空目錄，底下還有檔案就失敗（同 POSIX）。"""
+        path = path.rstrip("/")
+        prefix = path + "/"
+        if any(p.startswith(prefix) for p in self.files):
+            raise OSError(f"Directory not empty: {path}")
+        self.rmdir_calls.append(path)
+        self.dirs.discard(path)
 
     def chmod(self, path, mode):
         path = path.rstrip("/")

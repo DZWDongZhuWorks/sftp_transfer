@@ -1097,8 +1097,105 @@ class TestDownloadOneFileCheckpointing:
 
         d._download_one_file("/remote/big.bin", "big.bin", tmp_path)
 
-        # 傳輸中每 4 個 chunk 一次，最後一筆是 finally 的收尾（15 個 chunk 全部）
-        assert snapshots == [dl.CHUNK_SIZE * n for n in (4, 8, 12, 15)]
+        # 傳輸中每 4 個 chunk 一次。收尾那筆**不在這裡** —— 檔案傳完之後 manifest 項目
+        # 與「略過」同級，走的是定期落盤（見 _flush_manifest_due），而這個測試把秒數
+        # 門檻設成 3600 所以不會觸發。不能等的是沒傳完的 checkpoint，那些仍然立刻落盤，
+        # 見 test_completed_download_defers_manifest_write 與它下面幾條。
+        assert snapshots == [dl.CHUNK_SIZE * n for n in (4, 8, 12)]
+
+    def test_completed_download_defers_manifest_write(
+        self, downloader_factory, fake_sftp_factory, tmp_path, monkeypatch
+    ):
+        """傳完的檔不該各自把整份 manifest 重寫一次。
+
+        岸端 fleet_logs 的 manifest 已經 17,161 項／2.4 MB／單次 144 ms，一趟同步約
+        204 個新檔 —— 逐檔重寫就是 29 秒，而且項目數還在長。
+        """
+        monkeypatch.setattr(dl, "CHECKPOINT_INTERVAL_SECONDS", 3600)
+        monkeypatch.setattr(dl, "CHECKPOINT_INTERVAL_BYTES", 1 << 30)
+        d = downloader_factory()
+        d._last_manifest_flush = time.time()          # 剛落盤過，時間門檻還沒到
+        d.sftp = fake_sftp_factory(files={"/remote/a.bin": b"A" * 10},
+                                   mtimes={"/remote/a.bin": 5})
+        snapshots = self._record_checkpoints(d, "a.bin")
+
+        assert d._download_one_file("/remote/a.bin", "a.bin", tmp_path) == "downloaded"
+
+        assert snapshots == []                        # 一次都沒有落盤
+        assert d._manifest["a.bin"]["local_bytes"] == 10   # 但記憶體裡是對的
+        assert d._manifest_dirty is True                   # 標記成待落盤
+
+    def test_deferred_entry_lands_on_disk_once_the_interval_passes(
+        self, downloader_factory, fake_sftp_factory, tmp_path, monkeypatch
+    ):
+        """延後不是不寫：批次進行中每過秒數門檻就落一次，暴露窗口與傳輸中檢查點同級。"""
+        monkeypatch.setattr(dl, "CHECKPOINT_INTERVAL_SECONDS", 0)
+        d = downloader_factory()
+        d.sftp = fake_sftp_factory(files={"/remote/a.bin": b"A" * 10},
+                                   mtimes={"/remote/a.bin": 5})
+
+        d._download_one_file("/remote/a.bin", "a.bin", tmp_path)
+
+        assert d._load_manifest(tmp_path)["a.bin"]["local_bytes"] == 10
+        assert d._manifest_dirty is False
+
+    def test_incomplete_checkpoint_is_never_deferred(
+        self, downloader_factory, fake_sftp_factory, tmp_path, monkeypatch
+    ):
+        """沒傳完的 checkpoint 是硬中止後決定 .part 能不能接續的唯一依據 —— 不能等。
+
+        秒數門檻設成 3600 且剛落盤過，所以延後路徑在這個測試裡一定不會寫；
+        會寫就代表走的是立刻落盤那一條。
+        """
+        monkeypatch.setattr(dl, "CHECKPOINT_INTERVAL_SECONDS", 3600)
+        content = b"Y" * (dl.CHUNK_SIZE * 3)
+        d = downloader_factory()
+        d._last_manifest_flush = time.time()
+        sftp = fake_sftp_factory(files={"/remote/f.bin": content}, mtimes={"/remote/f.bin": 77})
+        original_open = sftp.open
+
+        def flaky_open(path, mode="rb"):
+            fake_file = original_open(path, mode)
+            original_read = fake_file.read
+            calls = {"n": 0}
+
+            def flaky_read(n=-1):
+                calls["n"] += 1
+                if calls["n"] == 2:
+                    raise OSError("simulated dropped connection")
+                return original_read(n)
+
+            fake_file.read = flaky_read
+            return fake_file
+
+        sftp.open = flaky_open
+        d.sftp = sftp
+
+        with pytest.raises(OSError):
+            d._download_one_file("/remote/f.bin", "f.bin", tmp_path)
+
+        assert d._load_manifest(tmp_path)["f.bin"]["local_bytes"] == dl.CHUNK_SIZE
+
+    def test_flush_due_respects_the_seconds_threshold(self, downloader_factory, tmp_path, monkeypatch):
+        """_flush_manifest_due 的節奏本身：沒到門檻不寫，到了才寫，不 dirty 一律不寫。"""
+        monkeypatch.setattr(dl, "CHECKPOINT_INTERVAL_SECONDS", 60)
+        d = downloader_factory()
+        d._manifest = {"a": {"size": 1}}
+
+        d._manifest_dirty = False
+        d._last_manifest_flush = 0.0
+        d._flush_manifest_due(tmp_path)
+        assert not (tmp_path / dl.MANIFEST_FILENAME).exists()   # 沒異動就不寫
+
+        d._manifest_dirty = True
+        d._last_manifest_flush = time.time()
+        d._flush_manifest_due(tmp_path)
+        assert not (tmp_path / dl.MANIFEST_FILENAME).exists()   # 有異動但門檻沒到
+
+        d._last_manifest_flush = time.time() - 61
+        d._flush_manifest_due(tmp_path)
+        assert d._load_manifest(tmp_path) == {"a": {"size": 1}}
+        assert d._manifest_dirty is False
 
     @staticmethod
     def _record_checkpoints(downloader, rel_path):

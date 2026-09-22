@@ -10,6 +10,8 @@ from datetime import datetime
 from types import SimpleNamespace
 from unittest import mock
 
+import pytest
+
 from monitor.log_monitor import (
     aggregate_by_device,
     build_tree,
@@ -111,6 +113,34 @@ def test_loading_bar_is_pure_ascii_and_clamped():
     assert tui.disp_width(tui.loading_bar(3, 10)) == tui._LOADING_BAR_W
 
 
+class FakeScreen:
+    """夠用來驗證繪製與抽鍵的假螢幕；keys 是待讀的按鍵，讀完回 -1。"""
+
+    def __init__(self, keys=()):
+        self.rows = {}
+        self.keys = list(keys)
+        self.draws = 0
+        self.delays = []
+
+    def erase(self):
+        self.rows.clear()
+
+    def getmaxyx(self):
+        return tui._SYNC_LINE_LIMIT + 4, 80
+
+    def addstr(self, y, x, text, attr=0):
+        self.rows[y] = text
+
+    def refresh(self):
+        self.draws += 1
+
+    def nodelay(self, flag):
+        self.delays.append(flag)
+
+    def getch(self):
+        return self.keys.pop(0) if self.keys else -1
+
+
 def test_loading_progress_throttles_but_always_draws_first_and_last():
     """回呼是每份 log 叫一次（全船隊 3 萬多次），不限流會把時間花在畫面上。"""
     drawn = []
@@ -118,14 +148,37 @@ def test_loading_progress_throttles_but_always_draws_first_and_last():
     with mock.patch.object(tui, "_draw_loading",
                            side_effect=lambda _s, _d, done, total, _e: drawn.append(done)), \
          mock.patch.object(tui.time, "monotonic", side_effect=lambda: clock[0]):
-        tick = tui._loading_progress(object(), "fleet_logs")
+        tick = tui._loading_progress(FakeScreen(), "fleet_logs")
         tick(0, 1000)                    # 總數剛數完：一定要畫
         for done in range(1, 500):       # 同一瞬間的 499 次回呼只該畫第一次之後的 0 次
             tick(done, 1000)
-        clock[0] += tui._LOADING_REDRAW_SEC + 0.01
+        clock[0] += tui._PROGRESS_REDRAW_SEC + 0.01
         tick(500, 1000)                  # 過了限流間隔才再畫一次
         tick(1000, 1000)                 # 最後一次無論如何都要畫
     assert drawn == [0, 500, 1000]
+
+
+def test_loading_progress_aborts_on_q():
+    """解析要十幾秒,那段時間 q 是唯一能把畫面拿回來的鍵。"""
+    screen = FakeScreen(keys=[ord("q")])
+    tick = tui._loading_progress(screen, "fleet_logs")
+    with pytest.raises(tui._ReloadAborted):
+        tick(0, 1000)
+
+
+def test_poll_abort_drains_buffer_without_aborting():
+    """【這是「按了沒反應然後亂跳」的修法】積在 tty 裡的鍵要當場丟掉,
+    不能留到畫面回來才一次補送。只有 q 會中止,其餘一律吃掉。"""
+    screen = FakeScreen(keys=[curses.KEY_DOWN, ord("f"), 27, ord("j")])
+    tui._poll_abort(screen)              # 不該丟例外
+    assert screen.keys == []             # 全部抽乾
+    assert screen.delays == [True]       # 還原的責任在 reload(),這裡只開 nodelay
+
+
+def test_poll_abort_ignores_escape():
+    """Esc 不能當中止鍵：滑鼠回報與方向鍵都是 ESC 開頭的序列,
+    誤判的代價是動一下滑鼠就把兩分鐘的同步砍掉。"""
+    tui._poll_abort(FakeScreen(keys=[27, 91, 65]))   # ESC [ A ＝ 上鍵
 
 
 def _html_args(tmp_path, html):
@@ -169,23 +222,6 @@ def test_write_html_snapshot_survives_write_error(tmp_path):
 
 
 def test_sync_progress_keeps_recent_lines_clean():
-    # 高度足夠顯示滿 _SYNC_LINE_LIMIT 行
-    class FakeScreen:
-        def __init__(self):
-            self.rows = {}
-
-        def erase(self):
-            self.rows.clear()
-
-        def getmaxyx(self):
-            return tui._SYNC_LINE_LIMIT + 4, 80
-
-        def addstr(self, y, x, text, attr=0):
-            self.rows[y] = text
-
-        def refresh(self):
-            pass
-
     limit = tui._SYNC_LINE_LIMIT
     total = limit + 5  # 餵超過上限，驗證只保留最近 limit 行
 
@@ -208,6 +244,40 @@ def test_sync_progress_keeps_recent_lines_clean():
         assert f"line {n}" not in values
     # ANSI / 控制字元已清除
     assert all("\x1b" not in v for v in values)
+
+
+def test_sync_progress_throttles_redraws():
+    """全船隊一輪同步吐 1.7 萬行,逐行整頁重繪就是 1.7 萬次全螢幕 refresh 灌進 tmux。"""
+    clock = [100.0]
+
+    def fake_sync(config, quiet, output_callback):
+        for number in range(1, 1001):
+            output_callback(f"line {number}")
+            clock[0] += 0.01            # 每行 10 毫秒 → 10 秒吐完 1000 行
+        return True
+
+    screen = FakeScreen()
+    with mock.patch.object(tui, "sync_logs", side_effect=fake_sync), \
+         mock.patch.object(tui.time, "monotonic", side_effect=lambda: clock[0]):
+        assert tui._sync_with_progress(screen, "sync.json") is True
+
+    # 10 秒 / 0.2 秒 ＝ 約 50 次,加上開頭與收尾各一次強制重繪；遠少於 1000 次
+    assert 40 <= screen.draws <= 60, screen.draws
+    # 收尾一定要補畫,否則畫面會停在最多晚 0.2 秒的位置 —— 那正好是同步的結語
+    assert "line 1000" in set(screen.rows.values())
+
+
+def test_sync_progress_aborts_on_q():
+    """同步實測要 126 秒,期間 q 要能把畫面拿回來（子行程由 sync_logs 的 finally 收掉）。"""
+    screen = FakeScreen(keys=[ord("q")])
+
+    def fake_sync(config, quiet, output_callback):
+        output_callback("略過（已完整下載）: download/WH315/IPC-1/share/x.csv")
+        raise AssertionError("中止之後不該還在吐行")
+
+    with mock.patch.object(tui, "sync_logs", side_effect=fake_sync):
+        with pytest.raises(tui._ReloadAborted):
+            tui._sync_with_progress(screen, "sync.json")
 
 
 # --- flatten：展開/收合 ----------------------------------------------------

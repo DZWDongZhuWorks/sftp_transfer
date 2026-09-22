@@ -471,7 +471,103 @@ SFTP 連線，並把 `.part` 的**精確位元組數、SHA-256、遠端 size/mti
 - **下載方向會影響所有人**：刪掉的是共用的遠端來源，同一個目錄若還有別的機器要下載，它們就再也拿不到了。只該開在「這台機器是該來源唯一消費者」的情境。
 - **下載方向會拉到別人正在寫的檔**：岸端 `sftp_logs` 是各船用 `upload_log` 推上去的，而 `_upload_log_file` 走 `sftp.put` **直寫最終檔名、沒有遠端 `.part` 暫存**——傳到一半的 log 看起來就是個正常小檔。這正是隔離期存在的原因，別把 `delete_source_min_age_minutes` 設成 `0`。
 - 上傳方向刪成功時會順手把該檔的版本紀錄從 `.sftp_upload_manifest.json` 移除（來源已經不在，那筆紀錄永遠不會再被比對到，留著只會隨日誌檔名無限長大）。
+- **不要拿它當岸端 log 的保留政策**：`delete_source` 沒有保留窗（傳完就刪），岸端 `sftp_logs` 需要的是留 N 天的中繼緩衝，見【岸端 log 的保留政策（remote_retention.py）】。
 - **與 `scheduler` 的清掃器分工**：`share/scheduler/script/cleanup_old_files.py`（timer 每天一次、依 `cleanup_rules.json` 按天數清舊檔）處理的是「放久了該清掉」，`delete_source` 處理的是「送出去了就不必留」。兩者是不同的問題，**但可能撞在同一個目錄上** —— 出貨的規則檔裡 `sftp-transfer-csv-logs` 那條就在清本工具的 `logs/D_*.csv`、`U_*.csv`。若在同一個目錄開了 `delete_source`，那條規則會變成幾乎永遠掃不到東西（傳完就被刪了），請一併檢視是否還需要它。本工具**不匯入**清掃器的程式碼：`share/scheduler` 本身就是由本工具下載下來的（見 `config/scheduler_download_settings.json`），傳輸層不能反過來依賴自己的載荷；共用的只有 `pattern` 的語意。
+
+## 【岸端 log 的保留政策（remote_retention.py）】
+
+岸端 `/fleet/wanhai_nssms_deploy/sftp_logs/` 只增不減 —— 各船靠 `upload_log=true` 一直往上推，
+而**沒有任何自動刪除者**。2026-09-22 實測的形狀：`upload/` 從 2026-08-25 起 29 天沒被碰過、
+`download/` 的地板線停在 2026-09-15 01:38:53。那兩條線是**人工**清除留下的（兩次事件相隔 21 天、
+範圍還不一樣、地板線是零碎的時間點而不是日界），不是任何排程的形狀。
+
+`remote_retention.py` 把它變成可預測的 **21 天**窗，由 scheduler 的
+`nssms-remote-log-retention.timer` 每天 03:10 觸發（`# NSSMS-BaseIPC=ipc1`）：
+
+```bash
+# 預覽（預設，不會刪任何東西）
+python remote_retention.py --config config/log_monitor_sync.json
+
+# 真的刪
+python remote_retention.py --config config/log_monitor_sync.json --apply
+
+# 包裝（讀 config/log_monitor_sync.json；REMOTE_RETENTION_APPLY=1 才實刪）
+bash script/run_remote_retention.sh
+```
+
+設定檔沿用同一份 download 設定：`host`/帳密／`remote_path` 用來連線與走訪，`local_path` 是用來
+比對的本地鏡像。
+
+| 參數 | 說明 |
+|------|------|
+| `--config PATH` | download 設定檔（必填） |
+| `--retention-days N` | 保留窗（天），預設 `21` |
+| `--pattern GLOB` | 只刪檔名符合的（可重複），預設 `D_*.csv` `U_*.csv` |
+| `--apply` | 真的刪；不給就只預覽 |
+| `--remove-empty-dirs` | 順便移除被清空的目錄（不動最上面兩層） |
+| `--require-local-sync-hours N` | 本地鏡像最新一份紀錄必須新於這麼多小時，否則整趟放棄（預設 `48`；`0`＝不檢查） |
+| `--allow-missing-local` | 本地鏡像沒有那一份時照樣刪。只在停機超過 9 天、要收掉殘留時才用，不該進排程 |
+| `--verbose` | 逐檔列出，不只前 20 筆 |
+
+離開碼：`0` 正常；`1` 有刪除失敗；`2` fail-closed（設定檔缺席、同步不新鮮、連不上）。
+紀錄寫 `logs/remote_retention.log`（2 MiB × 3 輪替 —— 這份 log 不被任何 `cleanup_rules.json`
+的規則涵蓋，自己輪替才不會變成下一個只增不減的東西）。
+
+### 三個刪除者的分工
+
+| 管哪裡 | 誰 | 節奏 |
+|---|---|---|
+| 船上本機 `logs/D_*.csv`、`U_*.csv` | `scheduler/script/cleanup_old_files.py`（規則 `sftp-transfer-csv-logs`） | 每天 |
+| 岸端本機鏡像 `fleet_logs/` | 同上（規則 `sftp-fleet-reports`，**30 天**） | 每天 02:30 |
+| **岸端 SFTP 上的 `sftp_logs/`** | **`remote_retention.py`**（**21 天**） | 每天 03:10 |
+
+遠端 21 / 本地 30 不是巧合，見下方安全設計第 2 點。兩支排程差 40 分鐘也不是必要的 ——
+有 9 天的差額，同一天誰先跑都不影響判定。
+
+**為什麼不是 `delete_source`**：那是「傳完就刪」，沒有保留窗，等於把遠端壓到 0 天 —— 岸端本機
+那份鏡像就成為唯一副本。本程式是「放久了才刪」，遠端留 N 天當中繼緩衝。
+
+**為什麼不直接用 `cleanup_old_files.py`**：(1) 反向依賴 —— `share/scheduler` 本身就是本工具下載
+下來的（見 `config/scheduler_download_settings.json`），傳輸層不能反過來依賴自己的載荷；
+(2) 那一支是 `os.walk` + `os.unlink`，全是本地檔案系統語意，遠端只有 `SFTPAttributes` 可用；
+(3) `cleanup_rules.json` 是已上線、全條 enabled 的生產檔，還有測試釘住逐條宣告清單，在這裡放
+一個同名不同 schema 的檔會害死維運。共用的只有 `pattern` 的**語意**，而且是直接共用程式碼：
+判定沿用 `SFTPBase._delete_source_kept_reason`，所以船隊三個刪除工具同一個心智模型。
+
+### 兩道安全設計
+
+**1. 同步不新鮮就整趟放棄（`--require-local-sync-hours`，預設 48 小時）。** 擋的是「同步壞掉
+幾天沒人發現，而這支還在照時間刪」。真實案例：09-15 那次人工清除的地板線 `01:38:53` **正好是
+我們那趟同步收工的時刻**，只差五分鐘就會永久少掉 20 天的 download log；而當時這台機器上根本
+沒有任何排程在同步。現在靠的是 tmux 裡那個 `log_monitor --watch 6000` 的 pane —— 而它正是會
+卡住的那一個，所以不能假設它活著。新鮮度只看符合 `--pattern` 的紀錄：`log_monitor.html` 與
+`.sftp_download_manifest.json` 每輪都會被改寫，即使一個 log 都沒下載到，拿它們當證據是假的。
+
+**2. 逐檔要求「本地確實有同一份」—— 而這道檢查能成立，全靠 21 天 < 30 天那 9 天的差額。**
+本地鏡像 `fleet_logs` 的清掃是 30 天（`cleanup_rules.json` 的 `sftp-fleet-reports`），且兩邊用
+**同一個時間戳**（下載時 `os.utime` 把遠端 mtime 鏡射到本地檔）。所以遠端檔滿 21 天時，本地那份
+還有 9 天壽命、**必須**還在；不在就代表我們根本沒拿到。
+
+| 本地鏡像的狀態 | 行為 |
+|---|---|
+| 那份在、大小相符 | 刪 |
+| 那份**不在** | **保留**（`local_copy_missing`） |
+| 那份在、**大小不符** | **保留**（`local_size_mismatch`，我們手上不是遠端現在這一版） |
+
+manifest 不能當證據：2026-09-22 實測 `.sftp_download_manifest.json` 的 17,275 筆是**遠端現況的
+子集**，對本地還在、遠端已消失的 23,472 個檔一筆紀錄都沒有（紀錄只回溯到 09-15 那次清除）。
+
+> **不變式：遠端窗必須嚴格短於本地窗。** 兩邊相等（30/30）時這道檢查會失效 —— 同一天到期、
+> 誰先跑誰贏，把它當硬門檻就會變成「本地先跑的日子遠端永遠刪不掉」。違反的方向是安全的
+> （刪不掉而非刪錯），而且看得出來：總結裡的 `local_copy_missing` 會開始累積。
+>
+> **停機超過 9 天會漏水**：那時遠端檔會先滿 30 天、本地那份被本地政策刪掉，之後這支恢復也
+> 不敢再刪它們。要收掉那批殘留就跑一次 `--allow-missing-local` —— 那是明確的人工決定。
+
+> **穩態**是「到貨率 × 保留天數」，以目前每天約 2,050 檔／47 MB 計算，21 天約 **43,000 檔／
+> 990 MB**。遠端現在是 17,418 檔／410 MB，但那個數字之所以小是因為有人 09-15 手動清過
+> （`download/` 只剩 8 天），不是因為有政策；換成 21 天窗等於把上限明確化。要更省就把天數
+> 轉小（7 天約 330 MB），代價是「同步壞掉幾天沒人發現」的容忍度跟著變小。
 
 ## 【狀態判斷】
 

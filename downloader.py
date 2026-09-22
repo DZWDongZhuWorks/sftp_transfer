@@ -35,9 +35,10 @@ KEEPALIVE_INTERVAL = 15
 #
 # 兩個門檻的分工：硬中止時丟掉的進度是 min(位元組門檻, 當下速率 × 秒數門檻)。慢鏈路由秒數
 # 門檻把關（20 KB/s × 60 s ≈ 1.2 MB），快鏈路由位元組門檻把關（16 MB）。位元組門檻不取更小
-# 值的理由是寫入成本：manifest 是整份重寫的 JSON，最大的一份（岸端 fleet_logs 近 4,000 個
-# 項目）實測一次 32 ms，16 MB 一次代表每 GB 約 64 次、合計 2 秒上限，而多數目錄的 manifest
-# 只有幾個項目、單次不到 1 ms。
+# 值的理由是寫入成本：manifest 是整份重寫的 JSON，16 MB 一次代表每 GB 約 64 次，而多數目錄
+# 的 manifest 只有幾個項目、單次不到 1 ms。**但最大的那一份會跟著船隊一起長大**：岸端
+# fleet_logs 的 manifest 2026-08 是近 4,000 項／單次 32 ms，2026-09 已經是 17,161 項／2.4 MB
+# ／單次 144 ms。所以「每個檔都整份重寫一次」這種節奏不能留（見 _flush_manifest_due）。
 CHECKPOINT_INTERVAL_BYTES = 16 * 1024 * 1024
 CHECKPOINT_INTERVAL_SECONDS = 60
 MANIFEST_FILENAME = ".sftp_download_manifest.json"
@@ -289,6 +290,8 @@ class SFTPBase:
         self._manifest = {}
         # 記憶體中的 manifest 是否已有尚未落盤的異動（見 _flush_manifest）。
         self._manifest_dirty = False
+        # 上一次 manifest 真的落盤的時刻（見 _flush_manifest_due）。
+        self._last_manifest_flush = 0.0
         self._ignore_spec = None
 
     def _retry_limit_reached(self, attempts):
@@ -528,6 +531,7 @@ class SFTPBase:
             with open(path, "w", encoding="utf-8") as f:
                 json.dump(self._manifest, f, ensure_ascii=False, indent=2)
             self._manifest_dirty = False
+            self._last_manifest_flush = time.time()
             return True
         except OSError as e:
             self.logger.warning(diagnostic_message(
@@ -553,6 +557,28 @@ class SFTPBase:
         的依據，不能等。掉了略過項目最多是下次重新用大小比對推導一次，不影響正確性。
         """
         if not self.resume or not self._manifest_dirty:
+            return
+        self._save_manifest(local_root)
+
+    def _flush_manifest_due(self, local_root):
+        """批次進行中的定期落盤：距上次落盤超過 CHECKPOINT_INTERVAL_SECONDS 才寫。
+
+        【為什麼「傳完的檔」不該逐檔落盤】manifest 是整份重寫的 JSON，而岸端 fleet_logs
+        的那一份已經 17,161 項／2.4 MB／單次 144 ms —— 一趟同步約 204 個新檔，光重寫
+        manifest 就是 29 秒，而且項目數與每輪新檔數都還在長。
+
+        【為什麼可以延後】傳完的項目與「略過」同級：它記的是一個**已經完整**的檔案，
+        而略過分支對 `known is None` 一律用大小比對推導（見 _download_one_file），所以
+        掉了最多是下次重新推導一次。真正不能等的是**沒傳完**的 checkpoint —— 那才是
+        硬中止後決定 .part 能不能接續的依據，那條路徑仍然當下立刻 _save_manifest()。
+
+        【為什麼還是要定期寫、不只在批次結尾寫】完全不寫的話，SIGKILL 會讓整批新檔的
+        項目一起消失，而「靠大小推導」比對不出「遠端同大小但內容換過」的情況。綁在秒數
+        門檻上，暴露的窗口就與傳輸中檢查點同一個等級（最多 60 秒的工作量）。
+        """
+        if not self.resume or not self._manifest_dirty:
+            return
+        if time.time() - self._last_manifest_flush < CHECKPOINT_INTERVAL_SECONDS:
             return
         self._save_manifest(local_root)
 
@@ -1070,7 +1096,14 @@ class SFTPDownloader(SFTPBase):
                     "local_sha256": running_hash.hexdigest(),
                     "local_bytes": transferred,
                 }
-                saved = self._save_manifest(local_root)
+                saved = False
+                if cancelled or transfer_error or transferred < remote_size:
+                    # 沒傳完：這筆是 .part 能不能接續的唯一依據，不能等。
+                    saved = self._save_manifest(local_root)
+                else:
+                    # 傳完了：與「略過」同級，改走定期落盤（理由見 _flush_manifest_due）。
+                    self._manifest_dirty = True
+                    self._flush_manifest_due(local_root)
                 if cancelled:
                     self.logger.warning(
                         diagnostic_message(
@@ -1240,6 +1273,8 @@ class SFTPDownloader(SFTPBase):
                 # 配對模式各目的地各自維護版本紀錄檔；合併模式共用單一 local 的紀錄檔。
                 self._manifest = self._load_manifest(local_root) if self.resume else {}
                 self._manifest_dirty = False
+                # 每組工作各自重新起算，否則這一組的第一個檔會被上一組的落盤時刻擋掉。
+                self._last_manifest_flush = time.time()
                 current_local_root = local_root
 
                 file_list = None

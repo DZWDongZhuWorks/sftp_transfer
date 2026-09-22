@@ -45,6 +45,9 @@ _MODE_CYCLE = ["", "download", "upload"]
 _STATUS_CYCLE = ["all", "ok", "stale", "problem"]
 _PAIR = {"success": 1, "stale": 2, "incomplete": 2, "partial": 3, "aborted": 3}
 _SYNC_LINE_LIMIT = 20
+# 同步與載入這兩個畫面都是「回呼每筆叫一次」（全船隊一輪各是 1.7 萬與 4 萬次），
+# 不限流就是把時間花在畫面上。每秒最多重畫 5 次，再密只是灌 tmux 的 socket。
+_PROGRESS_REDRAW_SEC = 0.2
 _ANSI_ESCAPE = re.compile(r"\x1b\[[0-?]*[ -/]*[@-~]")
 _ENTER_KEYS = (10, 13, curses.KEY_ENTER)
 _SORT_CYCLE = ["船隻名稱", "更新時間", "嚴重度", "裝置名稱", "版本", "時鐘偏差"]
@@ -1061,6 +1064,7 @@ _HELP_LINES = [
     "看明細    在裝置列按 Enter；明細再按 Enter 看該筆 CSV 原始資料",
     "CSV檢視   ↑↓/PgUp/PgDn/g/G 捲動、←→ 水平捲動、0 復位、s/S 排序、q/Esc 返回",
     "檢視      f 切換 平坦/分群（平坦＝全船隊一張表，忽略 方向/船/IPC 分群）",
+    "同步/載入 同步與解析期間畫面不收一般按鍵；q 中止這一輪,保留上一輪的資料",
     "排序      o 循環欄位（船隻名稱 / 更新時間 / 嚴重度 / 裝置名稱 / 版本）、O 切換升降冪",
     "          預設 船隻名稱↓（分群模式下這欄排的是船群，其餘欄位排裝置列）",
     "          更新時間↑ 最久未更新在前（找失聯裝置）",
@@ -1135,6 +1139,35 @@ def _swallow_escape_sequence(stdscr) -> bool:
         stdscr.nodelay(False)
 
 
+class _ReloadAborted(Exception):
+    """使用者在同步／解析途中按了 q：放棄這一輪 reload。"""
+
+
+def _poll_abort(stdscr) -> None:
+    """把終端機積著的按鍵讀乾淨；看到 q 就丟 _ReloadAborted。
+
+    【為什麼一定要有這個】reload()（同步子行程＋解析）是同步跑完才回到主迴圈的
+    getch 的，全船隊實測一輪是 126 秒同步加 19 秒解析。那兩分半鐘之內沒有任何人
+    讀鍵盤，使用者按的鍵全部堆在 tty 緩衝區裡，等畫面回來才一次補送成一串亂跳 ——
+    「按了沒反應、然後自己亂跳」就是這樣來的。這裡在每次重繪時把緩衝區抽乾，
+    順便讓 q 成為那段時間裡唯一有效的鍵。
+
+    【為什麼只認 q、不認 Esc】滑鼠回報與方向鍵本身就是 ESC 開頭的序列（見
+    _swallow_escape_sequence 的說明），這裡沒有主迴圈那套探讀就分不出裸 Esc 與
+    序列開頭，誤判的代價是動一下滑鼠就把兩分鐘的同步砍掉。
+
+    離開時刻意不還原讀鍵模式：這段路徑上沒有別人要讀鍵，由 reload() 統一還原
+    （nodelay(False) 會把 timeout 清成無限阻塞，還原的責任不能散在這裡）。
+    """
+    stdscr.nodelay(True)
+    while True:
+        ch = stdscr.getch()
+        if ch == -1:
+            return
+        if ch in (ord("q"), ord("Q")):
+            raise _ReloadAborted()
+
+
 def _clean_sync_line(line: str) -> str:
     """移除會干擾 curses 游標位置的 ANSI 與控制字元。"""
     line = _ANSI_ESCAPE.sub("", line).replace("\t", "    ")
@@ -1156,33 +1189,51 @@ def _draw_sync(stdscr, lines) -> None:
             stdscr,
             maxy - 1,
             0,
-            pad_display(" 同步完成後自動返回監視畫面", width),
+            pad_display(" 同步完成後自動返回監視畫面（q 中止這一輪）", width),
             curses.A_REVERSE,
         )
     stdscr.refresh()
 
 
 def _sync_with_progress(stdscr, sync_config) -> bool:
-    """攔截 main.py 輸出，清理後在 curses 內即時顯示最近幾行。"""
+    """攔截 main.py 輸出，清理後在 curses 內即時顯示最近幾行。
+
+    重繪要限流：全船隊一輪同步會吐 1.7 萬行，逐行整頁 erase+refresh 就是 1.7 萬次
+    全螢幕重繪灌進 tmux。限流之後畫面看起來一樣在動（每秒 5 次），但最後一幀一定要
+    補畫 —— 不補的話畫面會停在最多晚 0.2 秒的位置,而那正好是同步的結語那幾行。
+    """
     recent = deque(maxlen=_SYNC_LINE_LIMIT)
-    _draw_sync(stdscr, recent)
+    last = [0.0]
+
+    def redraw(force=False):
+        now = time.monotonic()
+        if not force and (now - last[0]) < _PROGRESS_REDRAW_SEC:
+            return
+        last[0] = now
+        _draw_sync(stdscr, recent)
+
+    redraw(force=True)
 
     def show(line):
         cleaned = _clean_sync_line(line)
         if cleaned:
             recent.append(cleaned)
-            _draw_sync(stdscr, recent)
+        # 被 _clean_sync_line 濾掉的行也要抽鍵：那是純控制字元的行,同樣會吐很多次。
+        _poll_abort(stdscr)
+        redraw()
 
-    return sync_logs(
-        sync_config,
-        quiet=True,
-        output_callback=show,
-    )
+    try:
+        return sync_logs(
+            sync_config,
+            quiet=True,
+            output_callback=show,
+        )
+    finally:
+        redraw(force=True)
 
 
 # 全船隊 31,876 份 log 平行解析要十幾秒，在那之前畫面上什麼都沒有 —— 看起來就像當掉。
 # 這一段的存在只為了「讓人看得出它在動」：總數、已解析、百分比與粗估剩餘時間。
-_LOADING_REDRAW_SEC = 0.2   # 每秒最多重畫 5 次：再密只是把時間花在畫面上
 _LOADING_BAR_W = 30
 
 
@@ -1224,7 +1275,8 @@ def _draw_loading(stdscr, log_dir, done: int, total: int, elapsed: float) -> Non
         _addstr(stdscr, 3, 0, fit_display(" " + loading_line(done, total, elapsed), width)[0])
     if maxy > 1:
         _addstr(stdscr, maxy - 1, 0,
-                pad_display(" 讀完自動進入監視畫面", width), curses.A_REVERSE)
+                pad_display(" 讀完自動進入監視畫面（q 中止這一輪）", width),
+                curses.A_REVERSE)
     stdscr.refresh()
 
 
@@ -1239,9 +1291,10 @@ def _loading_progress(stdscr, log_dir):
 
     def tick(done, total):
         now = time.monotonic()
-        if done and done < total and (now - last[0]) < _LOADING_REDRAW_SEC:
+        if done and done < total and (now - last[0]) < _PROGRESS_REDRAW_SEC:
             return
         last[0] = now
+        _poll_abort(stdscr)
         _draw_loading(stdscr, log_dir, done, total, now - started)
 
     return tick
@@ -1630,14 +1683,31 @@ def _main_loop(stdscr, args):
     state = TuiState(flat=bool(getattr(args, "flat", False)))
     watch = args.watch or 0
 
-    def reload():
-        now = datetime.now()
-        tree = load_tree(
-            args,
-            now,
-            sync_handler=lambda config: _sync_with_progress(stdscr, config),
-            progress=_loading_progress(stdscr, getattr(args, "log_dir", "")),
-        )
+    def reload(current=None):
+        """重載一輪；current 是上一輪的樹,中止時退回它。
+
+        【為什麼要能中止】這整段（同步子行程＋解析）跑完才會回到主迴圈的 getch，
+        全船隊實測一輪是 126 秒同步加 19 秒解析。中止是那兩分半鐘裡唯一能把畫面
+        拿回手上的路。中止後保留上一輪的資料 —— 那份資料頂多舊 100 分鐘,總比清成
+        空畫面有用。首輪沒有上一輪可退,中止就等於離開（見 run_app）。
+        """
+        try:
+            now = datetime.now()
+            tree = load_tree(
+                args,
+                now,
+                sync_handler=lambda config: _sync_with_progress(stdscr, config),
+                progress=_loading_progress(stdscr, getattr(args, "log_dir", "")),
+            )
+        except _ReloadAborted:
+            if current is None:
+                raise
+            state.notice = "已中止這一輪重載（畫面仍是上一輪的資料）"
+            return current
+        finally:
+            # _poll_abort 動過 nodelay,而 nodelay(False) 會把 timeout 清成無限阻塞 ——
+            # 不在這裡還原的話,--watch 的 1 秒輪詢再也不會醒,畫面就真的凍住了。
+            stdscr.timeout(1000 if watch else -1)
         seed_expanded(tree, state)
         state.now = now
         # reload 是唯一的重載點：首輪啟動、r 手動重載、--watch 自動刷新都經過這裡，
@@ -1656,7 +1726,7 @@ def _main_loop(stdscr, args):
         ch = stdscr.getch()
         if ch == -1:
             if watch and (time.monotonic() - last) >= watch:
-                tree = reload()
+                tree = reload(tree)
                 last = time.monotonic()
             continue
         if ch == 27 and _swallow_escape_sequence(stdscr):
@@ -1755,7 +1825,7 @@ def _main_loop(stdscr, args):
         elif act == "search":
             _prompt_search(stdscr, state)
         elif act == "reload":
-            tree = reload()
+            tree = reload(tree)
             last = time.monotonic()
         elif act == "help":
             _popup(stdscr, _HELP_LINES, "說明")
@@ -1765,6 +1835,7 @@ def run_app(args) -> int:
     """由 log_monitor.main（--tui、TTY）呼叫；包在 curses.wrapper 內。"""
     try:
         curses.wrapper(_main_loop, args)
-    except KeyboardInterrupt:
+    except (KeyboardInterrupt, _ReloadAborted):
+        # 首輪還沒有資料時按 q：curses.wrapper 已把終端機還原,直接安靜離開。
         pass
     return 0

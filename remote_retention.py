@@ -48,17 +48,21 @@
    log；而當時這台機器上根本沒有任何排程在同步。現在靠的是 tmux 裡那個
    `log_monitor --watch 6000` 的 pane —— 而它正是會卡住的那一個，所以不能假設它活著。
 
-3. **逐檔的「本地確實有」只驗得到一半，這是 30 天窗自己的限制。** 本地鏡像的清掃也是 30 天
-   且用同一個時間戳（下載時 `os.utime` 把遠端 mtime 鏡射到本地檔），所以遠端檔滿 30 天的
-   那一刻，本地那份也正在同一天被刪 —— 誰先跑誰贏。若把「本地必須還在」當成硬門檻，本地
-   先跑的日子遠端就永遠刪不掉（漏水）。而 manifest 也救不了：2026-09-22 實測
-   `.sftp_download_manifest.json` 的 17,275 筆是**遠端現況的子集**，對本地還在、遠端已消失
-   的 23,472 個檔**一筆紀錄都沒有**（紀錄只回溯到 09-15 那次清除），它不是「我們曾經收到過」
-   的耐久證據。所以逐檔只做**降級版**的檢查：
-     * 本地那份不在 → 放行（它已經超過本地保留窗，本地政策自己刪掉是預期行為）
-     * 本地那份在、大小相符 → 放行
-     * 本地那份在、**大小不符** → 保留（我們手上不是遠端現在這一版）
-   要拿回完整的逐檔保證，遠端窗必須**嚴格短於**本地窗（例如遠端 21 天、本地 30 天）。
+3. **逐檔要求「本地確實有同一份」。** 遠端 21 天 < 本地 30 天，所以遠端檔到期時本地那份
+   還有 9 天壽命、**必須**還在；不在就代表我們根本沒拿到，那就不能刪。這是遠端窗刻意短於
+   本地窗換來的保證（見 DEFAULT_RETENTION_DAYS）。
+
+     * 本地那份在、大小相符 → 刪
+     * 本地那份**不在** → 保留（`local_copy_missing`）
+     * 本地那份在、**大小不符** → 保留（`local_size_mismatch`，我們手上不是遠端現在這一版）
+
+   為什麼不用 manifest 當證據：2026-09-22 實測 `.sftp_download_manifest.json` 的 17,275 筆是
+   **遠端現況的子集**，對本地還在、遠端已消失的 23,472 個檔**一筆紀錄都沒有**（紀錄只回溯到
+   09-15 那次清除），它不是「我們曾經收到過」的耐久證據。
+
+   **停機超過 9 天會漏水**：那時遠端檔會先滿 30 天、本地那份被本地政策刪掉，之後這支恢復
+   也不敢再刪它們了（`local_copy_missing` 會累積，看得出來）。要收掉那批殘留就跑一次
+   `--allow-missing-local`，那是明確的人工決定，不該是預設。
 
 4. **空目錄是選配（`--remove-empty-dirs`），而且永遠不動最上面兩層。** 清空的葉目錄移掉之後
    船再上傳時 `_ensure_remote_dir` 會自己建回來，不會失去可見性；順帶讓每輪同步的目錄走訪
@@ -88,7 +92,16 @@ from downloader import SFTPBase, format_exception, format_size, diagnostic_messa
 from settings import PlaceholderError, load_settings
 
 BASE_DIR = Path(__file__).resolve().parent
-DEFAULT_RETENTION_DAYS = 30
+# 遠端窗 21 天，**刻意短於本地鏡像的 30 天**（scheduler 的 cleanup_rules.json 規則
+# `sftp-fleet-reports`）。那 9 天的差額就是逐檔「本地確實有」這道檢查能成立的全部理由：
+# 遠端檔滿 21 天時，本地那份還有 9 天才到期，所以它**必須**還在 —— 不在就代表我們根本
+# 沒拿到，那就不能刪。兩邊相等（30/30）時這道檢查會失效，因為兩者用同一個時間戳
+# （下載時 os.utime 把遠端 mtime 鏡射到本地檔）、同一天到期、誰先跑誰贏。
+#
+# 【不變式】遠端窗 < 本地窗。違反的方向是安全的（變成刪不掉而非刪錯），而且看得出來：
+# 總結裡的 local_copy_missing 會開始累積。
+LOCAL_MIRROR_RETENTION_DAYS = 30      # 只是文件；真相在 cleanup_rules.json，這裡不去讀它（反向依賴）
+DEFAULT_RETENTION_DAYS = 21
 # 預設樣式與 cleanup_rules.json 的 `sftp-transfer-csv-logs` 一字不差：只吃逐次傳輸紀錄。
 # 刻意不用 `*.csv` 也不用 `*` —— 遠端那棵樹現在只有這兩種前綴的檔，但哪天多了別的東西
 # （設定、報表、誰放上去的暫存檔），用寬樣式就會一起刪掉。
@@ -159,13 +172,15 @@ class RemoteRetention(SFTPBase):
     """
 
     def __init__(self, *args, retention_days=DEFAULT_RETENTION_DAYS, apply=False,
-                 remove_empty_dirs=False, verbose=False, **kwargs):
+                 remove_empty_dirs=False, verbose=False, allow_missing_local=False,
+                 **kwargs):
         kwargs["delete_source_min_age_minutes"] = max(0.0, float(retention_days)) * 24 * 60
         super().__init__(*args, **kwargs)
         self.retention_days = retention_days
         self.apply = apply
         self.remove_empty_dirs = remove_empty_dirs
         self.verbose = verbose
+        self.allow_missing_local = allow_missing_local
 
     # ---- 走訪 ----------------------------------------------------------
     def _walk(self, root: str) -> Tuple[list, list]:
@@ -210,14 +225,14 @@ class RemoteRetention(SFTPBase):
     def _local_copy_verdict(self, rel_path: str, remote_size) -> Optional[str]:
         """本地鏡像的狀態。回 None 代表可以刪，回字串代表保留的理由代碼。
 
-        降級版檢查，理由見檔頭安全設計第 3 點：本地那份不在是**預期**的（本地也是 30 天窗、
-        同一個時間戳），把它當硬門檻會讓遠端永遠刪不掉。
+        遠端窗（21 天）短於本地窗（30 天），所以遠端檔到期時本地那份必須還在 ——
+        這道檢查因此是真正的門檻，不是裝飾。理由與例外見檔頭安全設計第 3 點。
         """
         local_file = Path(self.local_path) / Path(*rel_path.split("/"))
         try:
             local_size = local_file.stat().st_size
         except OSError:
-            return None
+            return None if self.allow_missing_local else "local_copy_missing"
         if remote_size is not None and local_size != remote_size:
             return "local_size_mismatch"
         return None
@@ -246,6 +261,8 @@ class RemoteRetention(SFTPBase):
             "RETENTION_CONTEXT", f"岸端 log 保留政策：{mode_label}",
             host=self.host, remote_path=roots, local_path=str(self.local_path),
             retention_days=self.retention_days,
+            local_mirror_retention_days=LOCAL_MIRROR_RETENTION_DAYS,
+            allow_missing_local=self.allow_missing_local,
             cutoff=time.strftime("%Y-%m-%d %H:%M:%S", time.localtime(cutoff)),
             pattern=self.delete_source_pattern,
             remove_empty_dirs=self.remove_empty_dirs,
@@ -270,9 +287,10 @@ class RemoteRetention(SFTPBase):
                     code = self._local_copy_verdict(rel_path, size)
                     if code is not None:
                         kept[code] = kept.get(code, 0) + 1
-                        self.logger.warning(
-                            f"  保留（本地那份與遠端大小不符，我們手上不是這一版）: {rel_path}"
-                        )
+                        why = ("本地鏡像沒有這一份，我們可能根本沒拿到"
+                               if code == "local_copy_missing"
+                               else "本地那份與遠端大小不符，我們手上不是這一版")
+                        self.logger.warning(f"  保留（{why}）: {rel_path}")
                         continue
                     if not self.apply:
                         self.stats["deleted"] += 1
@@ -345,6 +363,9 @@ def main(argv=None) -> int:
                         default=DEFAULT_REQUIRE_LOCAL_SYNC_HOURS,
                         help="本地鏡像最新一份紀錄必須新於這麼多小時，否則整趟放棄"
                              f"（預設 {DEFAULT_REQUIRE_LOCAL_SYNC_HOURS}；0 = 不檢查）")
+    parser.add_argument("--allow-missing-local", action="store_true",
+                        help="本地鏡像沒有那一份時照樣刪。只在停機超過 9 天、要收掉殘留時"
+                             "才用（見檔頭安全設計第 3 點），不該進排程")
     parser.add_argument("--verbose", action="store_true", help="逐檔列出，不只前 20 筆")
     args = parser.parse_args(argv)
 
@@ -405,6 +426,7 @@ def main(argv=None) -> int:
         apply=args.apply,
         remove_empty_dirs=args.remove_empty_dirs,
         verbose=args.verbose,
+        allow_missing_local=args.allow_missing_local,
     )
     return task.run()
 

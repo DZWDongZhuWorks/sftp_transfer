@@ -82,6 +82,10 @@ BOOT_ACTIVATING_FAIL_SECONDS = 900
 #
 # nssms-shipboard-alert-upload 在 IPC1/IPC2 都跑；有效角色不影響它，IPC3 則為 N/A。
 #
+# nssms-remote-log-retention 只在 IPC1 —— 適用範圍照樣由 unit 內的 `# NSSMS-BaseIPC=ipc1`
+# 宣告，本巡檢自己讀。它在船上會因為找不到 config/log_monitor_sync.json 而 exit 0 略過
+# ；那是「本機不是彙整端」而不是故障，所以仍是 Result=success，不需要特例。
+#
 # 【勿在下面的 tuple 內寫含括號的註解】device_monitor/tests/test_integration.sh 的涵蓋度斷言
 # 用 `^TIMERS = \((.*?)\)` 抓這個 tuple,非貪婪會停在**第一個**右括號:註解裡的括號會把清單
 # 截斷,於是後面的 timer 全被誤判為「沒被涵蓋」。要加說明就寫在這一段。
@@ -92,6 +96,7 @@ TIMERS = (
     "nssms-device-monitor-report",
     "nssms-download-photos",
     "nssms-reboot",
+    "nssms-remote-log-retention",
     "nssms-shipboard-alert-upload",
     "nssms-teamviewer",
     "nssms-warm-env",

@@ -100,6 +100,7 @@ TIMERS = (
     "nssms-shipboard-alert-upload",
     "nssms-teamviewer",
     "nssms-warm-env",
+    "nssms-warning-sign-upload",
     "nssms-wave-send",
     "nssms-wave-update",
 )

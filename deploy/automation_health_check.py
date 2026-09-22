@@ -87,6 +87,7 @@ BOOT_ACTIVATING_FAIL_SECONDS = 900
 # 截斷,於是後面的 timer 全被誤判為「沒被涵蓋」。要加說明就寫在這一段。
 TIMERS = (
     "nssms-cleanup-old-files",
+    "nssms-deploy-reconcile",
     "nssms-device-monitor-probe",
     "nssms-device-monitor-report",
     "nssms-download-photos",

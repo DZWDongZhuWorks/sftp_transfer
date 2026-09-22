@@ -4,6 +4,7 @@
 不需網路：於 tmp_path 寫入含 BOM 的合成 CSV log，直接驗證解析、彙整與呈現。
 """
 import csv
+import json
 import multiprocessing
 import os
 from pathlib import Path
@@ -13,6 +14,7 @@ from unittest import mock
 
 import pytest
 
+from monitor import log_monitor
 from monitor.log_monitor import (
     RunRecord,
     aggregate_by_device,
@@ -706,11 +708,17 @@ class TestParallelCollect:
         return tmp_path
 
     def test_parallel_and_sequential_agree(self, tmp_path):
-        """逐檔比對而不是只比數量：順序也要一致，aggregate 的穩定排序靠它。"""
+        """逐檔比對而不是只比數量：順序也要一致，aggregate 的穩定排序靠它。
+
+        一律 use_cache=False：第二次呼叫若吃到第一次寫下的快取，比的就不是
+        平行與單執行緒,而是快取與它自己。
+        """
         d = self._dir(tmp_path)
-        assert collect_logs(d, workers=4) == collect_logs(d, workers=1)
-        assert collect_logs(d, mode="upload", workers=4) == collect_logs(d, mode="upload", workers=1)
-        assert len(collect_logs(d, workers=4)) == 12      # 非本工具的 CSV 仍被濾掉
+        cold = dict(use_cache=False)
+        assert collect_logs(d, workers=4, **cold) == collect_logs(d, workers=1, **cold)
+        assert (collect_logs(d, mode="upload", workers=4, **cold)
+                == collect_logs(d, mode="upload", workers=1, **cold))
+        assert len(collect_logs(d, workers=4, **cold)) == 12   # 非本工具的 CSV 仍被濾掉
 
     def test_progress_reports_total_before_parsing_and_ends_at_total(self, tmp_path):
         """呼叫端要先知道總數才畫得出進度條，所以開工前先報一次 (0, total)。"""
@@ -721,12 +729,104 @@ class TestParallelCollect:
         assert seen[-1] == (13, 13)
         assert [x for x, _ in seen] == sorted(x for x, _ in seen)   # 單調遞增
 
+    def test_progress_still_monotonic_and_complete_on_a_cache_hit(self, tmp_path):
+        """第二輪 99.5% 命中：進度條要先跳到命中的位置,不能從 0 再爬一次。"""
+        d = self._dir(tmp_path)
+        collect_logs(d)                                    # 第一輪把快取寫出來
+        seen = []
+        collect_logs(d, progress=lambda done, total: seen.append((done, total)))
+        assert seen[0] == (0, 13)
+        assert (13, 13) in seen                            # 全命中時直接跳到底
+        assert [x for x, _ in seen] == sorted(x for x, _ in seen)
+
     def test_falls_back_to_single_process_when_fork_is_unavailable(self, tmp_path):
         """沒有 fork（或 pool 開不起來）只是慢，不能少解析任何一份。"""
         d = self._dir(tmp_path)
-        expected = collect_logs(d, workers=1)
+        expected = collect_logs(d, workers=1, use_cache=False)
         with mock.patch.object(multiprocessing, "get_context", side_effect=ValueError):
-            assert collect_logs(d, workers=4) == expected
+            assert collect_logs(d, workers=4, use_cache=False) == expected
+
+    # --- 解析結果快取 -----------------------------------------------------
+    # 快取是純最佳化：它唯一被允許改變的東西是速度。下面每一條都在釘「結果不變」。
+
+    def test_cache_hit_gives_identical_records(self, tmp_path):
+        """冷啟與命中要逐欄一致 —— 含 arrived_at（它是從快取鍵的 mtime 重建的）。"""
+        d = self._dir(tmp_path)
+        cold = collect_logs(d, use_cache=False)
+        collect_logs(d)                                     # 寫出快取
+        warm = collect_logs(d)
+        assert warm == cold
+        assert [r.arrived_at for r in warm] == [r.arrived_at for r in cold]
+        assert (tmp_path / log_monitor._PARSE_CACHE_FILENAME).exists()
+
+    def test_cache_key_includes_mtime_and_size(self, tmp_path):
+        """log 是寫完就不改的,所以 (mtime, size) 沒變＝內容沒變。改了就必須重解析。"""
+        d = self._dir(tmp_path)
+        collect_logs(d)
+        target = tmp_path / "D_WH000_IPC-1_ecdis_0.csv"
+        write_log(target, "WH000_IPC-1_ecdis",
+                  [("2026-09-15 10:00:00", "INFO", "=== SFTP 下載任務開始 ==="),
+                   ("2026-09-15 10:00:00", "INFO", "=== 下載任務結束：成功 9，略過 0，失敗 0 ===")])
+        os.utime(target, (1_800_000_000, 1_800_000_000))    # 明確換一個 mtime
+        again = {r.path: r for r in collect_logs(d)}
+        assert again[target].success == 9                   # 吃到新內容,不是舊快取
+
+    def test_cache_drops_deleted_files(self, tmp_path):
+        """快取只收這一輪真的看到的檔,否則它會跟著 fleet_logs 一起無上限長大。"""
+        d = self._dir(tmp_path)
+        collect_logs(d)
+        (tmp_path / "D_WH000_IPC-1_ecdis_0.csv").unlink()
+        collect_logs(d)
+        entries = json.loads(
+            (tmp_path / log_monitor._PARSE_CACHE_FILENAME).read_text(encoding="utf-8")
+        )["entries"]
+        assert "D_WH000_IPC-1_ecdis_0.csv" not in entries
+        assert len(entries) == 12                           # 原本 13 份
+
+    def test_cache_remembers_files_that_are_not_ours(self, tmp_path):
+        """parse_log_file 回 None 的也要記著,否則每輪都要重讀一次才知道不是我們的。"""
+        d = self._dir(tmp_path)
+        collect_logs(d)
+        entries = json.loads(
+            (tmp_path / log_monitor._PARSE_CACHE_FILENAME).read_text(encoding="utf-8")
+        )["entries"]
+        assert entries["not_ours.csv"][2] is None
+
+    @pytest.mark.parametrize("payload", [
+        "{ 不是 JSON",
+        '{"version": 999, "entries": {}}',                  # 版號不合＝欄位可能已改
+        '{"entries": "不是 dict"}',
+        '[]',
+    ])
+    def test_broken_cache_is_ignored_not_fatal(self, tmp_path, payload):
+        """快取壞掉只該讓這一輪變慢,不該讓畫面出錯（沿用 manifest 的姿態）。"""
+        d = self._dir(tmp_path)
+        expected = collect_logs(d, use_cache=False)
+        (tmp_path / log_monitor._PARSE_CACHE_FILENAME).write_text(payload, encoding="utf-8")
+        assert collect_logs(d) == expected
+
+    def test_tampered_entry_is_ignored_not_trusted(self, tmp_path):
+        """快取檔與 manifest 同住在「下載目標」目錄裡,所以每個欄位都要驗型別:
+        鍵對得上但內容形狀不對時,重新解析,不是把垃圾端上畫面。"""
+        d = self._dir(tmp_path)
+        expected = collect_logs(d, use_cache=False)
+        collect_logs(d)                                     # 先寫出一份正常的快取
+        path = tmp_path / log_monitor._PARSE_CACHE_FILENAME
+        data = json.loads(path.read_text(encoding="utf-8"))
+        stamp = data["entries"]["D_WH000_IPC-1_ecdis_0.csv"]
+        for bad in ([stamp[0], stamp[1], ["太短"]],
+                    [stamp[0], stamp[1], [1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12]],
+                    [stamp[0], stamp[1], "不是 list"]):
+            data["entries"]["D_WH000_IPC-1_ecdis_0.csv"] = bad
+            path.write_text(json.dumps(data), encoding="utf-8")
+            assert collect_logs(d) == expected
+
+    def test_unwritable_cache_does_not_break_the_round(self, tmp_path):
+        """寫不出來（唯讀目錄、磁碟滿）只是下一輪再慢一次。"""
+        d = self._dir(tmp_path)
+        expected = collect_logs(d, use_cache=False)
+        with mock.patch.object(log_monitor.json, "dump", side_effect=OSError("full")):
+            assert collect_logs(d) == expected
 
     def test_pool_failure_midway_finishes_the_rest(self, tmp_path):
         """pool 中途壞掉就把剩下的補完 —— 監視工具不該因為最佳化本身而掛掉。"""

@@ -20,6 +20,10 @@
 
 > **解析是平行的。** 全船隊的 `fleet_logs` 實測有 31,876 份 log、共 993 MB，逐列剖析 CSV 是純 CPU 的工作，單執行緒要 **96 秒**（目錄走訪加 `stat` 只佔 0.7 秒）。所以檔案數超過 200 份時改用 `multiprocessing` 的 process pool（GIL 讓 thread 幫不上忙），本機 12 核實測 **96 秒 → 12 秒**。用 `fork` 而不是 `spawn`：`spawn` 會在子行程重新 import 這個模組，而它同時是可執行腳本。沒有 `fork` 的平台、或 pool 開不起來／中途壞掉，一律退回單執行緒把剩下的補完 —— 結果完全相同，只是慢。
 
+> **解析結果會快取。** 上面那 19 秒是「全部重算」的價錢，而兩輪之間真正變動的只有約 200 份 —— log 是一次執行一檔、寫完就不再改的，所以 `(mtime, size)` 沒變就等於內容沒變，可以直接沿用上一輪的答案。快取放在 `<log-dir>/.log_monitor_parse_cache.json`（與 `.sftp_download_manifest.json` 同一個目錄），**只收這一輪真的看到的檔**，所以刪掉的 log 會自然掉出去，不必另寫清掃。岸端實測 40,678 份：**22 秒 → 5.5 秒**（全命中且無異動時免掉寫回，3.6 秒）。
+>
+> 快取是**純最佳化，唯一被允許改變的東西是速度**。所以：壞掉、版號不合、任何欄位型別不對，一律當成沒有快取（沿用 `_load_manifest` 的姿態）—— 它住在「下載目標」目錄裡，檔案內容不能信。`arrived_at` 刻意不存進去，直接從快取鍵裡的 mtime 重建，與 `parse_log_file` 同一條算式，不會有浮點往返誤差。改 `RunRecord` 的欄位時記得把 `_PARSE_CACHE_VERSION` +1，否則舊快取會餵出錯的形狀。
+
 裝置身分取自 `device_name`，慣例為 `{vsl_name}_{ipc}_{project}`（如 `CLINK_IPC-1_ecdis`）；
 無法解析者（靜態名如 `RADAR_UPLOADER`、舊命名）歸入「（未分類）」桶。
 
@@ -321,5 +325,6 @@ pytest -q tests/test_log_monitor.py
 | `monitor/tui.py` | curses 互動式 TUI（`--tui`）；資料層沿用 `log_monitor`。 |
 | `monitor/__init__.py` | 使 `import monitor.log_monitor` 於測試中可用。 |
 | `config/log_monitor_sync.json` | 抓取遠端 `sftp_logs` 的 download 設定檔（依慣例不納入版控）。 |
+| `<log-dir>/.log_monitor_parse_cache.json` | 解析結果快取（自動產生、可安全刪除，刪了只是下一輪慢一次）。 |
 | `tests/test_log_monitor.py` | 解析/分群/呈現的單元測試。 |
 | `tests/test_tui.py` | TUI 純邏輯測試（flatten/reducer/按鍵映射）。 |

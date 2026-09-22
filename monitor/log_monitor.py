@@ -23,6 +23,7 @@ from typing import Dict, List, Optional, Tuple
 import argparse
 import csv
 import html
+import json
 import multiprocessing
 import os
 import re
@@ -444,8 +445,138 @@ def _parse_all(paths: List[Path], workers: Optional[int] = None):
         yield parse_log_file(path)
 
 
+# 解析結果快取
+# ---------------------------------------------------------------------------
+# 岸端 fleet_logs 已經有 40,635 份 log／1.1 GB，每輪重解析要 19 秒（12 核平行之後），
+# 而兩輪之間真正變動的只有約 200 份 —— 其餘 99.5% 是重算一模一樣的答案。log 是
+# 一次執行一檔、寫完就不再改的,所以 (mtime, size) 沒變就等於內容沒變,可以直接沿用。
+# 實測 20.2 MB 的快取檔 dumps 0.30 秒、loads 0.78 秒,整輪 19 秒 → 約 2 秒。
+#
+# 快取壞掉一律當成沒有快取（沿用 _load_manifest 的姿態）：它是最佳化,壞掉只該讓
+# 這一輪變慢,不該讓畫面出錯。存放位置與 .sftp_download_manifest.json 同一個目錄,
+# 而那個目錄是下載目標 —— 所以解出來的每個欄位都要驗型別,不能信檔案內容。
+_PARSE_CACHE_FILENAME = ".log_monitor_parse_cache.json"
+# RunRecord 的欄位一改,舊快取就必須整份作廢 —— 改欄位時記得把這個版號 +1。
+_PARSE_CACHE_VERSION = 1
+# 條目刻意是扁平的一串,不是巢狀 dict：40,678 筆的快取檔在 json 的 _iterencode 裡
+# 是按「容器節點數」計價的,少一層巢狀就少幾十萬個節點（實測寫回 2.6 → 1.8 秒）。
+_PARSE_CACHE_FIELDS = 14
+_CACHE_MISS = object()      # 與 None 區分：None 是「快取記著這份不是本工具的 log」
+
+
+def _fast_ts(text: str) -> datetime:
+    """解 TS_FMT（固定寬度）的時間戳。
+
+    不用 strptime 是因為量出來差一個數量級：快取解碼一輪要叫 81,356 次,strptime
+    佔掉 2.4 秒（整輪 8.1 秒）,自己切欄位之後剩 0.2 秒。格式壞掉時 int() 自己會丟
+    ValueError,呼叫端接住當成快取未命中,所以不必自己驗每個分隔符。
+    """
+    if len(text) != 19:
+        raise ValueError(text)
+    return datetime(int(text[0:4]), int(text[5:7]), int(text[8:10]),
+                    int(text[11:13]), int(text[14:16]), int(text[17:19]))
+
+
+def _cache_encode(rec: Optional[RunRecord]):
+    """RunRecord → 可 JSON 序列化的定位清單；None 照實存 None。
+
+    arrived_at 刻意不存：它就是 datetime.fromtimestamp(檔案 mtime)，而 mtime 已經在
+    快取鍵裡了。從鍵重建與 parse_log_file 的算法完全同一條，省掉一次 float 往返
+    （datetime → timestamp() → fromtimestamp 在微秒級不保證還原,而 mtime 帶微秒）。
+    started_at/ended_at 存字串而不是 float：它們本來就是用 TS_FMT 解出來的整秒,
+    原樣寫回去再解一次是無損的,也不必擔心時區與日光節約。
+    """
+    if rec is None:
+        return None
+    return [
+        rec.device_name, rec.mode, rec.version_info,
+        None if rec.started_at is None else rec.started_at.strftime(TS_FMT),
+        None if rec.ended_at is None else rec.ended_at.strftime(TS_FMT),
+        rec.file_count, rec.success, rec.skipped, rec.failed,
+        rec.status, rec.abort_reason,
+        rec.failed_list, rec.warnings, rec.errors,
+    ]
+
+
+def _cache_decode(path: Path, mtime: float, blob):
+    """定位清單 → RunRecord。形狀或型別不對就回 _CACHE_MISS，讓呼叫端重新解析。"""
+    if blob is None:
+        return None
+    if not isinstance(blob, list) or len(blob) != _PARSE_CACHE_FIELDS:
+        return _CACHE_MISS
+    (device_name, mode, version_info, started, ended,
+     file_count, success, skipped, failed, status, abort_reason,
+     failed_list, warnings, errors) = blob
+    for value in (device_name, mode, version_info, status, abort_reason):
+        if not isinstance(value, str):
+            return _CACHE_MISS
+    for value in (file_count, success, skipped, failed):
+        if value is not None and not isinstance(value, int):
+            return _CACHE_MISS
+    for group in (failed_list, warnings, errors):
+        if not isinstance(group, list) or not all(isinstance(x, str) for x in group):
+            return _CACHE_MISS
+    try:
+        started_at = None if started is None else _fast_ts(started)
+        ended_at = None if ended is None else _fast_ts(ended)
+        arrived_at = datetime.fromtimestamp(mtime)
+    except (TypeError, ValueError, OSError, OverflowError):
+        return _CACHE_MISS
+    return RunRecord(
+        path=path, device_name=device_name, mode=mode, version_info=version_info,
+        started_at=started_at, ended_at=ended_at, arrived_at=arrived_at,
+        file_count=file_count, success=success, skipped=skipped, failed=failed,
+        status=status, abort_reason=abort_reason,
+        failed_list=list(failed_list), warnings=list(warnings), errors=list(errors),
+    )
+
+
+def _load_parse_cache(log_dir: Path) -> Dict:
+    """讀回上一輪的解析結果；讀不到或格式不對一律回空的（＝這輪全部重解析）。"""
+    try:
+        with open(log_dir / _PARSE_CACHE_FILENAME, encoding="utf-8") as fh:
+            data = json.load(fh)
+    except (OSError, ValueError):
+        return {}
+    if not isinstance(data, dict) or data.get("version") != _PARSE_CACHE_VERSION:
+        return {}
+    entries = data.get("entries")
+    return entries if isinstance(entries, dict) else {}
+
+
+def _save_parse_cache(log_dir: Path, entries: Dict) -> None:
+    """整份寫回。先寫暫存再 os.replace：--watch 每輪都覆寫這個 20 MB 的檔，
+    半寫入的狀態若被下一輪（或另一個行程）讀到，就白白丟掉一整輪的快取。
+
+    separators 去掉空白：20.9 MB 的檔,光是每個逗號後面那個空格就是幾百萬個位元組。
+    """
+    target = log_dir / _PARSE_CACHE_FILENAME
+    tmp = target.with_name(target.name + ".tmp")
+    try:
+        with open(tmp, "w", encoding="utf-8") as fh:
+            json.dump({"version": _PARSE_CACHE_VERSION, "entries": entries},
+                      fh, ensure_ascii=False, separators=(",", ":"))
+        os.replace(str(tmp), str(target))
+    except OSError:
+        # 寫不出來（唯讀目錄、磁碟滿）只是下一輪再慢一次，不影響這一輪的結果
+        try:
+            tmp.unlink()
+        except OSError:
+            pass
+
+
+def _stat_stamp(path: Path):
+    """快取鍵用的 (mtime, size)；stat 失敗回 None ＝ 這份不進快取也不吃快取。"""
+    try:
+        st = path.stat()
+    except OSError:
+        return None
+    return st.st_mtime, st.st_size
+
+
 def collect_logs(log_dir, mode: str = "all", progress=None,
-                 workers: Optional[int] = None) -> List[RunRecord]:
+                 workers: Optional[int] = None,
+                 use_cache: bool = True) -> List[RunRecord]:
     """遞迴掃描 log_dir 下所有 *.csv，解析成 RunRecord 清單並依 mode 過濾。
 
     用 rglob 是為了涵蓋遠端 sftp_logs 下載後的巢狀結構
@@ -453,21 +584,73 @@ def collect_logs(log_dir, mode: str = "all", progress=None,
 
     progress(done, total) 每解析完一份呼叫一次，另在開工前先以 (0, total) 呼叫一次 ——
     全船隊要跑十幾秒，呼叫端（TUI）得先知道總數才畫得出進度，否則畫面就是一片黑。
-    限流是呼叫端的事，這裡只如實回報。workers 只給測試指定，預設由 _worker_count 決定。
+    限流是呼叫端的事，這裡只如實回報。快取命中的份數會在開工前一次算進 done：
+    第二輪之後 99.5% 是命中，進度條會先跳到那個位置再慢慢走完真正要解析的那幾百份，
+    這是如實的 —— 命中的那些確實已經有答案了。
+
+    workers 只給測試指定，預設由 _worker_count 決定。use_cache=False 供測試強迫
+    真的走解析路徑（見 _PARSE_CACHE_FILENAME 的說明）。
     """
     log_dir = Path(log_dir)
     paths = sorted(log_dir.rglob("*.csv"))
     if progress is not None:
         progress(0, len(paths))
-    records: List[RunRecord] = []
-    for done, rec in enumerate(_parse_all(paths, workers), start=1):
+
+    cache = _load_parse_cache(log_dir) if use_cache else {}
+    # entries 是這一輪要寫回去的快取。只收這一輪真的看到的檔 —— 已刪除的 log 就這樣
+    # 自然掉出去,不必另寫一套清掃（否則快取會跟著 fleet_logs 一起無上限長大）。
+    entries: Dict[str, list] = {}
+    resolved = {}
+    todo: List[Path] = []
+    keys = {}
+    hit_intact = True     # 全命中且沒有任何檔消失 → 寫回去的內容與現有檔案完全相同
+    for path in paths:
+        stamp = _stat_stamp(path)
+        if stamp is None:
+            # stat 失敗（掃描與解析之間被搬走）：這份不吃快取也不進快取
+            todo.append(path)
+            hit_intact = False
+            continue
+        key = path.relative_to(log_dir).as_posix()
+        keys[path] = key
+        known = cache.get(key)
+        rec = _CACHE_MISS
+        if (isinstance(known, list) and len(known) == 3
+                and known[0] == stamp[0] and known[1] == stamp[1]):
+            rec = _cache_decode(path, stamp[0], known[2])
+        if rec is _CACHE_MISS:
+            todo.append(path)
+            entries[key] = [stamp[0], stamp[1], None]   # 解析完再填
+            hit_intact = False
+        else:
+            resolved[path] = rec
+            # 命中就原樣沿用 blob：decode 完再 encode 回去是純空轉。
+            entries[key] = known
+
+    done = len(paths) - len(todo)     # 命中的先算完成，進度條才不會從 0 重爬一次
+    if progress is not None and done:
+        progress(done, len(paths))
+    for path, rec in zip(todo, _parse_all(todo, workers)):
+        resolved[path] = rec
+        key = keys.get(path)
+        if key is not None:
+            entries[key][2] = _cache_encode(rec)
+        done += 1
         if progress is not None:
             progress(done, len(paths))
+
+    records: List[RunRecord] = []
+    for path in paths:
+        rec = resolved.get(path)
         if rec is None:
             continue
         if mode != "all" and rec.mode != mode:
             continue
         records.append(rec)
+    # 全命中而且沒有檔案消失時,寫回去的內容與磁碟上那份逐位元組相同 —— 21 MB 的
+    # 序列化加落盤是整輪最貴的一段（實測 2.6 秒）,沒有異動就不該付這筆錢。
+    if use_cache and not (hit_intact and len(entries) == len(cache)):
+        _save_parse_cache(log_dir, entries)
     return records
 
 

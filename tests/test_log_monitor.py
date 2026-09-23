@@ -855,12 +855,42 @@ class TestParallelCollect:
             got = list(_parse_all(paths, workers=4))
         assert got == [parse_log_file(p) for p in paths]    # 前 3 份出自 pool，其餘補完
 
+    def test_pool_workers_do_not_inherit_the_parents_sigterm_handler(self, tmp_path):
+        """with Pool 離開時 terminate() 對 worker 送 SIGTERM；worker 不能執行繼承來的 handler。
+
+        --tui 時那個 handler 是 ncurses 在 C 層裝的清理：它會把共用的 tty 設回
+        icanon+echo，父行程的畫面從此收不到任何按鍵。worker 會不會真的挨到 SIGTERM
+        是競態（閒著的 worker 可能先自己退了），所以不等它發生，直接問 worker 自己
+        的 SIGTERM 處置是什麼。
+        """
+        import signal
+        from monitor.log_monitor import _parse_all
+        d = self._dir(tmp_path)
+        paths = sorted(Path(d).rglob("*.csv"))
+
+        previous = signal.signal(signal.SIGTERM, _parent_cleanup)
+        try:
+            with mock.patch.object(log_monitor, "parse_log_file", _sigterm_is_default):
+                got = list(_parse_all(paths, workers=2))
+        finally:
+            signal.signal(signal.SIGTERM, previous)
+        assert got == [True] * len(paths)
+
     def test_worker_count_scales_down_for_small_dirs(self):
         from monitor.log_monitor import _worker_count, _PARALLEL_MIN_FILES, _PARALLEL_MAX_WORKERS
         assert _worker_count(10) == 1                       # 開 pool 比自己解析還貴
         assert _worker_count(_PARALLEL_MIN_FILES) >= 1
         assert _worker_count(10_000) <= _PARALLEL_MAX_WORKERS
         assert _worker_count(10, workers=3) == 3            # 呼叫端指定就照辦
+
+
+def _parent_cleanup(signum, frame):    # 代替 ncurses 的 SIGTERM 清理 handler
+    raise AssertionError("worker 執行了父行程的 SIGTERM handler")
+
+
+def _sigterm_is_default(path):          # 在 pool worker 裡執行（fork 之後按名稱找得到）
+    import signal
+    return signal.getsignal(signal.SIGTERM) is signal.SIG_DFL
 
 
 class TestClockOffset:

@@ -1,5 +1,5 @@
 {
-  "version": "0.23.1",
-  "date": "2026-09-22",
-  "notes": "把 nssms-warning-sign-upload 加進 deploy/automation_health_check.py 的 TIMERS 涵蓋清單。scheduler v0.36.0 新增的排程:IPC-3 每天 01:40 把 warning_sign 的告示牌截圖回傳岸端(DZWDongZhuWorks/scheduler 的 nssms-warning-sign-upload)。【為什麼這是必要的前置,不是事後補登】device_monitor/tests/test_integration.sh 斷言 scheduler/timers/ 內每一支 timer 都要被這份清單涵蓋,而它讀的是機上活體樹 —— 所以合併順序是先這個 PR、再合 scheduler#那一個,否則活體樹一更新斷言就紅。那道守門本身也是有來歷的:install_timers.sh 對 verify 失敗的 unit 是「跳過、保留舊版、繼續」,沒被巡檢涵蓋的 timer 壞掉不會有任何東西發現(device_monitor 那兩支就這樣漏過一個無效的 OnCalendar)。【只改一行就夠】base IPC 的分流早就是泛用的:unit_applicable() 讀 scheduler 母體裡的 # NSSMS-BaseIPC= 註記,不適用的機器記 SKIP、殘留已安裝 unit 才記 FAIL。這支宣告的是 ipc3(全船隊第一支只裝 IPC-3 的排程),在 IPC-1/IPC-2 上會正確地落在 SKIP 那條路徑,不需要為它加任何特例。驗證:TIMERS 解析後 13 筆、排序正確(warm-env → warning-sign-upload → wave-send);用 test_integration.sh 的同一段正則對 scheduler 的新分支實跑,未涵蓋 0 筆。"
+  "version": "0.23.2",
+  "date": "2026-09-23",
+  "notes": "sftp-monitor TUI 偶發「畫面在、每輪照刷,但怎麼按都沒反應(按鍵被回顯在畫面上)」的修正。與 v0.22.0 修的「重載期間按鍵排隊」是不同的機制。【根因】--tui 時父行程已 initscr(),ncurses 看到 SIGTERM 是 SIG_DFL 就在 C 層裝上自己的清理 handler;_parse_all 的 fork Pool 讓每個 worker 繼承它,而 with Pool 離開時是 terminate() —— 對 worker 送 SIGTERM —— worker 就跑 ncurses 的清理,把共用的 tty 設回 icanon+echo。父行程的 curses 不知情,按鍵從此卡在行緩衝裡、getch 收不到。只有一輪要解析的檔 ≥ 200 份才開 pool,加上 terminate 與 worker 自行結束之間是競態,所以是偶發的。【修法】Pool 加 initializer=_pool_worker_init,worker 一出生就把 SIGTERM 還原成 SIG_DFL。不改用 close()+join():解析途中按 q 中止時仍必須 terminate。【驗證】岸端 monitor:1 實況:stty 顯示 icanon echo、送 j 被回顯;最小重現 with Pool → 翻、close+join → 不翻;冷快取真實 TUI 舊版 2/8 次翻、修正後 0/24;新增的單元測試在拿掉 initializer 時會紅。"
 }

@@ -27,6 +27,7 @@ import json
 import multiprocessing
 import os
 import re
+import signal
 import subprocess
 import sys
 from dataclasses import dataclass, field
@@ -416,6 +417,23 @@ def _worker_count(total: int, workers: Optional[int] = None) -> int:
     return max(1, min(os.cpu_count() or 1, _PARALLEL_MAX_WORKERS))
 
 
+def _pool_worker_init() -> None:
+    """worker 一出生就把 SIGTERM 還原成預設動作。
+
+    【為什麼非做不可】--tui 時父行程已經 initscr(),而 ncurses 看到 SIGTERM 是 SIG_DFL
+    就會在 C 層裝上自己的清理 handler（Python 的 signal.getsignal 看不到它）。fork
+    出來的 worker 連這個 handler 一起繼承。with Pool 離開時是 terminate() —— 對每個
+    worker 送 SIGTERM —— 於是每個 worker 都跑一次 ncurses 的清理，把**共用的那個 tty**
+    設回 shell 模式（icanon + echo）。父行程的 curses 渾然不知，之後按的鍵全卡在行緩衝
+    裡、getch 永遠收不到：畫面還在、每輪照樣刷新，但怎麼按都沒反應（按鍵反而被回顯在
+    畫面上）。只有「這一輪要解析的檔 ≥ _PARALLEL_MIN_FILES」才會開 pool，所以是偶發的。
+
+    不改用 close()+join() 避開 terminate：使用者在解析途中按 q 時產生器會被提早關閉，
+    那時 pool 裡還有活，只能 terminate。worker 本來就不該執行父行程的清理。
+    """
+    signal.signal(signal.SIGTERM, signal.SIG_DFL)
+
+
 def _parse_all(paths: List[Path], workers: Optional[int] = None):
     """依 paths 的順序產出每一份的解析結果（None ＝ 不是本工具的 log）。
 
@@ -435,7 +453,8 @@ def _parse_all(paths: List[Path], workers: Optional[int] = None):
             ctx = None
         if ctx is not None:
             try:
-                with ctx.Pool(_worker_count(len(paths), workers)) as pool:
+                with ctx.Pool(_worker_count(len(paths), workers),
+                              initializer=_pool_worker_init) as pool:
                     for rec in pool.imap(parse_log_file, paths, chunksize=_PARSE_CHUNK):
                         done += 1
                         yield rec

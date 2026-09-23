@@ -95,6 +95,7 @@ TIMERS = (
     "nssms-device-monitor-probe",
     "nssms-device-monitor-report",
     "nssms-download-photos",
+    "nssms-ecdis-screenshot-upload",
     "nssms-reboot",
     "nssms-remote-log-retention",
     "nssms-shipboard-alert-upload",

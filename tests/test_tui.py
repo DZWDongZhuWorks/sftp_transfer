@@ -1204,16 +1204,40 @@ def test_grouped_vessel_sort_matches_flat_vessel_order(tmp_path):
         assert _vessel_names(tree, st) == flat_order
 
 
-def test_grouped_other_sort_keys_keep_data_layer_vessel_order(tmp_path):
-    """非船名欄位在群組層沒有單一值可比，船群維持 build_tree 的次序（過期在前、未分類墊底）。"""
+def test_grouped_device_sort_keys_reorder_vessels_by_first_visible_device(tmp_path):
+    """嚴重度/更新時間/裝置名稱/版本 在分群模式也要重排船群，否則一搜尋就全成死鍵。
+
+    群組的名次＝它展開後第一列的值，所以船群次序必須與平坦模式「每艘船第一次出現」一致。
+    """
     tree = _multi_vessel_tree(tmp_path)
-    from_tree = [v.name for m in tree for v in m.vessels]
-    assert from_tree[0] == "aaa" and from_tree[-1] == "（未分類）"  # 資料層：嚴重度優先
-    for key in ("更新時間", "嚴重度", "裝置名稱"):
+    st = tui.TuiState(sort_key="嚴重度", sort_desc=True)
+    tui.expand_all(st, tree)
+    assert _vessel_names(tree, st)[0] == "aaa"          # 唯一 stale 的船在最前
+    st.sort_desc = False
+    assert _vessel_names(tree, st)[-1] == "aaa"
+    for key in ("更新時間", "嚴重度", "裝置名稱", "版本"):
         for desc in (False, True):
             st = tui.TuiState(sort_key=key, sort_desc=desc)
             tui.expand_all(st, tree)
-            assert _vessel_names(tree, st) == from_tree
+            flat = tui.flatten_flat(tree, tui.TuiState(flat=True, sort_key=key, sort_desc=desc), NOW)
+            assert _vessel_names(tree, st) == list(dict.fromkeys(r.key[2] for r in flat))
+
+
+def test_grouped_sort_after_search_ranks_by_matching_devices_only(tmp_path):
+    """搜尋後每台 IPC 只剩一列：船的名次只能由那幾列決定，不能被隱藏的列拉走。"""
+    tree = _tree(
+        tmp_path,
+        [
+            ("AAA_IPC-1_scheduler", "download", RECENT, 5, 0, 0),
+            ("AAA_IPC-1_ecdis", "download", OLD, 5, 0, 0),      # 被搜尋藏起來的 stale
+            ("BBB_IPC-1_scheduler", "download", OLD, 5, 0, 0),
+        ],
+    )
+    st = tui.TuiState(sort_key="嚴重度", sort_desc=True, query="scheduler")
+    tui.expand_all(st, tree)
+    assert _vessel_names(tree, st) == ["BBB", "AAA"]
+    st.sort_desc = False
+    assert _vessel_names(tree, st) == ["AAA", "BBB"]
 
 
 def test_sort_value_and_missing_last_seen():
@@ -1703,15 +1727,30 @@ def test_grouped_clock_sort_survives_groups_without_offset(tmp_path):
     assert _vessel_names(tree, st) == [v.name for v in tree[0].vessels]
 
 
-def test_grouped_other_sort_keys_keep_data_layer_ipc_order(tmp_path):
-    """時鐘以外的欄位在 IPC 群這一層沒有單一值可比，維持 build_tree 的次序。"""
+def test_grouped_vessel_name_sort_keeps_data_layer_ipc_order(tmp_path):
+    """船名在 IPC 群這一層是常數，穩定排序維持 build_tree 的次序。"""
     tree, _ = _clock_fleet(tmp_path)
     from_tree = [ip.name for v in tree[0].vessels if v.name == "WH322" for ip in v.ipcs]
-    for key in ("船隻名稱", "更新時間", "嚴重度", "裝置名稱", "版本"):
+    for desc in (False, True):
+        st = tui.TuiState(sort_key="船隻名稱", sort_desc=desc)
+        tui.expand_all(st, tree)
+        assert _ipc_names(tree, st, "WH322") == from_tree
+
+
+def test_grouped_device_sort_keys_reorder_ipcs(tmp_path):
+    """裝置屬性欄位也重排同船的 IPC 群：名次＝群內第一列的值。"""
+    tree, _ = _clock_fleet(tmp_path)
+    wh322 = next(v for v in tree[0].vessels if v.name == "WH322")
+    for key in ("更新時間", "嚴重度", "裝置名稱", "版本"):
         for desc in (False, True):
             st = tui.TuiState(sort_key=key, sort_desc=desc)
             tui.expand_all(st, tree)
-            assert _ipc_names(tree, st, "WH322") == from_tree
+            want = sorted(
+                wh322.ipcs,
+                key=lambda ip: (max if desc else min)(tui.sort_value(d, key) for d in ip.devices),
+                reverse=desc,
+            )
+            assert _ipc_names(tree, st, "WH322") == [ip.name for ip in want]
 
 
 def test_clock_row_survives_devices_without_offset(tmp_path):

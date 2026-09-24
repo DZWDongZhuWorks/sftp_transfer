@@ -1,5 +1,5 @@
 {
-  "version": "0.23.3",
-  "date": "2026-09-23",
-  "notes": "把 nssms-ecdis-screenshot-upload 加進 deploy/automation_health_check.py 的 TIMERS 涵蓋清單。scheduler v0.38.0 新增的排程:每天 00:40 / 08:40 / 16:40 把 ECDIS 的 debug_screenshot 搬回 /fleet/LOG/<船名>/ecdis/debug_screenshot,用的是本工具的 delete_source(送達即刪本機)。【必要的前置】device_monitor/tests/test_integration.sh 斷言 scheduler/timers/ 內每一支 timer 都要被這份清單涵蓋,而它讀的是機上活體樹 —— 所以先合這個、再合 scheduler 那一個。【只改一行就夠】那支宣告 # NSSMS-BaseIPC=ipc1,ipc2(ECDIS 平時在 ipc1、failover 後在 ipc2emer;檔案屬於實體磁碟),unit_applicable() 讀的就是這個註記,在 IPC-3 上會正確地落在 SKIP 那條路徑,不需要特例。它在來源目錄不存在、以及每輪時限到時都是 exit 0,所以 Result=success 的判斷也不需要特例。驗證:TIMERS 解析後 14 筆、排序正確(download-photos → ecdis-screenshot-upload → reboot);用 test_integration.sh 的同一段正則對 scheduler 的新分支實跑,未涵蓋 0 筆。"
+  "version": "0.23.4",
+  "date": "2026-09-24",
+  "notes": "monitor TUI 分群模式下,嚴重度/更新時間/裝置名稱/版本 也會重排船群與 IPC 群。原本群組層只對 船隻名稱 與 時鐘偏差 重排,其餘欄位只排 IPC 底下的裝置列;一搜尋(例如 /scheduler)每台 IPC 只剩一列,群內排序全成 no-op,畫面看起來完全沒在排。現在群組名次＝群內**可見**裝置排最前那一個的值(升冪取最小、降冪取最大),也就是展開後的第一列,次序與平坦模式每艘船第一次出現的位置一致;只算通過過濾的裝置,不會被隱藏的列拉走。"
 }

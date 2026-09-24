@@ -363,33 +363,62 @@ def group_clock_magnitude(group) -> float:
     return abs(getattr(group.summary, "clock_offset", None) or 0)
 
 
-def sort_vessels(vessels: list, key: str, desc: bool) -> list:
-    """分群模式的船群次序：只有「船隻名稱」與「時鐘偏差」會重排，其餘維持資料層順序。
+def _group_device_rank(devices, key: str, desc: bool):
+    """裝置屬性欄位在群組層的排序值：群內**可見**裝置裡排最前面的那一個的值。
 
-    船名對整個 IPC 群組是常數（樹就是依 船→IPC 分的），套在群組內的裝置列上必然是
-    no-op，所以這個欄位得作用在「船」這一層才有意義。時鐘同理：鐘是**機器**的屬性，
-    同一台 IPC 的各專案共用同一個鐘，只排 IPC 底下的裝置列等於在排一串相同的數字，
-    真正要比的是船與船之間、IPC 與 IPC 之間。其餘欄位是裝置屬性，群組層沒有單一值
-    可比，維持 build_tree 的 (未分類置底, -嚴重度, 名稱) 次序。
+    升冪取最小、降冪取最大 —— 也就是這個群組展開後第一列的值，所以群組排到哪裡，
+    它的第一列就是它被排上來的原因；次序也與平坦模式「這艘船第一次出現的位置」一致。
+    只看通過過濾的裝置：搜尋 scheduler 之後，船的名次就該由 scheduler 那幾列決定，
+    而不是被隱藏的 ecdis 列拉走。
+    """
+    vals = [sort_value(d, key) for d in devices]
+    return max(vals) if desc else min(vals)
 
-    排序值與 sort_value("船隻名稱") 同為 name.casefold()，兩種檢視的船名次序才一致
-    （含 （未分類） 這個 sentinel：升冪在最後、降冪在最前）。
+
+def sort_vessels(vessels: list, key: str, desc: bool, match=None) -> list:
+    """分群模式的船群次序（穩定；同值維持 build_tree 的 (未分類置底, -嚴重度, 名稱) 次序）。
+
+    - 船隻名稱：比船名本身。船名對整個 IPC 群組是常數，套在群組內的裝置列上必然是
+      no-op，所以這個欄位得作用在「船」這一層才有意義。排序值與 sort_value("船隻名稱")
+      同為 name.casefold()，兩種檢視的船名次序才一致（含 （未分類） 這個 sentinel）。
+    - 時鐘偏差：比徽章上那個數字（見 group_clock_magnitude）。鐘是**機器**的屬性，
+      只排 IPC 底下的裝置列等於在排一串相同的數字。
+    - 其餘（嚴重度、更新時間、裝置名稱、版本）是裝置屬性，用群內可見裝置的極值
+      （見 _group_device_rank）。只排群組內的裝置列是不夠的：一搜尋，每台 IPC 往往只
+      剩一列，群內排序全成 no-op，整個畫面看起來完全沒有在排。
+
+    match：裝置過濾條件（與 flatten_tree 相同）；None 代表全部可見。
     """
     if key == "時鐘偏差":
         return sorted(vessels, key=group_clock_magnitude, reverse=desc)
-    if key != "船隻名稱":
-        return vessels
-    return sorted(vessels, key=lambda g: g.name.casefold(), reverse=desc)
+    if key == "船隻名稱":
+        return sorted(vessels, key=lambda g: g.name.casefold(), reverse=desc)
+    return _sort_groups_by_devices(
+        vessels, lambda v: [d for ip in v.ipcs for d in ip.devices], key, desc, match
+    )
 
 
-def sort_ipcs(ipcs: list, key: str, desc: bool) -> list:
-    """同一艘船底下的 IPC 群次序：只有「時鐘偏差」會重排（見 sort_vessels）。
+def sort_ipcs(ipcs: list, key: str, desc: bool, match=None) -> list:
+    """同一艘船底下的 IPC 群次序：規則同 sort_vessels。
 
-    其餘欄位（含船名）在這一層都是常數或裝置屬性，維持 build_tree 的次序。
+    船名在這一層是常數（穩定排序＝維持 build_tree 的次序）；時鐘比機器的鐘；
+    其餘比群內可見裝置的極值。
     """
-    if key != "時鐘偏差":
+    if key == "時鐘偏差":
+        return sorted(ipcs, key=group_clock_magnitude, reverse=desc)
+    if key == "船隻名稱":
         return ipcs
-    return sorted(ipcs, key=group_clock_magnitude, reverse=desc)
+    return _sort_groups_by_devices(ipcs, lambda ip: ip.devices, key, desc, match)
+
+
+def _sort_groups_by_devices(groups: list, devices_of, key: str, desc: bool, match) -> list:
+    """依群內可見裝置的極值排群組；沒有可見裝置的群組反正不會畫，原樣墊在最後。"""
+    ranked, empty = [], []
+    for g in groups:
+        dvs = [d for d in devices_of(g) if match is None or match(d)]
+        (ranked if dvs else empty).append((g, dvs))
+    ranked.sort(key=lambda gd: _group_device_rank(gd[1], key, desc), reverse=desc)
+    return [g for g, _ in ranked] + [g for g, _ in empty]
 
 
 def sort_label(key: str, desc: bool) -> str:
@@ -438,7 +467,8 @@ def flatten_tree(tree, state: TuiState, now: Optional[datetime]) -> List[Row]:
         )
         if mkey not in state.expanded:
             continue
-        for v in sort_vessels(m.vessels, state.sort_key, state.sort_desc):
+        match = lambda d: _device_matches(d, state)  # noqa: E731
+        for v in sort_vessels(m.vessels, state.sort_key, state.sort_desc, match):
             v_has = any(
                 _device_matches(d, state) for ip in v.ipcs for d in ip.devices
             )
@@ -450,7 +480,7 @@ def flatten_tree(tree, state: TuiState, now: Optional[datetime]) -> List[Row]:
             )
             if vkey not in state.expanded:
                 continue
-            for ip in sort_ipcs(v.ipcs, state.sort_key, state.sort_desc):
+            for ip in sort_ipcs(v.ipcs, state.sort_key, state.sort_desc, match):
                 dvs = [d for d in ip.devices if _device_matches(d, state)]
                 if not dvs:
                     continue

@@ -482,7 +482,9 @@ SFTP 連線，並把 `.part` 的**精確位元組數、SHA-256、遠端 size/mti
 範圍還不一樣、地板線是零碎的時間點而不是日界），不是任何排程的形狀。
 
 `remote_retention.py` 把它變成可預測的 **21 天**窗，由 scheduler 的
-`nssms-remote-log-retention.timer` 每天 03:10 觸發（`# NSSMS-BaseIPC=ipc1`）：
+`nssms-remote-log-retention.timer` 每天 03:10 觸發。它只裝在岸端彙整機的 IPC-1
+（`# NSSMS-BaseIPC=ipc1` + `# NSSMS-Vessel=CLINK`，兩者為 AND，由 scheduler 的 install_timers.sh
+落實；`deploy/automation_health_check.py` 讀同一份註記，船上未安裝報 SKIP、殘留報 FAIL）：
 
 ```bash
 # 預覽（預設，不會刪任何東西）

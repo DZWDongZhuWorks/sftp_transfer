@@ -21,10 +21,15 @@ cd "$BASE_DIR"
 
 config="$BASE_DIR/config/log_monitor_sync.json"
 
-# 【彙整端閘門】unit 本身用 `# NSSMS-BaseIPC=ipc1` 限定實體 IPC，但船隊每一艘的 IPC-1
-# 都符合那個條件，而只有岸端那一台在做船隊 log 彙整。判準用**設定檔在不在**：
-# config/log_monitor_sync.json 依慣例不納入版控（見 monitor/README.md），所以它天然只
-# 存在於彙整端。
+# 【彙整端閘門】「該不該裝」由 unit 的 `# NSSMS-BaseIPC=ipc1` + `# NSSMS-Vessel=CLINK`
+# 在安裝期決定（scheduler 的 install_timers.sh），船隊上根本不會有這支 timer。這裡的設定檔
+# 檢查只回答「能不能跑」。
+#
+# 【不要把它當成唯一的閘門】它原本被當成「只有彙整端才有」的判準，理由是
+# config/log_monitor_sync.json 不納入版控 —— 但不納入版控不等於不散佈：sftp_transfer 的
+# OTA 以整個目錄上傳到 STANDARD，這個檔會跟著到每一艘船。船上因此會通過這一道，改由
+# remote_retention.py 的同步新鮮度檢查以 exit 2 擋下（不會誤刪），每艘 IPC-1 每天多一個
+# failed unit。船號閘門就是為了這件事加的。
 #
 # 這裡 exit 0 而不是 exit 2 是刻意的：這是「本機不是這個工作的對象」，不是故障。回非零
 # 會讓船隊每一艘 IPC-1 每天多一個 failed unit，而那會遮蔽真正的故障

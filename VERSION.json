@@ -1,5 +1,5 @@
 {
-  "version": "0.23.5",
+  "version": "0.24.0",
   "date": "2026-09-29",
-  "notes": "新增 tag-versions workflow:主分支每進一次就自動補上 v<版號> annotated tag;首次執行會回填 23 個先前漏打的版本 tag"
+  "notes": "巡檢認得 scheduler 的船號閘門 NSSMS-Vessel(與 BaseIPC 為 AND,讀不到船號判 N/A):nssms-remote-log-retention 在船隊上未安裝報 SKIP、殘留報 FAIL,不再誤報缺件"
 }

@@ -1,0 +1,52 @@
+name: tag-versions
+
+# 主分支每進一次,就把 VERSION.json 的版號補成 v<版號> annotated tag。
+# 規則寫在 .github/scripts/tag_versions.sh 開頭;腳本每次掃整條主線,漏跑的會在下次補上。
+#
+# 【為什麼不併進 ci.yml】ci.yml 的 concurrency 是 cancel-in-progress,連續 merge 時
+# 前一次會被取消;tag job 放在那裡,被取消的那次就要等下一次 push 才補得上。
+on:
+  push:
+    branches: [main]
+  pull_request:
+    paths:
+      - VERSION.json
+      - .github/scripts/tag_versions.sh
+      - .github/workflows/tag-versions.yml
+
+# 不取消執行中的那次。排隊中的若被更新的一次取代也無妨:後者同樣掃整條主線。
+# 依事件分組,PR 預覽才不會把排隊中的 push 擠掉。
+concurrency:
+  group: tag-versions-${{ github.event_name }}-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  # PR:預覽 merge 後會打哪些 tag。HEAD 是 merge 預覽,first-parent 就是合併後的主線。
+  preview:
+    if: github.event_name == 'pull_request'
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          fetch-depth: 0   # 要完整主線歷史與既有 tag
+      - name: 預覽 merge 後會打的 tag
+        run: bash .github/scripts/tag_versions.sh --dry-run HEAD
+
+  tag:
+    if: github.event_name == 'push'
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          fetch-depth: 0
+      - name: 補上缺的版本 tag
+        run: |
+          git config user.name  "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          bash .github/scripts/tag_versions.sh --push HEAD

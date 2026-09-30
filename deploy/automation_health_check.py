@@ -82,9 +82,10 @@ BOOT_ACTIVATING_FAIL_SECONDS = 900
 #
 # nssms-shipboard-alert-upload 在 IPC1/IPC2 都跑；有效角色不影響它，IPC3 則為 N/A。
 #
-# nssms-remote-log-retention 只在 IPC1 —— 適用範圍照樣由 unit 內的 `# NSSMS-BaseIPC=ipc1`
-# 宣告，本巡檢自己讀。它在船上會因為找不到 config/log_monitor_sync.json 而 exit 0 略過
-# ；那是「本機不是彙整端」而不是故障，所以仍是 Result=success，不需要特例。
+# nssms-remote-log-retention 只在岸端彙整機（CLINK）的 IPC1 —— unit 內同時宣告
+# `# NSSMS-BaseIPC=ipc1` 與 `# NSSMS-Vessel=CLINK`（兩者為 AND），本巡檢自己讀。船隊上
+# 它是 N/A：未安裝 = SKIP，仍殘留 = FAIL。只看 BaseIPC 是不夠的 —— 船隊每一艘的 IPC1 都
+# 符合 ipc1，而那正是這支被裝到全船隊、每天在船上以 exit 2 失敗的原因。
 #
 # 【勿在下面的 tuple 內寫含括號的註解】device_monitor/tests/test_integration.sh 的涵蓋度斷言
 # 用 `^TIMERS = \((.*?)\)` 抓這個 tuple,非貪婪會停在**第一個**右括號:註解裡的括號會把清單
@@ -552,38 +553,69 @@ def base_ipc(role: str) -> str:
     return role[:-4] if role.endswith("emer") else role
 
 
-def unit_base_ipcs(source: Optional[Path]) -> Set[str]:
-    """讀取 installer 共用的 `# NSSMS-BaseIPC=...` 契約；空集合代表全 IPC 通用。"""
+def _unit_contract(source: Optional[Path], prefix: str) -> Set[str]:
+    """讀 unit 母體裡最後一行 `<prefix>a,b` 的逗號清單；沒有註記回空集合。
+
+    取最後一行，與 install_timers.sh 的 `sed -n ... | tail -1` 一致。
+    """
     if source is None:
         return set()
     try:
         lines = source.read_text(encoding="utf-8").splitlines()
     except OSError:
         return set()
-    prefix = "# NSSMS-BaseIPC="
     for raw in reversed(lines):
         if raw.startswith(prefix):
             return {item.strip() for item in raw[len(prefix):].split(",") if item.strip()}
     return set()
 
 
-def unit_applicable(unit: str, role: str) -> bool:
+def unit_base_ipcs(source: Optional[Path]) -> Set[str]:
+    """讀取 installer 共用的 `# NSSMS-BaseIPC=...` 契約；空集合代表全 IPC 通用。"""
+    return _unit_contract(source, "# NSSMS-BaseIPC=")
+
+
+def unit_vessels(source: Optional[Path]) -> Set[str]:
+    """讀取 `# NSSMS-Vessel=...` 契約（scheduler/services/require_vessel.sh）；空集合代表全船隊通用。"""
+    return _unit_contract(source, "# NSSMS-Vessel=")
+
+
+def unit_na_reason(unit: str, role: str, vessel: str = "") -> Optional[str]:
+    """本機不適用這支 unit 的原因；適用則回 None。
+
+    兩道閘門與 scheduler/install_timers.sh 的 unit_applicability() 是同一份契約,
+    判定方向也必須一致 —— 巡檢說「該裝」而安裝器說「N/A」,操作者就會被推去重跑一個
+    不會改變任何事的安裝器。
+    """
     # timer 的適用性宣告放在同 stem 的 service，讓 service/timer 成對處理。
     contract_unit = unit[:-5] + "service" if unit.endswith(".timer") else unit
-    allowed = unit_base_ipcs(unit_source_path(contract_unit))
-    if not allowed:
-        return True
+    source = unit_source_path(contract_unit)
+
+    allowed = unit_base_ipcs(source)
     base = base_ipc(role)
-    if base not in KNOWN_BASE_IPCS:
-        # 身分檔缺席/壞掉時 check_identity 會回 role="unknown"。這時**不能**把有宣告的
-        # unit 一律判成 N/A：一台裝好的 ipc1 會被報成「N/A 卻殘留 unit，請重跑安裝器」,
-        # 把操作者推去重裝正確的東西。身分本身的 FAIL 已由 check_identity 單獨記錄,
-        # 這裡照常檢查所有 unit,寧可多報也不要報錯方向。
-        return True
-    return base in allowed
+    # 身分檔缺席/壞掉時 check_identity 會回 role="unknown"。這時**不能**把有 BaseIPC 宣告的
+    # unit 一律判成 N/A：一台裝好的 ipc1 會被報成「N/A 卻殘留 unit，請重跑安裝器」,
+    # 把操作者推去重裝正確的東西。身分本身的 FAIL 已由 check_identity 單獨記錄,
+    # 這裡照常檢查所有 unit,寧可多報也不要報錯方向。（安裝器那邊也是 fail-open 退回 ipc1。）
+    if allowed and base in KNOWN_BASE_IPCS and base not in allowed:
+        return f"本機 {base} 為 N/A（適用 {','.join(sorted(allowed))}）"
+
+    vessels = unit_vessels(source)
+    if vessels:
+        wanted = ",".join(sorted(vessels))
+        # 船號閘門的方向與 BaseIPC **相反**：安裝器（require_vessel.sh）讀不到船號就判 N/A
+        # 並移除 unit。巡檢若在這時要求「應安裝」,就與安裝器互相矛盾。
+        # check_identity 讀不到時回 "unknown"，那不是一個船號。
+        known = "" if vessel in ("", "unknown") else vessel
+        if not known:
+            return f"讀不到本機船號，為 N/A（適用船號 {wanted}）"
+        # 逐字、區分大小寫 —— 與 require_vessel.sh 及 update_booster.sh 的 CLINK 判定一致。
+        if known not in vessels:
+            return f"本機船號 {known} 為 N/A（適用船號 {wanted}）"
+    return None
 
 
-def check_unit_sources(role: str = "ipc1") -> None:
+def check_unit_sources(role: str = "ipc1", vessel: str = "") -> None:
     heading("unit 母體與實際安裝版本")
     # 常駐服務由 services/ 目錄列舉,不硬編碼名字 —— 新增一支就自動納入比對。
     units = sorted(p.name for p in SERVICES_DIR.glob("*.service")) if SERVICES_DIR.is_dir() else []
@@ -599,15 +631,13 @@ def check_unit_sources(role: str = "ipc1") -> None:
             status = "SKIP" if unit.startswith(("nssms-wave-send", "nssms-wave-update")) else "FAIL"
             record("unit-sync", unit, status, "找不到 repo 母體")
             continue
-        if not unit_applicable(unit, role):
-            allowed = ",".join(sorted(unit_base_ipcs(
-                unit_source_path(unit[:-5] + "service") if unit.endswith(".timer") else source
-            )))
+        reason = unit_na_reason(unit, role, vessel)
+        if reason is not None:
             record(
                 "unit-sync",
                 unit,
                 "FAIL" if installed.exists() else "SKIP",
-                (f"本機 {base_ipc(role)} 為 N/A（適用 {allowed}）；"
+                (f"{reason}；"
                  + ("仍殘留已安裝 unit，請重跑對應安裝器" if installed.exists() else "未安裝，符合預期")),
             )
             continue
@@ -644,7 +674,7 @@ def parse_execstart_targets(service_file):
     return targets
 
 
-def check_timers(strict_wave: bool, role: str = "ipc2") -> None:
+def check_timers(strict_wave: bool, role: str = "ipc2", vessel: str = "") -> None:
     heading("timers 與最近執行結果")
     for stem in TIMERS:
         optional = stem in OPTIONAL_WAVE
@@ -660,7 +690,8 @@ def check_timers(strict_wave: bool, role: str = "ipc2") -> None:
             "NextElapseUSecRealtime",
             "LastTriggerUSec",
         )
-        if not unit_applicable(service, role):
+        reason = unit_na_reason(service, role, vessel)
+        if reason is not None:
             service_props = systemctl_show(
                 service, "LoadState", "UnitFileState", "ActiveState", "SubState"
             )
@@ -671,8 +702,7 @@ def check_timers(strict_wave: bool, role: str = "ipc2") -> None:
                 or service_props.get("ActiveState") in {"active", "activating", "reloading"}
             )
             stale = installed or live
-            allowed = ",".join(sorted(unit_base_ipcs(TIMERS_DIR / service)))
-            detail = f"本機 {base_ipc(role)} 為 N/A（適用 {allowed}）"
+            detail = reason
             if stale:
                 detail += "；仍有已安裝或啟用的 unit，請重跑 install_timers.sh"
             else:
@@ -1063,8 +1093,8 @@ def main() -> int:
     vessel, role = check_identity()
     check_user_manager()
     check_core_services(role)
-    check_unit_sources(role)
-    check_timers(args.strict_wave, role)
+    check_unit_sources(role, vessel)
+    check_timers(args.strict_wave, role, vessel)
     check_failed_units(args.strict_wave)
     check_sudoers()
     heartbeat_probe(role)

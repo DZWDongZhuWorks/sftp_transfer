@@ -13,6 +13,7 @@ OPTIONAL_UNITS 刻意是「佈署 unit 檔但不 enable」—— 早期它們被
 整體 UNHEALTHY,而 deploy_offline.sh 把這支程式當作首次部署唯一的驗證關卡:真正的故障會被
 那兩個常駐紅字遮蔽。
 """
+import os
 import subprocess
 import sys
 from pathlib import Path
@@ -29,7 +30,7 @@ import automation_health_check as hc  # noqa: E402
 
 
 # 需要 scheduler/timers/*.service 才問得出答案的測試用這個標記。角色限制(ExecCondition
-# 允許哪些 base IPC)只寫在 scheduler 出貨的 unit 檔裡,scheduler 不在場時 unit_applicable
+# 允許哪些 base IPC)只寫在 scheduler 出貨的 unit 檔裡,scheduler 不在場時 unit_na_reason
 # 一律回答「適用」,判成 FAIL 的是缺件而不是被測邏輯 —— 與 test_timers_list_covers_every
 # _scheduler_timer 同一個理由:三個專案各自獨立下載,別人沒下載好不該讓這裡變紅。
 requires_scheduler_units = pytest.mark.skipif(
@@ -281,6 +282,133 @@ def test_takeover_role_keeps_base_ipc_applicability(fake_systemd, monkeypatch, t
     hc.check_timers(strict_wave=False, role="ipc2emer")
 
     assert timer_checks()["nssms-download-photos.timer"] == "PASS"
+
+
+# ---- 船號閘門 NSSMS-Vessel -------------------------------------------------
+# 不依賴真實的 scheduler/timers/：那份會隨 scheduler 的版本變，而這裡要驗的是判定邏輯。
+# 母體寫在 tmp 裡，內容比照 scheduler 出貨的 nssms-remote-log-retention.service。
+RETENTION = "nssms-remote-log-retention"
+ABSENT_UNIT = {
+    "LoadState": "not-found",
+    "UnitFileState": "",
+    "ActiveState": "inactive",
+    "SubState": "dead",
+    "Result": "success",
+}
+
+
+@pytest.fixture
+def shore_only_unit(monkeypatch, tmp_path):
+    """假的 scheduler 母體目錄，只放一支宣告 BaseIPC=ipc1 + Vessel=CLINK 的 timer。"""
+    timers = tmp_path / "timers"
+    timers.mkdir()
+    (timers / f"{RETENTION}.service").write_text(
+        "[Service]\nType=oneshot\n# NSSMS-BaseIPC=ipc1\n# NSSMS-Vessel=CLINK\n"
+        "ExecStart=/bin/bash %h/nope.sh\n",
+        encoding="utf-8",
+    )
+    (timers / f"{RETENTION}.timer").write_text("[Timer]\nOnCalendar=daily\n", encoding="utf-8")
+    units = tmp_path / "units"
+    units.mkdir()
+    monkeypatch.setattr(hc, "TIMERS_DIR", timers)
+    monkeypatch.setattr(hc, "SERVICES_DIR", tmp_path / "no-services")
+    monkeypatch.setattr(hc, "USER_UNIT_DIR", units)
+    return units
+
+
+@pytest.mark.parametrize("vessel", ["WH325", "clink", "", "unknown"])
+def test_shore_only_timer_is_skip_on_fleet_when_absent(fake_systemd, shore_only_unit, vessel):
+    """船隊 IPC1 符合 BaseIPC=ipc1，但船號不符 → N/A；沒裝就是預期狀態。
+
+    "clink" 驗逐字比對（與 require_vessel.sh 一致）；"" 與 "unknown"（check_identity 讀不到
+    身分時的回傳值）驗讀不到船號時與安裝器同方向判 N/A,而不是要求安裝。
+    """
+    fake_systemd[f"{RETENTION}.timer"] = ABSENT_UNIT
+    fake_systemd[f"{RETENTION}.service"] = ABSENT_UNIT
+
+    hc.check_timers(strict_wave=False, role="ipc1", vessel=vessel)
+
+    check = next(c for c in hc.RESULTS if c.section == "timers" and c.name == f"{RETENTION}.timer")
+    assert check.status == "SKIP"
+    assert "船號" in check.detail and "CLINK" in check.detail
+
+
+def test_shore_only_timer_fails_if_still_installed_on_fleet(fake_systemd, shore_only_unit):
+    """升級前裝上的那份若沒被收掉（install_timers 還沒在開機跑過），必須浮成 FAIL。"""
+    (shore_only_unit / f"{RETENTION}.timer").write_text("x", encoding="utf-8")
+    fake_systemd[f"{RETENTION}.timer"] = HEALTHY_TIMER
+    fake_systemd[f"{RETENTION}.service"] = HEALTHY_ONESHOT
+
+    hc.check_timers(strict_wave=False, role="ipc1", vessel="WH325")
+
+    assert timer_checks()[f"{RETENTION}.timer"] == "FAIL"
+
+
+def test_shore_only_timer_is_checked_normally_on_clink(fake_systemd, shore_only_unit):
+    fake_systemd[f"{RETENTION}.timer"] = HEALTHY_TIMER
+    fake_systemd[f"{RETENTION}.service"] = HEALTHY_ONESHOT
+
+    hc.check_timers(strict_wave=False, role="ipc1", vessel="CLINK")
+
+    assert timer_checks()[f"{RETENTION}.timer"] == "PASS"
+
+
+def test_shore_only_timer_needs_both_gates(fake_systemd, shore_only_unit):
+    """AND：船號符合但實體 IPC 不符，照樣 N/A（原因要指出是 IPC 而不是船號）。"""
+    fake_systemd[f"{RETENTION}.timer"] = ABSENT_UNIT
+    fake_systemd[f"{RETENTION}.service"] = ABSENT_UNIT
+
+    hc.check_timers(strict_wave=False, role="ipc2", vessel="CLINK")
+
+    check = next(c for c in hc.RESULTS if c.section == "timers" and c.name == f"{RETENTION}.timer")
+    assert check.status == "SKIP"
+    assert "ipc2" in check.detail and "船號" not in check.detail
+
+
+def test_unit_sync_uses_vessel_gate(shore_only_unit, monkeypatch):
+    """unit-sync 那一段與 timers 那一段必須用同一個判定，否則兩段互相矛盾。"""
+    monkeypatch.setattr(hc, "_COMPACT", True)
+    hc.RESULTS.clear()
+
+    hc.check_unit_sources(role="ipc1", vessel="WH325")
+
+    sync = {c.name: c for c in hc.RESULTS if c.section == "unit-sync"}
+    assert sync[f"{RETENTION}.timer"].status == "SKIP"
+    assert sync[f"{RETENTION}.service"].status == "SKIP"
+    assert "船號" in sync[f"{RETENTION}.service"].detail
+
+
+def test_vessel_contract_takes_last_line(tmp_path):
+    """與 install_timers.sh 的 `sed -n ... | tail -1` 一致：重複宣告時以最後一行為準。"""
+    unit = tmp_path / "x.service"
+    unit.write_text("# NSSMS-Vessel=WH325\n# NSSMS-Vessel=CLINK, WH101\n", encoding="utf-8")
+    assert hc.unit_vessels(unit) == {"CLINK", "WH101"}
+    assert hc.unit_vessels(None) == set()
+
+
+@pytest.mark.skipif(
+    not (hc.SCHEDULER_DIR / "services" / "require_vessel.sh").is_file(),
+    reason="scheduler 尚未出貨 require_vessel.sh",
+)
+@pytest.mark.parametrize("vessel,expect_na", [
+    ("CLINK", False), ("WH325", True), ("clink", True), ("", True),
+])
+def test_vessel_gate_agrees_with_installer(tmp_path, monkeypatch, shore_only_unit, vessel, expect_na):
+    """跨 repo 契約：巡檢與 scheduler 的 require_vessel.sh 對同一個身分必須給同一個答案。"""
+    info = tmp_path / "vessel.json"
+    info.write_text(
+        '{"ipc":"IPC-1"%s}' % (', "vsl_name":"%s"' % vessel if vessel else ""),
+        encoding="utf-8",
+    )
+    rc = subprocess.run(
+        ["bash", str(hc.SCHEDULER_DIR / "services" / "require_vessel.sh"), "CLINK"],
+        env=dict(os.environ, VESSEL_INFO_PATH=str(info)),
+        stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+    ).returncode
+    installer_na = rc == 1
+    checker_na = hc.unit_na_reason(f"{RETENTION}.service", "ipc1", vessel) is not None
+    assert installer_na == expect_na
+    assert checker_na == installer_na
 
 
 def _fake_run(returncode, stdout="", stderr=""):

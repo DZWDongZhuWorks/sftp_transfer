@@ -244,3 +244,171 @@ def test_scan_reads_trans_type_without_resolving_placeholders(tmp_path, monkeypa
         ("radar", selected.DEPLOY),
         ("report", selected.TELEMETRY),
     ]
+
+
+# --- --pick-to / --run-from：挑選與執行拆成兩個行程 ---------------------------
+
+
+def _picked(tmp_path, *names):
+    for name in names:
+        _touch(tmp_path / name)
+    return [item for item in selected.scan_setting_files(tmp_path) if item.path.name in names]
+
+
+def test_selection_round_trips_in_picked_order(tmp_path):
+    items = _picked(tmp_path, "b_download_settings.json", "a_download_settings.json")
+    handoff = tmp_path / "pick.json"
+
+    selected.write_selection(handoff, items)
+
+    assert selected.load_selection(handoff, tmp_path) == items
+    assert not (tmp_path / "pick.json.tmp").exists()
+
+
+def test_selection_records_names_not_paths(tmp_path):
+    """交接檔只記檔名：執行時對照當下的 config/，塞不進掃描規則以外的路徑。"""
+    items = _picked(tmp_path, "a_download_settings.json")
+    handoff = tmp_path / "pick.json"
+    selected.write_selection(handoff, items)
+
+    assert json.loads(handoff.read_text(encoding="utf-8"))["configs"] == ["a_download_settings.json"]
+
+
+def test_load_selection_rejects_anything_it_cannot_match(tmp_path):
+    _touch(tmp_path / "a_download_settings.json")
+    _touch(tmp_path / "notes.json")
+    cases = {
+        "gone": {"version": 1, "configs": ["a_download_settings.json", "b_download_settings.json"]},
+        "outside_scan_rule": {"version": 1, "configs": ["notes.json"]},
+        "path_not_name": {"version": 1, "configs": ["../a_download_settings.json"]},
+        "duplicate": {"version": 1, "configs": ["a_download_settings.json"] * 2},
+        "empty": {"version": 1, "configs": []},
+        "not_strings": {"version": 1, "configs": [1]},
+        "unknown_version": {"version": 2, "configs": ["a_download_settings.json"]},
+        "not_a_dict": ["a_download_settings.json"],
+    }
+    for label, payload in cases.items():
+        handoff = tmp_path / f"{label}.handoff"
+        handoff.write_text(json.dumps(payload), encoding="utf-8")
+        try:
+            selected.load_selection(handoff, tmp_path)
+        except selected.SelectionError:
+            continue
+        raise AssertionError(f"{label} 應該被拒絕")
+
+    broken = tmp_path / "broken.handoff"
+    broken.write_text("{not json", encoding="utf-8")
+    for path in (broken, tmp_path / "absent.handoff"):
+        try:
+            selected.load_selection(path, tmp_path)
+        except selected.SelectionError:
+            continue
+        raise AssertionError(f"{path.name} 應該被拒絕")
+
+
+def test_run_from_bad_selection_runs_nothing(tmp_path, capsys):
+    _touch(tmp_path / "a_download_settings.json")
+    handoff = tmp_path / "pick.json"
+    handoff.write_text(json.dumps({"version": 1, "configs": ["gone_download_settings.json"]}),
+                       encoding="utf-8")
+
+    with mock.patch.object(selected, "_run_transfer") as run:
+        assert selected.main(["--config-dir", str(tmp_path), "--run-from", str(handoff)]) == 1
+
+    run.assert_not_called()
+    assert "沒有執行任何傳輸" in capsys.readouterr().err
+
+
+def test_run_from_still_enforces_the_direction_lock(tmp_path):
+    """交接檔是另一個行程寫的：方向鎖必須在執行端再判一次，不能信任挑選端。"""
+    items = _picked(tmp_path, "radar_upload_settings.json")
+    handoff = tmp_path / "pick.json"
+    selected.write_selection(handoff, items)
+
+    with mock.patch.object(selected, "is_dev_machine", return_value=False), \
+            mock.patch.object(selected, "_run_transfer") as run:
+        assert selected.main(["--config-dir", str(tmp_path), "--run-from", str(handoff)]) == 3
+
+    run.assert_not_called()
+
+
+def test_run_from_executes_without_a_tty(tmp_path):
+    items = _picked(tmp_path, "a_download_settings.json", "b_download_settings.json")
+    handoff = tmp_path / "pick.json"
+    selected.write_selection(handoff, items)
+
+    with mock.patch.object(selected, "is_dev_machine", return_value=False), \
+            mock.patch.object(selected, "_run_transfer", return_value=(0, (1, 0, 0))) as run:
+        assert selected.main(["--config-dir", str(tmp_path), "--run-from", str(handoff)]) == 0
+
+    assert [c[0][0] for c in run.call_args_list] == items
+
+
+def test_run_from_refuses_a_mode_filter():
+    try:
+        selected.parse_args(["--run-from", "x.json", "--mode", "upload"])
+    except SystemExit as exc:
+        assert exc.code == 2
+    else:
+        raise AssertionError("--run-from 搭 --mode 應該被拒絕")
+
+
+def test_pick_and_run_are_mutually_exclusive():
+    try:
+        selected.parse_args(["--pick-to", "a.json", "--run-from", "b.json"])
+    except SystemExit as exc:
+        assert exc.code == 2
+    else:
+        raise AssertionError("--pick-to 與 --run-from 應該互斥")
+
+
+def _with_tty(stack):
+    stack.enter_context(mock.patch.object(selected.sys.stdin, "isatty", return_value=True))
+    stack.enter_context(mock.patch.object(selected.sys.stdout, "isatty", return_value=True))
+
+
+def test_pick_to_writes_the_selection_and_transfers_nothing(tmp_path):
+    from contextlib import ExitStack
+
+    items = _picked(tmp_path, "a_download_settings.json")
+    handoff = tmp_path / "pick.json"
+    with ExitStack() as stack:
+        _with_tty(stack)
+        stack.enter_context(mock.patch.object(selected.curses, "wrapper", return_value=items))
+        run = stack.enter_context(mock.patch.object(selected, "_run_transfer"))
+        assert selected.main(["--config-dir", str(tmp_path), "--pick-to", str(handoff)]) == 0
+
+    run.assert_not_called()
+    assert selected.load_selection(handoff, tmp_path) == items
+
+
+def test_pick_to_cancel_leaves_no_file_even_if_one_was_there(tmp_path):
+    """「檔案在 ⇔ 這一次確認過」：上一次的殘留不能被當成這一次的確認。"""
+    from contextlib import ExitStack
+
+    items = _picked(tmp_path, "a_download_settings.json")
+    handoff = tmp_path / "pick.json"
+    selected.write_selection(handoff, items)
+    with ExitStack() as stack:
+        _with_tty(stack)
+        stack.enter_context(mock.patch.object(selected.curses, "wrapper", return_value=None))
+        assert selected.main(["--config-dir", str(tmp_path), "--pick-to", str(handoff)]) == 0
+
+    assert not handoff.exists()
+
+
+def test_pick_to_clears_stale_file_before_any_early_exit(tmp_path):
+    """沒有 TTY、沒有設定檔這種提早結束，同樣不能留下上一次的交接檔。"""
+    items = _picked(tmp_path, "a_download_settings.json")
+    handoff = tmp_path / "pick.json"
+    selected.write_selection(handoff, items)
+
+    # pytest 底下 stdin 不是 TTY
+    assert selected.main(["--config-dir", str(tmp_path), "--pick-to", str(handoff)]) == 2
+    assert not handoff.exists()
+
+    selected.write_selection(handoff, items)
+    empty = tmp_path / "empty"
+    empty.mkdir()
+    assert selected.main(["--config-dir", str(empty), "--pick-to", str(handoff)]) == 1
+    assert not handoff.exists()

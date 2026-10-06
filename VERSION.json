@@ -1,5 +1,5 @@
 {
-  "version": "0.24.0",
-  "date": "2026-09-29",
-  "notes": "巡檢認得 scheduler 的船號閘門 NSSMS-Vessel(與 BaseIPC 為 AND,讀不到船號判 N/A):nssms-remote-log-retention 在船隊上未安裝報 SKIP、殘留報 FAIL,不再誤報缺件"
+  "version": "0.25.0",
+  "date": "2026-10-06",
+  "notes": "run_selected_transfers 可拆成兩個行程:--pick-to 只挑選並寫交接檔、--run-from 不需 TTY 照交接檔執行(方向鎖再判一次),讓 dashboard 把傳輸放到背景"
 }

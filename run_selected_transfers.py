@@ -7,12 +7,17 @@
 方向採雙向守門：CLINK 發佈端只可上傳，其餘部署端只可下載。
 設定檔可用 ``trans_type: telemetry`` 宣告自己是船到岸的資料回傳流，
 不受上述方向鎖管制（見 ``read_trans_type``）。
+
+挑選與執行可以拆成兩個行程（``--pick-to`` / ``--run-from``）：挑選需要真正的
+TTY、只要幾秒；執行可能跑很久、從頭到尾不問問題。scheduler 的 dashboard 靠這個
+把挑選留在前景、把傳輸放到背景（見 ``write_selection``）。
 """
 from typing import List, Optional, Set, Tuple
 
 import argparse
 import curses
 import json
+import os
 import re
 import subprocess
 import sys
@@ -36,6 +41,8 @@ DEPLOY = "deploy"
 TELEMETRY = "telemetry"
 # OTA 發佈樹的根。上傳到這些路徑底下的內容會被船隻拉走，是「舊程式回灌」的唯一途徑。
 PUBLISH_ROOTS = ("/fleet/wanhai_nssms_deploy/STANDARD", "/fleet/wanhai_nssms_deploy/UNIQUE")
+# --pick-to 寫出的交接檔格式版本。讀到不認得的版本一律拒絕，不猜。
+SELECTION_VERSION = 1
 
 
 @dataclass(frozen=True)
@@ -466,6 +473,66 @@ def execute_selected(items: List[TransferItem], locked_mode: str) -> int:
     return 0 if failed_projects == 0 else 1
 
 
+class SelectionError(Exception):
+    """交接檔讀不懂或對不上現在的 config/。呼叫端一個專案都不執行。"""
+
+
+def write_selection(path: Path, items: List[TransferItem]) -> None:
+    """把勾選結果寫成交接檔，給 ``--run-from`` 在另一個行程裡執行。
+
+    只記設定檔的**檔名**，不記路徑、不記內容：``--run-from`` 會對照當下的 config/
+    重掃一次，所以交接檔塞不進掃描規則以外的東西。先寫暫存檔再 rename，讀的那一方
+    不會讀到寫一半的檔。
+    """
+    payload = {"version": SELECTION_VERSION, "configs": [item.path.name for item in items]}
+    tmp = path.with_name(path.name + ".tmp")
+    tmp.write_text(json.dumps(payload, ensure_ascii=False), encoding="utf-8")
+    os.replace(str(tmp), str(path))
+
+
+def load_selection(path: Path, config_dir: Path) -> List[TransferItem]:
+    """讀回交接檔，逐一對照**現在**的掃描結果。任何對不上的地方都整批拒絕。
+
+    挑選與執行之間隔著一個行程邊界，這段時間裡 config/ 可能被 OTA 換掉。只跑對得上
+    的那幾項，等於執行一份操作者沒有看過的清單——寧可一項都不跑，讓人重挑。
+    方向鎖不在這裡判：execute_selected 會再判一次，與互動路徑同一道門。
+    """
+    try:
+        with open(path, "r", encoding="utf-8") as f:
+            data = json.load(f)
+    except (OSError, ValueError) as exc:
+        raise SelectionError(f"讀不到交接檔 {path}：{exc}")
+    if not isinstance(data, dict) or data.get("version") != SELECTION_VERSION:
+        raise SelectionError(f"交接檔格式不符（預期 version {SELECTION_VERSION}）：{path}")
+    names = data.get("configs")
+    if not isinstance(names, list) or not names or not all(isinstance(n, str) for n in names):
+        raise SelectionError(f"交接檔沒有可執行的設定檔清單：{path}")
+    if len(set(names)) != len(names):
+        raise SelectionError(f"交接檔裡有重複的設定檔：{path}")
+    by_name = {item.path.name: item for item in scan_setting_files(config_dir)}
+    missing = [name for name in names if name not in by_name]
+    if missing:
+        raise SelectionError(f"{config_dir} 裡已經沒有這些設定檔：{', '.join(missing)}")
+    return [by_name[name] for name in names]
+
+
+def run_selection(path: Path, config_dir: Path) -> int:
+    """``--run-from``：不需要 TTY，所以可以放在背景、輸出導到檔案。"""
+    try:
+        items = load_selection(path, config_dir)
+    except SelectionError as exc:
+        print(f"錯誤：{exc}；沒有執行任何傳輸。", file=sys.stderr)
+        return 1
+    if not MAIN_SCRIPT.is_file():
+        print(f"錯誤：找不到傳輸入口 {MAIN_SCRIPT}", file=sys.stderr)
+        return 1
+    downloads, uploads = _counts(items, {item.path for item in items})
+    print(f"依交接檔執行 {len(items)} 個專案（下載 {downloads}、上傳 {uploads}）：{path}", flush=True)
+    for index, item in enumerate(items, 1):
+        print(f"  {index:>2}. [{MODE_LABEL[item.mode]}] {item.project}", flush=True)
+    return execute_selected(items, locked_mode_for_role(is_dev_machine()))
+
+
 def parse_args(argv: Optional[List[str]] = None):
     parser = argparse.ArgumentParser(description="互動勾選本次要下載／上傳的 SFTP 專案")
     parser.add_argument("--config-dir", default=str(CONFIG_DIR), help="設定檔資料夾（預設 ./config）")
@@ -475,13 +542,41 @@ def parse_args(argv: Optional[List[str]] = None):
         default="all",
         help="只掃描指定方向（預設 all）",
     )
-    parser.add_argument("--list", action="store_true", help="只列出掃描結果，不啟動 curses 或傳輸")
-    return parser.parse_args(argv)
+    exclusive = parser.add_mutually_exclusive_group()
+    exclusive.add_argument("--list", action="store_true", help="只列出掃描結果，不啟動 curses 或傳輸")
+    exclusive.add_argument(
+        "--pick-to",
+        metavar="FILE",
+        help="只挑選：確認後把勾選結果寫進 FILE 就結束，不執行傳輸；取消時 FILE 不存在",
+    )
+    exclusive.add_argument(
+        "--run-from",
+        metavar="FILE",
+        help="只執行：照 --pick-to 寫出的 FILE 依序傳輸，不需要 TTY",
+    )
+    args = parser.parse_args(argv)
+    # 交接檔已經寫明每一項的方向；再帶 --mode 只會讓人以為它有作用。
+    if args.run_from and args.mode != "all":
+        parser.error("--run-from 的方向由交接檔決定，不能再帶 --mode")
+    return args
 
 
 def main(argv: Optional[List[str]] = None) -> int:
     args = parse_args(argv)
     config_dir = Path(args.config_dir).expanduser()
+    if args.run_from:
+        return run_selection(Path(args.run_from).expanduser(), config_dir)
+    pick_to = Path(args.pick_to).expanduser() if args.pick_to else None
+    if pick_to is not None:
+        # 「結束時 FILE 存在 ⇔ 這一次有人確認過」是給呼叫端的契約。上一次留下的檔
+        # 若還在，取消或任何提早結束都會被誤認成確認，把舊的清單再跑一遍。
+        try:
+            pick_to.unlink()
+        except FileNotFoundError:
+            pass
+        except OSError as exc:
+            print(f"錯誤：清不掉上一次的交接檔 {pick_to}：{exc}", file=sys.stderr)
+            return 1
     items = scan_setting_files(config_dir, args.mode)
     if not items:
         print(f"錯誤：{config_dir} 內找不到符合方向的 *_settings.json", file=sys.stderr)
@@ -509,6 +604,14 @@ def main(argv: Optional[List[str]] = None) -> int:
         selected = None
     if selected is None:
         print("已取消，沒有執行任何傳輸。")
+        return 0
+    if pick_to is not None:
+        try:
+            write_selection(pick_to, selected)
+        except OSError as exc:
+            print(f"錯誤：交接檔寫不進去 {pick_to}：{exc}；沒有執行任何傳輸。", file=sys.stderr)
+            return 1
+        print(f"已記下 {len(selected)} 個專案，交給 --run-from 執行：{pick_to}")
         return 0
     return execute_selected(selected, locked_mode)
 

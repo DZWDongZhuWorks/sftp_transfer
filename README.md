@@ -246,6 +246,9 @@ GUI：啟動後於頂端工具列的「模式」切換到「上傳」，來源/�
 - 在其餘部署端（包含船舶資訊缺失或無法辨識角色時），上傳項目會維持鎖定，只允許下載，避免舊程式反向回灌 OTA。
 - 標為 `"trans_type": "telemetry"` 的專案不受上述方向鎖管制，兩端都選得到，列表上會標示 `[回傳]`。
 - `--list` 可在不啟動選單的情況下列出掃描結果，逐列顯示方向、鎖定狀態與流類別。
+- `--pick-to FILE` 只挑選：按 `Enter`、`y` 確認後把勾選結果寫進 `FILE` 就結束，不執行傳輸；取消或任何提早結束時 `FILE` 都不存在（開始前會先清掉上一次留下的）。
+- `--run-from FILE` 只執行：照 `FILE` 依序傳輸，不需要 TTY，可以放在背景、輸出導到檔案。`FILE` 只記設定檔的檔名，執行時對照當下的 `config/` 重掃，任何一項對不上就整批不跑；方向鎖在這一步再判一次。不能再帶 `--mode`。
+- 這兩個參數是給 scheduler dashboard 用的：挑選需要真正的終端、只要幾秒，傳輸可能很久而且不問問題 —— 拆成兩個行程，dashboard 才能把挑選留在前景、把傳輸放到背景。
 
 #### 為什麼回傳類要豁免
 
@@ -722,7 +725,7 @@ manifest 不能當證據：2026-09-22 實測 `.sftp_download_manifest.json` 的 
 | `test_gitignore.py` | 忽略規則的 gitignore 語法比對 |
 | `test_pack_upload.py` | 封裝成本地 tar（含符號連結與權限處理） |
 | `test_version_stamp.py` | 版本標記（`VERSION.json` → `VERSION.stamp.json`） |
-| `test_run_selected_transfers.py` | 人工挑選選單的方向鎖與 `trans_type` 守門 |
+| `test_run_selected_transfers.py` | 人工挑選選單的方向鎖與 `trans_type` 守門、`--pick-to` / `--run-from` 交接檔 |
 | `test_log_monitor.py` / `test_tui.py` | `monitor/` 的 log 解析、分群與 curses 介面 |
 | `test_offline_deploy.py` / `test_automation_health_check.py` | `deploy/` 的平台分流、wheel 相容性，以及會上船原始碼的 **Python 3.6 語法守門** |
 

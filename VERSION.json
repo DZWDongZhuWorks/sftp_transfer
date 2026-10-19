@@ -1,5 +1,5 @@
 {
-  "version": "0.25.1",
+  "version": "0.25.2",
   "date": "2026-10-19",
-  "notes": "把 nssms-fleet-status-retention 加進 deploy/automation_health_check.py 的 TIMERS 涵蓋清單。scheduler 先前新增的岸端排程(每天 02:10 先同步、再刪除遠端 /fleet/LOG/<船名>/<IPC>/dashboard_reports/ 超過 21 天的狀態報表),當時漏了這一步,於是 tests/test_automation_health_check.py 的涵蓋度測試與 device_monitor/tests/test_integration.sh 都紅。【只改一行就夠】那支同時宣告 # NSSMS-BaseIPC=ipc1 與 # NSSMS-Vessel=CLINK,與 nssms-remote-log-retention 同一組閘門;unit_na_reason() 直接讀 unit 內的註記,船隊上落在 N/A(未安裝 = SKIP),不會被報成缺件。"
+  "notes": "修 tests/test_automation_health_check.py::test_wave_deployed_but_not_enabled_is_skip_not_fail 在 scheduler 在場時必紅(開發機與船上的 health_check 都會跑到,CI 因為 scheduler 不在場而一直是綠的)。兩個成因:(1) fake_systemd 對沒指定的 unit 一律回 enabled + active,有 NSSMS-BaseIPC/Vessel 閘門、在 ipc2 判 N/A 的三支(remote-log-retention、fleet-status-retention、warning-sign-upload)於是被正確地報成「N/A 卻仍啟用」;(2) N/A 分支還會讀 USER_UNIT_DIR,那是真實機器的狀態 —— 岸端 IPC1 裝著兩支 retention、IPC3 裝著 warning-sign-upload。修法:夾具預設把 USER_UNIT_DIR 指到空的 tmp 目錄;新增 mark_na_units_absent() 把該角色判 N/A 的 unit 設成未安裝(安裝器實際留下的狀態),這支測試明確以 role=ipc2 呼叫。沒有過濾任何 FAIL:wave 降級失效、N/A 判定反向、非 N/A timer 壞掉都仍會讓它變紅。只改測試,巡檢本身不變。"
 }

@@ -434,6 +434,126 @@ def test_vessel_gate_agrees_with_installer(tmp_path, monkeypatch, shore_only_uni
     assert checker_na == installer_na
 
 
+# ---- 船號排除 NSSMS-ExceptVessel -------------------------------------------
+# NSSMS-Vessel 的反面：全船隊裝、列出的船不裝。母體比照 scheduler 出貨的 nssms-reboot.service。
+REBOOT = "nssms-reboot"
+
+
+@pytest.fixture
+def fleet_wide_unit(monkeypatch, tmp_path):
+    """假的 scheduler 母體目錄，只放一支宣告 ExceptVessel=CLINK 的 timer。"""
+    timers = tmp_path / "timers"
+    timers.mkdir()
+    (timers / f"{REBOOT}.service").write_text(
+        "[Service]\nType=oneshot\n# NSSMS-ExceptVessel=CLINK\n"
+        "ExecStart=/usr/bin/sudo -n /bin/systemctl reboot\n",
+        encoding="utf-8",
+    )
+    (timers / f"{REBOOT}.timer").write_text("[Timer]\nOnCalendar=*-*-1/5 04:00:00\n", encoding="utf-8")
+    units = tmp_path / "units"
+    units.mkdir()
+    monkeypatch.setattr(hc, "TIMERS_DIR", timers)
+    monkeypatch.setattr(hc, "SERVICES_DIR", tmp_path / "no-services")
+    monkeypatch.setattr(hc, "USER_UNIT_DIR", units)
+    return units
+
+
+def test_excepted_timer_is_skip_on_clink_when_absent(fake_systemd, fleet_wide_unit):
+    """開發機不裝 reboot timer 是預期狀態，不是缺件。"""
+    fake_systemd[f"{REBOOT}.timer"] = ABSENT_UNIT
+    fake_systemd[f"{REBOOT}.service"] = ABSENT_UNIT
+
+    hc.check_timers(strict_wave=False, role="ipc1", vessel="CLINK")
+
+    check = next(c for c in hc.RESULTS if c.section == "timers" and c.name == f"{REBOOT}.timer")
+    assert check.status == "SKIP"
+    assert "排除" in check.detail and "CLINK" in check.detail
+
+
+def test_excepted_timer_fails_if_still_installed_on_clink(fake_systemd, fleet_wide_unit):
+    """升級前裝上的那份若沒被收掉（install_timers 還沒跑過），必須浮成 FAIL。"""
+    (fleet_wide_unit / f"{REBOOT}.timer").write_text("x", encoding="utf-8")
+    fake_systemd[f"{REBOOT}.timer"] = HEALTHY_TIMER
+    fake_systemd[f"{REBOOT}.service"] = HEALTHY_ONESHOT
+
+    hc.check_timers(strict_wave=False, role="ipc1", vessel="CLINK")
+
+    assert timer_checks()[f"{REBOOT}.timer"] == "FAIL"
+
+
+@pytest.mark.parametrize("vessel", ["WH325", "clink", "", "unknown"])
+def test_excepted_timer_is_required_elsewhere(fake_systemd, fleet_wide_unit, vessel):
+    """船隊照常要求安裝。"clink" 驗逐字比對;"" 與 "unknown"（check_identity 讀不到身分時的
+    回傳值）驗讀不到船號時當一般船 —— 與 NSSMS-Vessel 相反,與安裝器的 --except 一致。"""
+    fake_systemd[f"{REBOOT}.timer"] = ABSENT_UNIT
+    fake_systemd[f"{REBOOT}.service"] = ABSENT_UNIT
+
+    hc.check_timers(strict_wave=False, role="ipc1", vessel=vessel)
+
+    assert timer_checks()[f"{REBOOT}.timer"] == "FAIL"
+
+
+def test_excepted_timer_is_checked_normally_on_fleet(fake_systemd, fleet_wide_unit):
+    hc.check_timers(strict_wave=False, role="ipc1", vessel="WH325")
+
+    assert timer_checks()[f"{REBOOT}.timer"] == "PASS"
+
+
+def test_unit_sync_uses_except_gate(fleet_wide_unit, monkeypatch):
+    """unit-sync 那一段與 timers 那一段必須用同一個判定，否則兩段互相矛盾。"""
+    monkeypatch.setattr(hc, "_COMPACT", True)
+    hc.RESULTS.clear()
+
+    hc.check_unit_sources(role="ipc1", vessel="CLINK")
+
+    sync = {c.name: c for c in hc.RESULTS if c.section == "unit-sync"}
+    assert sync[f"{REBOOT}.timer"].status == "SKIP"
+    assert sync[f"{REBOOT}.service"].status == "SKIP"
+    assert "排除" in sync[f"{REBOOT}.service"].detail
+
+
+def test_except_contract_takes_last_line(tmp_path):
+    """與 install_timers.sh 的 `sed -n ... | tail -1` 一致：重複宣告時以最後一行為準。"""
+    unit = tmp_path / "x.service"
+    unit.write_text("# NSSMS-ExceptVessel=WH325\n# NSSMS-ExceptVessel=CLINK, WH101\n",
+                    encoding="utf-8")
+    assert hc.unit_except_vessels(unit) == {"CLINK", "WH101"}
+    assert hc.unit_except_vessels(None) == set()
+    # 兩個註記互不干擾:限定那道讀不到排除的內容。
+    assert hc.unit_vessels(unit) == set()
+
+
+def _installer_supports_except():
+    checker = hc.SCHEDULER_DIR / "services" / "require_vessel.sh"
+    try:
+        return "--except" in checker.read_text(encoding="utf-8")
+    except OSError:
+        return False
+
+
+@pytest.mark.skipif(not _installer_supports_except(),
+                    reason="scheduler 的 require_vessel.sh 尚未支援 --except(v0.64.0 起)")
+@pytest.mark.parametrize("vessel,expect_na", [
+    ("CLINK", True), ("WH325", False), ("clink", False), ("", False),
+])
+def test_except_gate_agrees_with_installer(tmp_path, fleet_wide_unit, vessel, expect_na):
+    """跨 repo 契約：巡檢與 scheduler 的 require_vessel.sh --except 對同一個身分必須給同一個答案。"""
+    info = tmp_path / "vessel.json"
+    info.write_text(
+        '{"ipc":"IPC-1"%s}' % (', "vsl_name":"%s"' % vessel if vessel else ""),
+        encoding="utf-8",
+    )
+    rc = subprocess.run(
+        ["bash", str(hc.SCHEDULER_DIR / "services" / "require_vessel.sh"), "--except", "CLINK"],
+        env=dict(os.environ, VESSEL_INFO_PATH=str(info)),
+        stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+    ).returncode
+    installer_na = rc == 1
+    checker_na = hc.unit_na_reason(f"{REBOOT}.service", "ipc1", vessel) is not None
+    assert installer_na == expect_na
+    assert checker_na == installer_na
+
+
 def _fake_run(returncode, stdout="", stderr=""):
     def runner(cmd, timeout=15):
         return subprocess.CompletedProcess(cmd, returncode, stdout, stderr)

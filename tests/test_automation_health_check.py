@@ -58,6 +58,14 @@ DEPLOYED_NOT_ENABLED = {
     "NextElapseUSecRealtime": "",
     "LastTriggerUSec": "",
 }
+# 安裝器對本機 N/A 的 unit 留下的狀態:根本沒裝。
+ABSENT_UNIT = {
+    "LoadState": "not-found",
+    "UnitFileState": "",
+    "ActiveState": "inactive",
+    "SubState": "dead",
+    "Result": "success",
+}
 # 一支真的壞掉的 timer(enable 了卻沒在跑)。
 BROKEN_TIMER = {
     "LoadState": "loaded",
@@ -79,10 +87,12 @@ HEALTHY_ONESHOT = {
 
 
 @pytest.fixture
-def fake_systemd(monkeypatch):
+def fake_systemd(monkeypatch, tmp_path):
     """把 systemctl_show 換掉,並清空 RESULTS。回傳一個「設定每支 unit 屬性」的 dict。
 
     預設所有 timer 健康、所有 service 正常結束;測試只覆寫它關心的那幾支。
+    N/A 的 unit 不在此列 —— 「適用與否」要看 check_timers 收到的 role/vessel,這裡不知道,
+    需要整節不出 FAIL 的測試要自己呼叫 mark_na_units_absent()。
     """
     states = {}  # type: Dict[str, Dict[str, str]]
 
@@ -93,10 +103,28 @@ def fake_systemd(monkeypatch):
         return dict(base, _returncode="0")
 
     monkeypatch.setattr(hc, "systemctl_show", fake_show)
+    # N/A 的 unit 會另外看 USER_UNIT_DIR 底下有沒有檔案,那是**真實機器**的狀態:岸端 IPC1
+    # 裝著兩支 retention、IPC3 裝著 warning-sign-upload,測試在那裡跑就會被它們染紅。
+    # 預設指到一個空目錄;要測「殘留 unit」的測試自己再覆寫。
+    monkeypatch.setattr(hc, "USER_UNIT_DIR", tmp_path / "no-user-units")
     # record() 會 print,測試不需要那些輸出;RESULTS 是斷言的來源。
     monkeypatch.setattr(hc, "_COMPACT", True)
     hc.RESULTS.clear()
     return states
+
+
+def mark_na_units_absent(states, role, vessel=""):
+    """把 (role, vessel) 判 N/A 的 unit 設成未安裝 —— 安裝器在那台機器上會留下的狀態。
+
+    少了這一步,夾具會替 N/A unit 回「enabled + active」,check_timers 正確地把它們報成
+    「N/A 卻仍啟用」的 FAIL。scheduler 不在場時 unit_na_reason 一律回 None,這裡什麼都
+    不做 —— 所以那個錯只在 scheduler 在場(開發機、船上)時才現形,CI 永遠是綠的。
+    已經指定過的 unit 不覆寫。
+    """
+    for stem in hc.TIMERS:
+        if hc.unit_na_reason(f"{stem}.service", role, vessel) is not None:
+            states.setdefault(f"{stem}.timer", ABSENT_UNIT)
+            states.setdefault(f"{stem}.service", ABSENT_UNIT)
 
 
 def timer_checks():
@@ -117,8 +145,10 @@ def test_wave_deployed_but_not_enabled_is_skip_not_fail(fake_systemd):
     """
     fake_systemd["nssms-wave-send.timer"] = DEPLOYED_NOT_ENABLED
     fake_systemd["nssms-wave-update.timer"] = DEPLOYED_NOT_ENABLED
+    # 其餘 unit 是一台裝好的 ipc2 該有的樣子:N/A 的沒裝(見 mark_na_units_absent)。
+    mark_na_units_absent(fake_systemd, role="ipc2")
 
-    hc.check_timers(strict_wave=False)
+    hc.check_timers(strict_wave=False, role="ipc2")
     checks = timer_checks()
 
     assert checks["nssms-wave-send.timer"] == "SKIP"
@@ -288,13 +318,6 @@ def test_takeover_role_keeps_base_ipc_applicability(fake_systemd, monkeypatch, t
 # 不依賴真實的 scheduler/timers/：那份會隨 scheduler 的版本變，而這裡要驗的是判定邏輯。
 # 母體寫在 tmp 裡，內容比照 scheduler 出貨的 nssms-remote-log-retention.service。
 RETENTION = "nssms-remote-log-retention"
-ABSENT_UNIT = {
-    "LoadState": "not-found",
-    "UnitFileState": "",
-    "ActiveState": "inactive",
-    "SubState": "dead",
-    "Result": "success",
-}
 
 
 @pytest.fixture

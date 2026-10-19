@@ -87,6 +87,9 @@ BOOT_ACTIVATING_FAIL_SECONDS = 900
 # 它是 N/A：未安裝 = SKIP，仍殘留 = FAIL。只看 BaseIPC 是不夠的 —— 船隊每一艘的 IPC1 都
 # 符合 ipc1，而那正是這支被裝到全船隊、每天在船上以 exit 2 失敗的原因。
 #
+# nssms-fleet-status-retention（岸端 dashboard 報表的遠端保留政策）與上面那支是同一組
+# 閘門、同一個理由：BaseIPC=ipc1 AND Vessel=CLINK，船隊上同樣是 N/A，不需要特例。
+#
 # 【勿在下面的 tuple 內寫含括號的註解】device_monitor/tests/test_integration.sh 的涵蓋度斷言
 # 用 `^TIMERS = \((.*?)\)` 抓這個 tuple,非貪婪會停在**第一個**右括號:註解裡的括號會把清單
 # 截斷,於是後面的 timer 全被誤判為「沒被涵蓋」。要加說明就寫在這一段。
@@ -98,6 +101,7 @@ TIMERS = (
     "nssms-device-monitor-report",
     "nssms-download-photos",
     "nssms-ecdis-screenshot-upload",
+    "nssms-fleet-status-retention",
     "nssms-reboot",
     "nssms-remote-log-retention",
     "nssms-shipboard-alert-upload",

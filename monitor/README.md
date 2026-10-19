@@ -120,12 +120,14 @@ python monitor/log_monitor.py --log-dir logs --html
 想要「接近 HTML 的控制能力」但留在終端機時，加上 `--tui`（stdlib `curses`，零新依賴）：
 
 ```bash
-python monitor/log_monitor.py --log-dir fleet_logs --tui
+# 岸端鏡像在 NVMe 資料碟上（見下方 B 節），先算出它的位置
+FLEET_LOGS="$(findmnt -n -o TARGET -S /dev/nvme0n1)/wanhai_nssms/share/sftp_transfer/fleet_logs"
+python monitor/log_monitor.py --log-dir "$FLEET_LOGS" --tui
 # 搭配即時監視（每 60 秒重抓遠端 log 再刷新，保留展開/選取狀態）
 python monitor/log_monitor.py --sync-config config/log_monitor_sync.json \
-    --log-dir fleet_logs --tui --watch 60
+    --log-dir "$FLEET_LOGS" --tui --watch 60
 # 邊看 TUI 邊產出 HTML 報告（首輪與每次重載都覆寫同一份）
-python monitor/log_monitor.py --log-dir fleet_logs --tui --html
+python monitor/log_monitor.py --log-dir "$FLEET_LOGS" --tui --html
 ```
 
 同步期間由 TUI 安全顯示 `main.py` 最近 20 行輸出；完整紀錄仍寫入原本的 CSV log。
@@ -272,12 +274,20 @@ python monitor/log_monitor.py --log-dir fleet_logs --tui --html
 ### B) 一鍵即時監視（工具自行觸發本體下載遠端 sftp_logs 再分析）
 
 需先備一份 download 設定檔（`remote_path` 指向遠端 `sftp_logs`、`local_path` 等於 `--log-dir`）。
-本倉庫已提供 `config/log_monitor_sync.json`（`local_path=fleet_logs`）。
+本倉庫已提供 `config/log_monitor_sync.json`，`local_path` 是
+`{nvme}/wanhai_nssms/share/sftp_transfer/fleet_logs` —— 鏡像放在 NVMe 資料碟上，
+不佔主碟（`{nvme}` 見根目錄 README 的「保留字佔位符」）。
+
+**`--log-dir` 不會自己跟著設定檔走**：`--sync-config` 只負責「下載到哪」（設定檔的
+`local_path`），`--log-dir` 才是「讀哪裡」，兩者必須手動指到同一個地方。指錯不會報錯，
+只會讀到一個不再更新的舊目錄（或空目錄）。岸端常駐的那一份由 scheduler 的
+`script/start_monitor_tmux.sh` 啟動，它用同一個方法算出資料碟位置再帶進 `--log-dir`。
 
 ```bash
+FLEET_LOGS="$(findmnt -n -o TARGET -S /dev/nvme0n1)/wanhai_nssms/share/sftp_transfer/fleet_logs"
 python monitor/log_monitor.py \
     --sync-config config/log_monitor_sync.json \
-    --log-dir fleet_logs --watch 60 --html
+    --log-dir "$FLEET_LOGS" --watch 60 --html
 ```
 
 每 60 秒重新下載遠端 log 再刷新彩色列表。`--watch` 若不搭配 `--sync-config`，僅重讀本地目錄。

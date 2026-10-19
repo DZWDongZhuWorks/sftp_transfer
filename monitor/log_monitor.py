@@ -13,8 +13,12 @@
   # B) 一鍵即時監視（工具自行觸發本體下載遠端 sftp_logs 再分析）
     python monitor/log_monitor.py --sync-config config/xxx_download_settings.json \\
       --log-dir <該 config 的 local_path> --watch 60 --html
-    
-    python monitor/log_monitor.py --sync-config config/log_monitor_sync.json --log-dir fleet_logs --watch 60 --html
+
+    # 岸端：log_monitor_sync.json 的 local_path 是 {nvme}/…/fleet_logs（資料碟），
+    # --log-dir 要指到同一個地方 —— 本工具不會從設定檔反推。
+    python monitor/log_monitor.py --sync-config config/log_monitor_sync.json \\
+      --log-dir "$(findmnt -n -o TARGET -S /dev/nvme0n1)/wanhai_nssms/share/sftp_transfer/fleet_logs" \\
+      --watch 60 --html
 
 離開碼：一切正常 -> 0；有任何裝置處於異常（partial/aborted/incomplete）或過期 -> 1。
 """

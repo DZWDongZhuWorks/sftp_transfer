@@ -1,5 +1,5 @@
 {
-  "version": "0.25.0",
-  "date": "2026-10-06",
-  "notes": "run_selected_transfers 可拆成兩個行程:--pick-to 只挑選並寫交接檔、--run-from 不需 TTY 照交接檔執行(方向鎖再判一次),讓 dashboard 把傳輸放到背景"
+  "version": "0.25.3",
+  "date": "2026-10-19",
+  "notes": "岸端 fleet_logs 鏡像搬上 NVMe 資料碟(log_monitor_sync.json 的 local_path 改用 {nvme},設定檔不進版控):log_monitor 的用法與 monitor/README 改成帶資料碟上的 --log-dir —— 它不會從設定檔反推讀取位置"
 }

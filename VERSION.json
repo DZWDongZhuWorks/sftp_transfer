@@ -1,5 +1,5 @@
 {
-  "version": "0.25.3",
+  "version": "0.25.4",
   "date": "2026-10-19",
-  "notes": "岸端 fleet_logs 鏡像搬上 NVMe 資料碟(log_monitor_sync.json 的 local_path 改用 {nvme},設定檔不進版控):log_monitor 的用法與 monitor/README 改成帶資料碟上的 --log-dir —— 它不會從設定檔反推讀取位置"
+  "notes": "部署巡檢(automation_health_check.py)認得 scheduler v0.64.0 的 `# NSSMS-ExceptVessel=` 船號排除閘門:列出的船上判 N/A(未安裝 = SKIP、仍殘留 = FAIL),讀不到船號照常要求安裝,與 require_vessel.sh --except 同方向。CLINK 上的 nssms-reboot / nssms-deploy-reconcile 不再被報成缺件"
 }

@@ -90,6 +90,11 @@ BOOT_ACTIVATING_FAIL_SECONDS = 900
 # nssms-fleet-status-retention（岸端 dashboard 報表的遠端保留政策）與上面那支是同一組
 # 閘門、同一個理由：BaseIPC=ipc1 AND Vessel=CLINK，船隊上同樣是 N/A，不需要特例。
 #
+# nssms-reboot 與 nssms-deploy-reconcile 反過來：全船隊都裝、唯獨開發機不裝 —— unit 內宣告
+# `# NSSMS-ExceptVessel=CLINK`（scheduler v0.64.0 起），本巡檢同樣自己讀。CLINK 上它們是
+# N/A：未安裝 = SKIP，仍殘留 = FAIL。讀不到船號時**照常要求安裝**,方向與 NSSMS-Vessel 相反,
+# 與安裝器（require_vessel.sh --except）一致 —— 證明不了自己是被排除的那台,就當一般船。
+#
 # 【勿在下面的 tuple 內寫含括號的註解】device_monitor/tests/test_integration.sh 的涵蓋度斷言
 # 用 `^TIMERS = \((.*?)\)` 抓這個 tuple,非貪婪會停在**第一個**右括號:註解裡的括號會把清單
 # 截斷,於是後面的 timer 全被誤判為「沒被涵蓋」。要加說明就寫在這一段。
@@ -585,10 +590,15 @@ def unit_vessels(source: Optional[Path]) -> Set[str]:
     return _unit_contract(source, "# NSSMS-Vessel=")
 
 
+def unit_except_vessels(source: Optional[Path]) -> Set[str]:
+    """讀取 `# NSSMS-ExceptVessel=...` 契約（require_vessel.sh --except）；空集合代表沒有排除。"""
+    return _unit_contract(source, "# NSSMS-ExceptVessel=")
+
+
 def unit_na_reason(unit: str, role: str, vessel: str = "") -> Optional[str]:
     """本機不適用這支 unit 的原因；適用則回 None。
 
-    兩道閘門與 scheduler/install_timers.sh 的 unit_applicability() 是同一份契約,
+    三道閘門與 scheduler/install_timers.sh 的 unit_applicability() 是同一份契約,
     判定方向也必須一致 —— 巡檢說「該裝」而安裝器說「N/A」,操作者就會被推去重跑一個
     不會改變任何事的安裝器。
     """
@@ -617,6 +627,15 @@ def unit_na_reason(unit: str, role: str, vessel: str = "") -> Optional[str]:
         # 逐字、區分大小寫 —— 與 require_vessel.sh 及 update_booster.sh 的 CLINK 判定一致。
         if known not in vessels:
             return f"本機船號 {known} 為 N/A（適用船號 {wanted}）"
+
+    excepted = unit_except_vessels(source)
+    if excepted:
+        # 排除的方向與上面那道**相反**：安裝器（require_vessel.sh --except）讀不到船號就當
+        # 一般船照裝。巡檢若在這時判 N/A,裝好的 unit 會被報成「N/A 卻殘留,請重跑安裝器」。
+        known = "" if vessel in ("", "unknown") else vessel
+        # 逐字、區分大小寫,與限定那道同一個判讀。
+        if known and known in excepted:
+            return f"本機船號 {known} 在排除清單,為 N/A（排除船號 {','.join(sorted(excepted))}）"
     return None
 
 

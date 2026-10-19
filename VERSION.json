@@ -1,5 +1,5 @@
 {
-  "version": "0.25.1",
+  "version": "0.25.3",
   "date": "2026-10-19",
-  "notes": "把 nssms-fleet-status-retention 加進 deploy/automation_health_check.py 的 TIMERS 涵蓋清單。scheduler 先前新增的岸端排程(每天 02:10 先同步、再刪除遠端 /fleet/LOG/<船名>/<IPC>/dashboard_reports/ 超過 21 天的狀態報表),當時漏了這一步,於是 tests/test_automation_health_check.py 的涵蓋度測試與 device_monitor/tests/test_integration.sh 都紅。【只改一行就夠】那支同時宣告 # NSSMS-BaseIPC=ipc1 與 # NSSMS-Vessel=CLINK,與 nssms-remote-log-retention 同一組閘門;unit_na_reason() 直接讀 unit 內的註記,船隊上落在 N/A(未安裝 = SKIP),不會被報成缺件。"
+  "notes": "岸端 fleet_logs 鏡像搬上 NVMe 資料碟(log_monitor_sync.json 的 local_path 改用 {nvme},設定檔不進版控):log_monitor 的用法與 monitor/README 改成帶資料碟上的 --log-dir —— 它不會從設定檔反推讀取位置"
 }

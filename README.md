@@ -523,7 +523,7 @@ bash script/run_remote_retention.sh
 | 管哪裡 | 誰 | 節奏 |
 |---|---|---|
 | 船上本機 `logs/D_*.csv`、`U_*.csv` | `scheduler/script/cleanup_old_files.py`（規則 `sftp-transfer-csv-logs`） | 每天 |
-| 岸端本機鏡像 `fleet_logs/` | 同上（規則 `sftp-fleet-reports`，**30 天**） | 每天 02:30 |
+| 岸端本機鏡像 `fleet_logs/`（NVMe 資料碟上，見 `config/log_monitor_sync.json` 的 `local_path`） | 同上（規則 `sftp-fleet-reports`，**30 天**） | 每天 02:30 |
 | **岸端 SFTP 上的 `sftp_logs/`** | **`remote_retention.py`**（**21 天**） | 每天 03:10 |
 
 遠端 21 / 本地 30 不是巧合，見下方安全設計第 2 點。兩支排程差 40 分鐘也不是必要的 ——

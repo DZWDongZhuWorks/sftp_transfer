@@ -118,6 +118,18 @@ def build_parser():
         help="只刪檔名符合此 glob 的來源（可重複指定多次，任一命中就算符合；未指定＝不限）。"
         "語意同 scheduler 的 cleanup_rules.json：比對檔名不比對路徑、區分大小寫、不支援 {a,b} 展開",
     )
+    parser.add_argument(
+        "--force-redownload",
+        action="append",
+        help="僅 download 模式：強制重新下載符合此樣式的檔案，即使本地大小與遠端相同（可重複指定多次）。"
+        "樣式格式同 --ignore-file（gitignore）：wheels/、*.whl、/requirements.txt、* 代表整個專案。"
+        "用來修復內容壞掉但大小沒變、因此每一輪都被略過的檔案；整份重來，不接續既有的 .part",
+    )
+    parser.add_argument(
+        "--force-redownload-id",
+        help="強制重下的批次號（任意字串，建議用日期）。有填時每個命中的檔案只重抓一次，之後照常略過，"
+        "換一個值才會再重抓；沒填則每次執行都重抓（只適合手動跑一次）",
+    )
     return parser
 
 
@@ -165,6 +177,8 @@ def run_cli(args):
         DEFAULT_DELETE_SOURCE_MIN_AGE_MINUTES,
     )
     delete_source_pattern = _resolve(args.delete_source_pattern, settings, "delete_source_pattern")
+    force_redownload = _resolve(args.force_redownload, settings, "force_redownload")
+    force_redownload_id = _resolve(args.force_redownload_id, settings, "force_redownload_id")
 
     missing = [
         name
@@ -225,8 +239,15 @@ def run_cli(args):
         delete_source=delete_source,
         delete_source_min_age_minutes=delete_source_min_age_minutes if delete_source else None,
         delete_source_pattern=delete_source_pattern if delete_source else None,
+        force_redownload=force_redownload if mode == "download" else None,
+        force_redownload_id=force_redownload_id if mode == "download" else None,
     ))
-    transfer_cls = SFTPUploader if mode == "upload" else SFTPDownloader
+    if mode == "upload":
+        transfer_cls, direction_kwargs = SFTPUploader, {}
+    else:
+        # 強制重下只屬於下載方向（上傳端沒有「略過壞檔」的問題），不傳給 SFTPUploader。
+        transfer_cls = SFTPDownloader
+        direction_kwargs = dict(force_redownload=force_redownload, force_redownload_id=force_redownload_id)
     transfer = transfer_cls(
         host=host,
         port=port,
@@ -251,6 +272,7 @@ def run_cli(args):
         delete_source_pattern=delete_source_pattern,
         logger=logger,
         log_file=log_file,
+        **direction_kwargs,
     )
     success = transfer.run()
     return 0 if success else 1

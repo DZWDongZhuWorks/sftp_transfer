@@ -23,6 +23,7 @@ def make_args(**overrides):
         retry_count=None, retry_delay=None, upload_log=False, log_remote_dir=None, log_dir=None,
         duplicate_mode=None, duplicate_suffix=None, delete_source=False,
         delete_source_min_age_minutes=None, delete_source_pattern=None,
+        force_redownload=None, force_redownload_id=None,
     )
     defaults.update(overrides)
     return main_module.argparse.Namespace(**defaults)
@@ -482,6 +483,69 @@ class TestRunCliMode:
         settings_path = self._write_settings(tmp_path, mode="upload")
         main_module.run_cli(make_args(config=str(settings_path), mode="download"))
         assert captured["cls"] == "download"
+
+    def test_force_redownload_resolved_from_settings_for_download(self, tmp_path, monkeypatch):
+        captured = self._fakes_and_logger(monkeypatch)
+        settings_path = self._write_settings(
+            tmp_path, force_redownload=["wheels/"], force_redownload_id="20261020",
+        )
+        main_module.run_cli(make_args(config=str(settings_path)))
+        assert captured["cls"] == "download"
+        assert captured["kwargs"]["force_redownload"] == ["wheels/"]
+        assert captured["kwargs"]["force_redownload_id"] == "20261020"
+
+    def test_cli_force_redownload_overrides_settings(self, tmp_path, monkeypatch):
+        captured = self._fakes_and_logger(monkeypatch)
+        settings_path = self._write_settings(tmp_path, force_redownload=["wheels/"], force_redownload_id="a")
+        main_module.run_cli(make_args(
+            config=str(settings_path), force_redownload=["*.whl"], force_redownload_id="b",
+        ))
+        assert captured["kwargs"]["force_redownload"] == ["*.whl"]
+        assert captured["kwargs"]["force_redownload_id"] == "b"
+
+    def test_force_redownload_is_never_passed_to_the_uploader(self, tmp_path, monkeypatch):
+        """強制重下只屬於下載方向；SFTPUploader 不認得這兩個參數，傳過去會 TypeError。"""
+        captured = self._fakes_and_logger(monkeypatch)
+        settings_path = self._write_settings(tmp_path, mode="upload", force_redownload=["*"])
+        main_module.run_cli(make_args(config=str(settings_path)))
+        assert captured["cls"] == "upload"
+        assert "force_redownload" not in captured["kwargs"]
+        assert "force_redownload_id" not in captured["kwargs"]
+
+    def test_parser_accepts_repeated_force_redownload(self):
+        args = main_module.build_parser().parse_args(
+            ["--cli", "--force-redownload", "wheels/", "--force-redownload", "*.tar.gz",
+             "--force-redownload-id", "20261020"]
+        )
+        assert args.force_redownload == ["wheels/", "*.tar.gz"]
+        assert args.force_redownload_id == "20261020"
+
+
+class TestRunAllDownloadsForceArgs:
+    """run_all_downloads.py 把強制重下參數原樣轉給每個專案的 main.py。"""
+
+    def _parse(self, monkeypatch, argv):
+        import run_all_downloads
+        captured = {}
+        monkeypatch.setattr(sys, "argv", ["run_all_downloads.py"] + argv)
+        monkeypatch.setattr(run_all_downloads, "is_dev_machine", lambda: False)
+        monkeypatch.setattr(run_all_downloads, "find_setting_files", lambda _d: [Path("x_download_settings.json")])
+
+        def fake_run(cmd, cwd=None):
+            captured["cmd"] = cmd
+            return MagicMock(returncode=0)
+
+        monkeypatch.setattr(run_all_downloads.subprocess, "run", fake_run)
+        assert run_all_downloads.main() == 0
+        return captured["cmd"]
+
+    def test_without_force_the_command_is_unchanged(self, monkeypatch):
+        cmd = self._parse(monkeypatch, [])
+        assert cmd[2:] == ["--cli", "--mode", "download", "--config", "x_download_settings.json"]
+
+    def test_force_args_are_forwarded(self, monkeypatch):
+        cmd = self._parse(monkeypatch, ["--force-redownload", "wheels/", "--force-redownload-id", "20261020"])
+        assert cmd[-4:] == ["--force-redownload", "wheels/", "--force-redownload-id", "20261020"]
 
 
 class TestBuildParser:

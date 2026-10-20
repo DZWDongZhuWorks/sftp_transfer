@@ -179,6 +179,8 @@ cp example_settings.json settings.json
 | `delete_source` | `--delete-source`（僅能開啟） | `true` / `false` | 每個檔案傳輸完成後是否刪除**來源**檔：下載模式刪遠端來源、上傳模式刪本地來源，未填預設 `false`。專為日誌搬運類任務設計，**一般部署/同步流切勿開啟**；詳見下方【傳輸完畢後刪除來源檔】 |
 | `delete_source_min_age_minutes` | `--delete-source-min-age-minutes` | `10` | `delete_source` 的**隔離期**：來源檔距上次修改不足這麼多分鐘就保留不刪，未填預設 `10`。擋的是「來源還在被寫入」的情況。設 `0` 等於明確宣告來源已經沒有人在寫 |
 | `delete_source_pattern` | `--delete-source-pattern`（可重複指定多次） | `["D_*.csv", "U_*.csv"]` 或 `[]` | 只刪**檔名**符合這些 glob 的來源，任一命中就算符合；留空代表不限。語意與 `scheduler/script/cleanup_rules.json` 的 `pattern` 完全相同 |
+| `force_redownload` | `--force-redownload`（可重複指定多次） | `["wheels/"]`、`["*.whl"]`、`["*"]` 或 `[]` | **僅下載**：強制重新下載符合這些樣式的檔案，即使本地大小與遠端相同。樣式格式同 `ignore_file`（gitignore），`*` 代表整個專案。留空＝不啟用；詳見下方【強制重新下載】 |
+| `force_redownload_id` | `--force-redownload-id` | `"20261020"` 或 `""` | 強制重下的**批次號**：有填時每個命中的檔案只重抓**一次**，之後照常略過，換一個值才會再抓；留空則每一輪都重抓（只適合手動跑一次的 CLI） |
 
 ---
 
@@ -404,6 +406,42 @@ SFTP 連線，並把 `.part` 的**精確位元組數、SHA-256、遠端 size/mti
 > 若某個檔案是**這台裝置第一次遇到、還沒有版本紀錄**（例如升級到這個版本之前就已經下載過的舊檔案，或本地端本來就已經放了同名檔案），沒有歷史資料可比對時：大小相同會姑且信任為未變更略過；大小不同（不論大於或小於遠端）則依上述規則處理（小於遠端的情況一樣會經過 SHA 雜湊驗證再決定是否接續）。
 
 > 若不希望保留這份版本紀錄檔或想重新讓所有檔案回到「首次遇到」的狀態（例如手動清空過本地端資料夾），直接刪除 `.sftp_download_manifest.json` 即可，下次執行會依單純檔案大小比對重新建立。
+
+## 【強制重新下載（force_redownload）】
+
+上面「大小相同 + 版本紀錄對得上 → 略過」的規則是對的，**也不能拿掉**：船岸頻寬是整套設計的核心限制（scheduler 的 warm update 一輪預算 1680 秒，多數機器都跑不完），每輪重抓等於讓更新永遠追不上。但它有個死角：**本地檔案內容壞了、大小卻沒變**。
+
+實際發生過：radar 在船上跑 `install_env.sh` 時 pip 炸出 `zlib.error: Error -3 while decompressing data: invalid block type` —— wheels 目錄裡某個 `.whl` 中段的位元壞了（儲存層或來源的 bit rot），zip 中央目錄完整、檔案打得開、**大小與來源一模一樣**。於是每一輪都判成「已完整下載」而略過，船上沒有任何自動修復路徑，只能人工上船刪檔。斷點續傳的 SHA-256 救不了這件事：它只驗 `.part` 前段能不能接續，SFTP 協定本來就拿不到來源的 hash，做不了端到端校驗。
+
+`force_redownload` 讓維運人員指定「這些路徑下一輪一定要重抓」：
+
+```bash
+# 手動跑一次：radar 的 wheels 整個資料夾重抓
+python main.py --cli --config config/radar_download_settings.json --force-redownload 'wheels/'
+
+# 所有下載設定一起套用（樣式相對於各專案根目錄，wheels/ 一次涵蓋所有帶離線 wheels 的專案）
+python run_all_downloads.py --force-redownload 'wheels/' --force-redownload-id 20261020
+```
+
+或寫進設定檔（會隨 `config/` 的 OTA 散佈到全船隊）：
+
+```json
+"force_redownload": ["wheels/"],
+"force_redownload_id": "20261020"
+```
+
+**樣式**：與 `ignore_file` 同一套 gitignore 語法，比對相對於該組工作 `local_path` 根目錄的路徑 —— `wheels/x.whl`（單一檔）、`*.whl`（任何層級）、`wheels/`（整個資料夾）、`/requirements.txt`（只認根目錄）、`*`（整個專案）。
+
+**批次號（`force_redownload_id`）為什麼要有**：`config/` 是由 OTA 以 overwrite 散佈到全船隊的，在共用設定檔寫一條樣式，每艘船都會讀到。沒有批次號的話它就是「全船隊每一輪都重抓」，直到有人想起來把它刪掉 —— 那正是這套設計最怕的頻寬流失。有批次號時，每個命中的檔案重抓完成後會在 `.sftp_download_manifest.json` 的該筆紀錄記下 `force_id`，之後的輪次照常略過；**要再重抓一次就換一個批次號**，留在設定檔裡也不會再產生流量。沒填批次號時每一輪都會重抓，log 會以 `[FORCE_REDOWNLOAD_ENABLED]` 警告提醒。
+
+**行為細節**：
+
+- **整份重來，不接續**：強制重抓一律從 byte 0 開始，既有的 `.part` 即使雜湊驗得過也不接（它是強制重下之前留下的）。唯一的例外是「這一批次自己寫的 `.part`」：強制重下中途被中斷時，檢查點會帶著 `force_id`，下一輪照一般續傳規則驗證後接續 —— 否則慢鏈路上的大檔每輪都從 0 重來、永遠抓不完。接續期間目的地仍是舊檔，不會被略過規則吃掉。
+- **`duplicate_mode`**：來源**沒換版**時沒有「新舊版」之分，兩種模式都**覆蓋回原檔名**（另存成 `_copy` 的話壞檔仍佔著原檔名，等於沒修）；來源**真的換版**時照 `duplicate_mode` 原本的規則處理。
+- **`resume: false`** 時本來就每次整份重抓，強制重下沒有作用。
+- 每個被強制的檔案會記一行 `[FORCE_REDOWNLOAD]`（含 `state="restart"` 或 `"continue"`）；下載統計照常算在「成功」裡，結尾那行的格式不變。
+- 沒設定任何樣式時，下載行為與 manifest 內容與改版前完全相同。
+- 與 radar / SHM-stream-manager `install_env.sh` 的 CRC 擋門互補：擋門驗到壞檔會改名成 `<檔名>.corrupt`，原檔名不在了，下一輪自然會重抓；`force_redownload` 補的是「壞了沒人發現」或「就是想重抓」的情況。
 
 ## 【傳輸完畢後刪除來源檔（delete_source）】
 

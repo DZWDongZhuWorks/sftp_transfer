@@ -771,6 +771,119 @@ class TestDownloadOneFileSameSize:
         assert (tmp_path / "f.bin").read_bytes() == b"HELLO"  # 原檔不動
         assert (tmp_path / "f_copy.bin").read_bytes() == b"WORLD"
 
+    # ---- 同大小換版、下載到一半被中斷 ----
+    # 中斷時 finally 會把 entry 寫成「新版」的 {size, mtime, local_bytes < size}。目的地仍是舊版、
+    # 大小又相同，若略過分支只比 size/mtime，下一輪就會把舊版當成已完整下載 —— 更新被永遠漏掉。
+
+    OLD = b"O" * (dl.CHUNK_SIZE * 3)
+    NEW = b"N" * (dl.CHUNK_SIZE * 3)
+
+    def _interrupt_after_first_chunk(self, sftp):
+        original_open = sftp.open
+        calls = {"n": 0}
+
+        def flaky_open(path, mode="rb"):
+            f = original_open(path, mode)
+            original_read = f.read
+
+            def read(n=-1):
+                calls["n"] += 1
+                if calls["n"] == 2:
+                    raise OSError("simulated dropped connection")
+                return original_read(n)
+
+            f.read = read
+            return f
+
+        sftp.open = flaky_open
+        return sftp
+
+    def _track_offsets(self, d):
+        offsets = []
+        original_open = d.sftp.open
+
+        def open_(path, mode="rb"):
+            f = original_open(path, mode)
+            original_seek = f.seek
+
+            def seek(pos):
+                offsets.append(pos)
+                original_seek(pos)
+
+            f.seek = seek
+            return f
+
+        d.sftp.open = open_
+        return offsets
+
+    def test_interrupted_same_size_update_is_not_skipped_next_round(
+        self, downloader_factory, fake_sftp_factory, tmp_path, caplog
+    ):
+        local = tmp_path / "f.bin"
+        local.write_bytes(self.OLD)
+        d = downloader_factory(duplicate_mode="overwrite")
+        d._manifest = {"f.bin": {"size": len(self.OLD), "mtime": 1000}}
+        d.sftp = self._interrupt_after_first_chunk(
+            fake_sftp_factory(files={"/remote/f.bin": self.NEW}, mtimes={"/remote/f.bin": 2000})
+        )
+        with pytest.raises(OSError):
+            d._download_one_file("/remote/f.bin", "f.bin", tmp_path)
+        entry = d._load_manifest(tmp_path)["f.bin"]
+        assert (entry["size"], entry["mtime"], entry["local_bytes"]) == (len(self.NEW), 2000, dl.CHUNK_SIZE)
+        assert local.read_bytes() == self.OLD
+
+        # 下一輪（新的行程）：entry 的 size/mtime 已等於遠端，但它是未完成的檢查點 → 不能略過，
+        # 交給既有的 .part 接續驗證。
+        d2 = downloader_factory(duplicate_mode="overwrite")
+        d2._manifest = d2._load_manifest(tmp_path)
+        d2.sftp = fake_sftp_factory(files={"/remote/f.bin": self.NEW}, mtimes={"/remote/f.bin": 2000})
+        offsets = self._track_offsets(d2)
+        with caplog.at_level(logging.INFO):
+            assert d2._download_one_file("/remote/f.bin", "f.bin", tmp_path) == "downloaded"
+        assert offsets == [dl.CHUNK_SIZE]
+        assert any("[RESUME_ACCEPTED]" in r.message for r in caplog.records)
+        assert local.read_bytes() == self.NEW
+        assert not (tmp_path / ("f.bin" + dl.PART_SUFFIX)).exists()
+
+        # 再下一輪：真的完成了，照常略過
+        assert d2._download_one_file("/remote/f.bin", "f.bin", tmp_path) == "skipped"
+
+    def test_incomplete_checkpoint_without_part_file_redownloads_from_scratch(
+        self, downloader_factory, fake_sftp_factory, tmp_path
+    ):
+        """.part 不在了（被清掉、或 SIGKILL 前根本還沒建好）：沒有東西可接，但仍不能略過。"""
+        local = tmp_path / "f.bin"
+        local.write_bytes(self.OLD)
+        d = downloader_factory(duplicate_mode="overwrite")
+        d._manifest = {"f.bin": {
+            "size": len(self.NEW), "mtime": 2000, "local_sha256": "0" * 64, "local_bytes": dl.CHUNK_SIZE,
+        }}
+        d.sftp = fake_sftp_factory(files={"/remote/f.bin": self.NEW}, mtimes={"/remote/f.bin": 2000})
+        offsets = self._track_offsets(d)
+        assert d._download_one_file("/remote/f.bin", "f.bin", tmp_path) == "downloaded"
+        assert offsets == [0]
+        assert local.read_bytes() == self.NEW
+
+    def test_interrupted_same_size_update_duplicate_mode_still_lands_as_copy(
+        self, downloader_factory, fake_sftp_factory, tmp_path
+    ):
+        local = tmp_path / "f.bin"
+        local.write_bytes(self.OLD)
+        d = downloader_factory(duplicate_mode="duplicate")
+        d._manifest = {"f.bin": {"size": len(self.OLD), "mtime": 1000}}
+        d.sftp = self._interrupt_after_first_chunk(
+            fake_sftp_factory(files={"/remote/f.bin": self.NEW}, mtimes={"/remote/f.bin": 2000})
+        )
+        with pytest.raises(OSError):
+            d._download_one_file("/remote/f.bin", "f.bin", tmp_path)
+
+        d2 = downloader_factory(duplicate_mode="duplicate")
+        d2._manifest = d2._load_manifest(tmp_path)
+        d2.sftp = fake_sftp_factory(files={"/remote/f.bin": self.NEW}, mtimes={"/remote/f.bin": 2000})
+        assert d2._download_one_file("/remote/f.bin", "f.bin", tmp_path) == "downloaded"
+        assert local.read_bytes() == self.OLD                        # 舊版保留
+        assert (tmp_path / "f_copy.bin").read_bytes() == self.NEW
+
 
 class TestForceRedownload:
     """強制重下：堵住「本地大小 == 遠端 → 永遠略過」的洞（見 SFTPDownloader.__init__）。
@@ -1009,6 +1122,29 @@ class TestForceRedownload:
 
         # 再下一輪：完成了，照常略過
         assert d2._download_one_file("/remote/wheels/big.whl", "wheels/big.whl", tmp_path) == "skipped"
+
+    def test_interrupted_forced_download_duplicate_mode_still_overwrites_original(
+        self, downloader_factory, fake_sftp_factory, tmp_path
+    ):
+        """一般下載的略過分支也會擋下未完成的檢查點，但那條路在 duplicate 模式會當成「來源換版」
+        另存 _copy。強制重下的接續不是換版 —— 壞檔仍佔著原檔名，必須覆蓋回去。"""
+        good = b"G" * (dl.CHUNK_SIZE * 3)
+        rotten = b"R" * len(good)
+        local = tmp_path / "wheels" / "big.whl"
+        local.parent.mkdir(parents=True)
+        local.write_bytes(rotten)
+        d = downloader_factory(
+            duplicate_mode="duplicate", force_redownload=["*.whl"], force_redownload_id="20261020"
+        )
+        d._manifest = {"wheels/big.whl": {
+            "size": len(good), "mtime": 1000, "local_sha256": "0" * 64, "local_bytes": dl.CHUNK_SIZE,
+            "force_id": "20261020",
+        }}
+        d.sftp = fake_sftp_factory(files={"/remote/wheels/big.whl": good}, mtimes={"/remote/wheels/big.whl": 1000})
+        assert d._force_state("wheels/big.whl", d._manifest["wheels/big.whl"]) == "continue"
+        assert d._download_one_file("/remote/wheels/big.whl", "wheels/big.whl", tmp_path) == "downloaded"
+        assert local.read_bytes() == good
+        assert not (tmp_path / "wheels" / "big_copy.whl").exists()
 
     # ---- 其他邊界 ----
 

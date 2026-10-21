@@ -1,5 +1,5 @@
 {
-  "version": "0.27.0",
-  "date": "2026-10-20",
-  "notes": "manifest 保留整檔 sha256:略過分支不再把完整下載留下的 local_sha256/local_bytes(local_bytes == size 的那筆)整筆覆寫掉，船上被略過過一次的檔從此不會再失去基準。新增離線驗證入口 main.py --verify [--quarantine](run_all_downloads.py 同名參數):不連線、不讀寫 manifest，用保留的整檔雜湊重算本地檔、列出寫入後才壞掉的檔，--quarantine 改名成 .corrupt 讓下一輪自然重抓(duplicate 模式與 CLINK 開發機不隔離)。抓不到岸端來源本身就壞的情況;既有已被略過過的檔沒有雜湊，要等重新下載(或 force_redownload)才有基準"
+  "version": "0.27.1",
+  "date": "2026-10-21",
+  "notes": "巡檢器的 TIMERS 清單補 nssms-verify-downloads —— scheduler v0.68.0 新增的每日完整性驗證 timer，跑的是本專案的 run_all_downloads.py --verify。這份清單必須涵蓋 scheduler/timers/ 內每一支 timer(device_monitor/tests/test_integration.sh 與本專案 tests/test_automation_health_check.py 都有斷言)，漏了會被巡檢誤判成沒被涵蓋。**要在 scheduler v0.68.0 之後才合**:unit 母體不在的話 unit-sync 會回報「找不到 repo 母體」而讓整份巡檢變 UNHEALTHY"
 }

@@ -111,6 +111,7 @@ TIMERS = (
     "nssms-remote-log-retention",
     "nssms-shipboard-alert-upload",
     "nssms-teamviewer",
+    "nssms-verify-downloads",
     "nssms-warm-env",
     "nssms-warning-sign-upload",
     "nssms-wave-send",

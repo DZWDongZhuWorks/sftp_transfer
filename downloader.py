@@ -50,6 +50,9 @@ MANIFEST_FILENAME = ".sftp_download_manifest.json"
 #      過:開機時 update_booster 更新 reboot_launcher.sh，把正在跑的自己改掉而中斷開機）。
 # 暫存檔與目的檔同目錄,確保同一個檔案系統、rename 才具原子性。
 PART_SUFFIX = ".part"
+# verify_local 隔離壞檔用的後綴，刻意與 radar / SHM-stream-manager install_env.sh 的 CRC 擋門
+# 同一個：原檔名消失 → 下一輪下載看到的是「本地沒有這個檔」→ 整份重抓，不需要任何新機制。
+QUARANTINE_SUFFIX = ".corrupt"
 
 # delete_source 的預設隔離期（分鐘）。刪除只發生在「來源檔至少這麼久沒被改過」之後。
 # 為什麼預設不是 0：來源端很可能還有人在寫。岸端 sftp_logs 就是各船用 upload_log 推上去的，
@@ -117,6 +120,34 @@ def checkpoint_incomplete(known):
     offset = checkpoint_offset(known)
     size = known.get("size") if known else None
     return offset is not None and isinstance(size, int) and offset < size
+
+
+def whole_file_digest(known):
+    """entry 若帶著「整檔」sha256 就回傳 {"local_sha256", "local_bytes"}，否則回空 dict。
+
+    local_sha256 的語意一直是「前 local_bytes 個位元組的 sha256」—— 傳輸中的檢查點、續傳時
+    從 _hash_local_prefix 接下去累加的 running hash 都是這個意思。所以**只有 local_bytes == size
+    的那筆才是整檔雜湊**；local_bytes < size 是還在 .part 裡的半截，拿它比對整個檔必定不符。
+    回傳 dict 是為了能直接 ** 進 _manifest_record。
+
+    這個雜湊能證明什麼、不能證明什麼（verify_local 與 README 都以此為前提）：
+      - 它算的是「當時收到並寫進 .part 的位元組」。抓得到**寫入之後**本地才壞掉的 bit rot；
+        抓不到岸端來源本身就壞的情況 —— 來源壞了，hash 就照著壞的內容算，比對永遠相符。
+      - duplicate 模式下來源換版時，收尾寫的是 `_copy` 那份的雜湊，entry 的 key 卻仍是原檔名
+        （原檔名底下是刻意保留的舊版）。拿它驗原檔名必定不符，所以 verify_local 在 duplicate
+        模式只列出、不隔離。船隊實機設定目前全是 overwrite，不受影響。
+    """
+    if not known:
+        return {}
+    size = known.get("size")
+    digest = known.get("local_sha256")
+    if (
+        isinstance(size, int) and not isinstance(size, bool)
+        and checkpoint_offset(known) == size
+        and isinstance(digest, str) and len(digest) == 64
+    ):
+        return {"local_sha256": digest, "local_bytes": size}
+    return {}
 
 
 def permission_bits(file_stat):
@@ -1023,7 +1054,8 @@ class SFTPDownloader(SFTPBase):
                 if disk_size == remote_size:
                     # 大小相同：用版本紀錄（若有）判斷是否真的未變更；沒有紀錄則姑且視為未變更略過。
                     # 這裡不逐一雜湊比對整個檔案內容，避免每次執行都要重新讀取所有已下載完成的檔案。
-                    # 代價是內容壞掉但大小沒變的檔會一直被略過 —— 修復途徑是強制重下（見 __init__）。
+                    # 代價是內容壞掉但大小沒變的檔會一直被略過 —— 偵測靠離線的 verify_local（拿 manifest
+                    # 保留的整檔雜湊重算），修復途徑是強制重下（見 __init__）或 verify 的隔離。
                     unchanged = known is None or (
                         known.get("size") == remote_size and known.get("mtime") == remote_mtime
                     )
@@ -1032,8 +1064,12 @@ class SFTPDownloader(SFTPBase):
                     if unchanged and force is None and not checkpoint_incomplete(known):
                         self.logger.info(f"略過（已完整下載）: {rel_path}")
                         self._align_local_mode(local_file, local_stat, remote_stat, rel_path)
+                        # 上一次完整下載留下的整檔雜湊要帶著走。舊版在這裡把 entry 整筆覆寫成
+                        # {size, mtime}，於是任何檔只要被略過一次，雜湊就沒了 —— 船上正常運作的
+                        # 專案一筆都不剩，verify_local 也就無從驗起。保留它不需要讀檔：unchanged
+                        # 已確認 known 描述的就是遠端這一版，而略過本來就不改目的地。
                         self._manifest[rel_path] = self._manifest_record(
-                            rel_path, size=remote_size, mtime=remote_mtime
+                            rel_path, size=remote_size, mtime=remote_mtime, **whole_file_digest(known)
                         )
                         self._manifest_dirty = True  # 收尾一次寫回，見 _flush_manifest
                         return "skipped"
@@ -1401,6 +1437,133 @@ class SFTPDownloader(SFTPBase):
             parent = Path(local)
             return [([r], parent / PurePosixPath(r.rstrip("/")).name) for r in remote_paths]
         return [(remote_paths, Path(local))]
+
+    def verify_local(self, quarantine=False):
+        """離線驗證：拿 manifest 保留的整檔 sha256 重算本地檔，列出內容已經不符的檔。回傳是否全數相符。
+
+        【為什麼要有】略過分支只比 size/mtime（見 _download_one_file），內容壞掉、大小沒變的檔
+        會永遠被當成已完整下載 —— 2026-10 radar 的 wheels 就是這樣，一路隱形到 pip 解壓才炸。
+        完整下載時本來就有算整檔雜湊（running hash），現在略過分支也會保留它（見
+        whole_file_digest），這裡就是把它拿來用的地方。
+
+        【為什麼不放進每一輪下載】要整檔讀回：radar 347 MB 熱快取 0.49 秒、冷讀 eMMC 估 1~3 秒；
+        岸端 fleet_logs 九萬多筆更不可能每輪讀一遍。它該在 install_env 之前、或每日抽驗時跑。
+        完全不連線、不讀寫 manifest —— 與正在跑的下載並存也不會搶寫同一份檔。
+
+        只驗 local_bytes == size 的筆（見 whole_file_digest）。其餘分類只計數、不算失敗：
+          no_baseline  —— 沒有整檔雜湊：從來沒完整下載過、或在保留雜湊這一版之前就已被略過的舊筆
+                          （上線時船上幾乎全是這種，要等重新下載或強制重下後才有基準）。
+          missing      —— 檔案不在：下一輪下載自己會補，不是 bit rot。
+          size_differs —— 大小已經不同：略過分支的大小比對本來就會讓它重下，不需要這裡出手。
+
+        quarantine=True 時把不符的檔改名成 <檔名>.corrupt（已存在就加流水號），下一輪自然重抓；
+        之後 install_env 的 CRC 擋門會再驗一次新抓的檔。duplicate 模式只列出不隔離：那裡的雜湊
+        可能是 _copy 的，原檔名底下則是刻意保留的舊版，隔離等於把舊版刪掉。
+        """
+        jobs = self._build_jobs()
+        if jobs is None:
+            return False
+        if quarantine and self.duplicate_mode == "duplicate":
+            self.logger.warning(diagnostic_message(
+                "VERIFY_QUARANTINE_DISABLED",
+                "duplicate 模式的雜湊可能屬於 _copy 檔，不隔離任何檔案，只列出不符",
+                duplicate_mode=self.duplicate_mode,
+            ))
+            quarantine = False
+        counts = dict(ok=0, mismatch=0, quarantined=0, no_baseline=0, missing=0, size_differs=0, unreadable=0)
+        hashed_bytes = 0
+        start = time.time()
+        for _sources, local_root in jobs:
+            manifest = self._load_manifest(local_root)
+            # 每個根目錄先交代讀了哪一份 manifest：local_path 多半是相對路徑（相對於執行時的 cwd），
+            # cwd 不對時讀到的是一個不存在的目錄 —— 沒有這一行，結果只會是一句看似正常的「全部 0 筆」。
+            self.logger.info(diagnostic_message(
+                "VERIFY_ROOT",
+                f"驗證本地目錄: {local_root}",
+                local_root=local_root.resolve(),
+                manifest_found=self._manifest_path(local_root).exists(),
+                entries=len(manifest),
+            ))
+            for rel_path, known in sorted(manifest.items()):
+                baseline = whole_file_digest(known) if isinstance(known, dict) else {}
+                rel = PurePosixPath(rel_path)
+                # 手改過的 manifest 可能出現 ../ 或絕對路徑；隔離會改名，不能讓它跑出 local_root。
+                if not baseline or rel.is_absolute() or ".." in rel.parts:
+                    counts["no_baseline"] += 1
+                    continue
+                local_file = local_root / Path(*rel.parts)
+                try:
+                    disk_size = local_file.stat().st_size
+                    if disk_size != baseline["local_bytes"]:
+                        counts["size_differs"] += 1
+                        continue
+                    actual = self._hash_local_file(local_file).hexdigest()
+                except FileNotFoundError:
+                    counts["missing"] += 1
+                    continue
+                except OSError as e:
+                    counts["unreadable"] += 1
+                    self.logger.warning(diagnostic_message(
+                        "VERIFY_UNREADABLE",
+                        f"無法讀取本地檔案，略過驗證: {rel_path}",
+                        local_root=local_root,
+                        file=rel_path,
+                        error=format_exception(e),
+                    ))
+                    continue
+                hashed_bytes += disk_size
+                if actual == baseline["local_sha256"]:
+                    counts["ok"] += 1
+                    continue
+                counts["mismatch"] += 1
+                self.logger.warning(diagnostic_message(
+                    "VERIFY_MISMATCH",
+                    f"本地檔案內容與完整下載當時不符: {rel_path}",
+                    local_root=local_root,
+                    file=rel_path,
+                    size=disk_size,
+                    expected_sha256=baseline["local_sha256"],
+                    actual_sha256=actual,
+                    action="quarantine" if quarantine else "report_only",
+                ))
+                if quarantine and self._quarantine(local_file, local_root, rel_path):
+                    counts["quarantined"] += 1
+        ok = counts["mismatch"] == 0 and counts["unreadable"] == 0
+        (self.logger.info if ok else self.logger.warning)(diagnostic_message(
+            "VERIFY_SUMMARY",
+            "本地檔案驗證完成" if ok else "本地檔案驗證發現問題",
+            hashed_bytes=hashed_bytes,
+            elapsed_seconds=round(time.time() - start, 2),
+            **counts,
+        ))
+        return ok
+
+    def _quarantine(self, local_file, local_root, rel_path):
+        """把壞檔改名成 <檔名>.corrupt（已存在就 .corrupt.1、.corrupt.2…，不蓋掉上一次的證據）。"""
+        target = local_file.with_name(local_file.name + QUARANTINE_SUFFIX)
+        n = 0
+        while target.exists():
+            n += 1
+            target = local_file.with_name(f"{local_file.name}{QUARANTINE_SUFFIX}.{n}")
+        try:
+            os.rename(str(local_file), str(target))
+        except OSError as e:
+            self.logger.warning(diagnostic_message(
+                "VERIFY_QUARANTINE_FAILED",
+                f"隔離壞檔失敗: {rel_path}",
+                local_root=local_root,
+                file=rel_path,
+                error=format_exception(e),
+            ))
+            return False
+        self.logger.warning(diagnostic_message(
+            "VERIFY_QUARANTINED",
+            f"已隔離壞檔，下一輪下載會重抓: {rel_path} → {target.name}",
+            local_root=local_root,
+            file=rel_path,
+            quarantined_as=target.name,
+        ))
+        return True
 
     def _run(self):
         self.logger.info("=== SFTP 下載任務開始 ===")

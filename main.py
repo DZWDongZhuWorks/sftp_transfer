@@ -8,6 +8,7 @@
 
 import argparse
 import getpass
+import logging
 import os
 import signal
 import sys
@@ -21,6 +22,7 @@ from downloader import (
     create_logger,
     diagnostic_message,
 )
+from run_all_downloads import is_dev_machine
 from settings import SETTINGS_PATH, PlaceholderError, load_settings
 from uploader import SFTPUploader
 
@@ -130,6 +132,18 @@ def build_parser():
         help="強制重下的批次號（任意字串，建議用日期）。有填時每個命中的檔案只重抓一次，之後照常略過，"
         "換一個值才會再重抓；沒填則每次執行都重抓（只適合手動跑一次）",
     )
+    parser.add_argument(
+        "--verify",
+        action="store_true",
+        help="僅 download 設定：不連線、不下載，拿 .sftp_download_manifest.json 保留的整檔 SHA-256 重算本地檔，"
+        "列出內容已經不符（寫入後才壞掉）的檔；有不符時回傳 1。只需要 local_path / remote_path，不需要帳密",
+    )
+    parser.add_argument(
+        "--quarantine",
+        action="store_true",
+        help="搭配 --verify：把不符的檔改名成 <檔名>.corrupt，下一輪下載會自然重抓。"
+        "duplicate 模式與 CLINK 開發機上不會隔離",
+    )
     return parser
 
 
@@ -147,6 +161,8 @@ def run_cli(args):
         return 1
 
     mode = args.mode or settings.get("mode") or "download"
+    if args.verify:
+        return run_verify(args, settings, mode)
     host = _resolve(args.host, settings, "host")
     port = _resolve(args.port, settings, "port", 22)
     device_name = _resolve(args.device_name, settings, "device_name")
@@ -278,6 +294,50 @@ def run_cli(args):
     return 0 if success else 1
 
 
+def run_verify(args, settings, mode):
+    """--verify：離線驗證本地檔案（見 SFTPDownloader.verify_local）。
+
+    只走 SFTPDownloader 的路徑展開（_build_jobs 需要 remote_path 才知道「尾斜線＝共同父目錄」
+    展開成哪幾個目錄），不連線，所以 host / 帳密 / device_name 都不是必要參數，也不觸發密碼輸入。
+
+    log 只印到 stdout、不寫 logs/ 底下的 CSV：那裡的 D_*.csv 會被 log_monitor 當成下載紀錄解讀，
+    一份沒有「下載任務開始／結束」的檔只會變成假警報。
+    """
+    if mode != "download":
+        print("錯誤：--verify 只適用於下載設定（manifest 是 .sftp_download_manifest.json）", file=sys.stderr)
+        return 1
+    remote_path = _resolve(args.remote_path, settings, "remote_path")
+    local_path = _resolve(args.local_path, settings, "local_path")
+    if not remote_path or not local_path:
+        print("錯誤：--verify 需要 --remote-path 與 --local-path（可透過 command line 或 settings.json 提供）",
+              file=sys.stderr)
+        return 1
+    quarantine = args.quarantine
+    if quarantine and is_dev_machine():
+        # 開發機的工作樹本來就與 manifest 不符（改過還沒發佈），隔離等於把開發中的檔改名藏起來。
+        print("偵測到開發機 (vsl_name=CLINK)，--quarantine 停用，只列出不符的檔。", file=sys.stderr)
+        quarantine = False
+    device_name = _resolve(args.device_name, settings, "device_name") or "verify"
+    logger = logging.getLogger("sftp_transfer.verify")
+    logger.setLevel(logging.INFO)
+    logger.handlers.clear()
+    logger.propagate = False
+    handler = logging.StreamHandler(sys.stdout)
+    handler.setFormatter(logging.Formatter(f"%(asctime)s [%(levelname)s] [{device_name}] %(message)s",
+                                           "%Y-%m-%d %H:%M:%S"))
+    logger.addHandler(handler)
+    verifier = SFTPDownloader(
+        host=_resolve(args.host, settings, "host"),
+        port=_resolve(args.port, settings, "port", 22),
+        username=_resolve(args.username, settings, "username"),
+        remote_path=remote_path,
+        local_path=local_path,
+        duplicate_mode=args.duplicate_mode or settings.get("duplicate_mode") or "overwrite",
+        logger=logger,
+    )
+    return 0 if verifier.verify_local(quarantine=quarantine) else 1
+
+
 def main():
     if len(sys.argv) == 1:
         from gui import launch_gui
@@ -287,6 +347,8 @@ def main():
 
     parser = build_parser()
     args = parser.parse_args()
+    if args.quarantine and not args.verify:
+        parser.error("--quarantine 只能搭配 --verify 使用")
     previous_sigterm = signal.signal(signal.SIGTERM, _cancel_on_signal)
     try:
         return run_cli(args)

@@ -1181,6 +1181,244 @@ class TestForceRedownload:
         assert d.force_redownload_id is None
 
 
+def _sha(data):
+    return hashlib.sha256(data).hexdigest()
+
+
+class TestManifestKeepsWholeFileHash:
+    """完整下載時算好的整檔 sha256，被略過之後不能消失（見 whole_file_digest）。
+
+    舊版略過分支把 entry 整筆覆寫成 {size, mtime}：船上 radar / ecdis / scheduler 的 manifest
+    因此一筆雜湊都不剩，只有從沒略過過的 CLINK 還留著。"""
+
+    DATA = b"WHEEL-CONTENT-0123456789"
+
+    def _download_then_skip(self, d, fake_sftp_factory, tmp_path, rel="wheels/x.whl"):
+        d.sftp = fake_sftp_factory(files={"/remote/" + rel: self.DATA}, mtimes={"/remote/" + rel: 1000})
+        assert d._download_one_file("/remote/" + rel, rel, tmp_path) == "downloaded"
+        assert d._download_one_file("/remote/" + rel, rel, tmp_path) == "skipped"
+        return d._manifest[rel]
+
+    def test_completed_download_keeps_its_hash_after_being_skipped(
+        self, downloader_factory, fake_sftp_factory, tmp_path
+    ):
+        entry = self._download_then_skip(downloader_factory(), fake_sftp_factory, tmp_path)
+        assert entry == {
+            "size": len(self.DATA), "mtime": 1000,
+            "local_sha256": _sha(self.DATA), "local_bytes": len(self.DATA),
+        }
+
+    def test_hash_survives_many_rounds_through_the_manifest_file(
+        self, downloader_factory, fake_sftp_factory, tmp_path
+    ):
+        d = downloader_factory()
+        self._download_then_skip(d, fake_sftp_factory, tmp_path)
+        d._save_manifest(tmp_path)
+        for _ in range(3):                                # 每一輪都是新的行程、從磁碟讀 manifest
+            d2 = downloader_factory()
+            d2._manifest = d2._load_manifest(tmp_path)
+            d2.sftp = d.sftp
+            assert d2._download_one_file("/remote/wheels/x.whl", "wheels/x.whl", tmp_path) == "skipped"
+            d2._save_manifest(tmp_path)
+        assert d2._load_manifest(tmp_path)["wheels/x.whl"]["local_sha256"] == _sha(self.DATA)
+
+    def test_hash_and_force_id_coexist_on_skip(self, downloader_factory, fake_sftp_factory, tmp_path):
+        d = downloader_factory(force_redownload=["*.whl"], force_redownload_id="20261020")
+        (tmp_path / "wheels").mkdir()
+        (tmp_path / "wheels" / "x.whl").write_bytes(b"X" * len(self.DATA))   # 強制前的壞檔
+        d._manifest = {"wheels/x.whl": {"size": len(self.DATA), "mtime": 1000}}
+        entry = self._download_then_skip(d, fake_sftp_factory, tmp_path)
+        assert entry["force_id"] == "20261020"
+        assert entry["local_sha256"] == _sha(self.DATA)
+        assert entry["local_bytes"] == len(self.DATA)
+
+    def test_legacy_entry_without_hash_is_unchanged(self, downloader_factory, fake_sftp_factory, tmp_path):
+        """已經在船上、已被略過過的舊筆沒有雜湊；略過不會憑空生出一個（那得讀整個檔）。"""
+        (tmp_path / "f.bin").write_bytes(self.DATA)
+        d = downloader_factory()
+        d._manifest = {"f.bin": {"size": len(self.DATA), "mtime": 1000}}
+        d.sftp = fake_sftp_factory(files={"/remote/f.bin": self.DATA}, mtimes={"/remote/f.bin": 1000})
+        assert d._download_one_file("/remote/f.bin", "f.bin", tmp_path) == "skipped"
+        assert d._manifest["f.bin"] == {"size": len(self.DATA), "mtime": 1000}
+
+    def test_source_update_replaces_the_hash_with_the_new_version(
+        self, downloader_factory, fake_sftp_factory, tmp_path
+    ):
+        d = downloader_factory()
+        self._download_then_skip(d, fake_sftp_factory, tmp_path)
+        new = b"NEW-" + self.DATA
+        d.sftp = fake_sftp_factory(files={"/remote/wheels/x.whl": new}, mtimes={"/remote/wheels/x.whl": 2000})
+        assert d._download_one_file("/remote/wheels/x.whl", "wheels/x.whl", tmp_path) == "downloaded"
+        assert d._download_one_file("/remote/wheels/x.whl", "wheels/x.whl", tmp_path) == "skipped"
+        assert d._manifest["wheels/x.whl"]["local_sha256"] == _sha(new)
+
+    @pytest.mark.parametrize("entry", [
+        {"size": 10, "mtime": 1, "local_sha256": "a" * 64, "local_bytes": 4},      # 半截檢查點
+        {"size": 10, "mtime": 1, "local_sha256": "a" * 64, "local_bytes": 11},     # 不合理
+        {"size": 10, "mtime": 1, "local_sha256": "a" * 64},                         # 缺 local_bytes
+        {"size": 10, "mtime": 1, "local_sha256": "abc", "local_bytes": 10},         # 不是 sha256
+        {"size": 10, "mtime": 1, "local_sha256": None, "local_bytes": 10},
+        {"size": True, "mtime": 1, "local_sha256": "a" * 64, "local_bytes": True},  # bool 不是 int
+        {"size": 10, "mtime": 1},
+        None,
+    ])
+    def test_only_complete_entries_count_as_whole_file_digest(self, entry):
+        assert dl.whole_file_digest(entry) == {}
+
+    def test_complete_entry_is_a_whole_file_digest(self):
+        entry = {"size": 10, "mtime": 1, "local_sha256": "a" * 64, "local_bytes": 10, "force_id": "x"}
+        assert dl.whole_file_digest(entry) == {"local_sha256": "a" * 64, "local_bytes": 10}
+
+
+class TestVerifyLocal:
+    """verify_local：拿保留下來的整檔雜湊重算本地檔，挑出寫入後才壞掉的檔。"""
+
+    GOOD = b"GOOD-WHEEL-CONTENT"
+    ROTTEN = b"GOOD-WHEEL-C0NTENT"   # 同大小、中段一個位元組壞掉 —— 略過分支看不出來
+
+    def _complete(self, root, rel, data, mtime=1000):
+        path = root / rel
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_bytes(data)
+        return {"size": len(data), "mtime": mtime, "local_sha256": _sha(data), "local_bytes": len(data)}
+
+    def _write_manifest(self, d, root, manifest):
+        d._manifest = manifest
+        d._save_manifest(root)
+
+    def test_all_intact_returns_true(self, downloader_factory, tmp_path, caplog):
+        d = downloader_factory()
+        self._write_manifest(d, tmp_path, {
+            "a.whl": self._complete(tmp_path, "a.whl", self.GOOD),
+            "sub/b.whl": self._complete(tmp_path, "sub/b.whl", b"other"),
+        })
+        with caplog.at_level(logging.INFO):
+            assert d.verify_local() is True
+        summary = next(r.message for r in caplog.records if "[VERIFY_SUMMARY]" in r.message)
+        assert "ok=2" in summary and "mismatch=0" in summary
+
+    def test_rotten_file_is_reported_and_not_touched(self, downloader_factory, tmp_path, caplog):
+        d = downloader_factory()
+        self._write_manifest(d, tmp_path, {
+            "wheels/x.whl": self._complete(tmp_path, "wheels/x.whl", self.GOOD),
+            "wheels/y.whl": self._complete(tmp_path, "wheels/y.whl", b"fine"),
+        })
+        (tmp_path / "wheels" / "x.whl").write_bytes(self.ROTTEN)
+        with caplog.at_level(logging.INFO):
+            assert d.verify_local() is False
+        mismatches = [r.message for r in caplog.records if "[VERIFY_MISMATCH]" in r.message]
+        assert len(mismatches) == 1
+        assert 'file="wheels/x.whl"' in mismatches[0]
+        assert 'action="report_only"' in mismatches[0]
+        assert (tmp_path / "wheels" / "x.whl").read_bytes() == self.ROTTEN   # 沒有 --quarantine 就不動
+
+    def test_verify_does_not_write_the_manifest(self, downloader_factory, tmp_path):
+        d = downloader_factory()
+        self._write_manifest(d, tmp_path, {"a.whl": self._complete(tmp_path, "a.whl", self.GOOD)})
+        manifest_file = tmp_path / dl.MANIFEST_FILENAME
+        before = manifest_file.read_bytes()
+        (tmp_path / "a.whl").write_bytes(self.ROTTEN)
+        d.verify_local(quarantine=True)
+        assert manifest_file.read_bytes() == before
+
+    def test_quarantine_closes_the_loop_with_the_next_download_round(
+        self, downloader_factory, fake_sftp_factory, tmp_path
+    ):
+        """壞檔被發現 → 改名成 .corrupt → 下一輪看到原檔名不在 → 整份重抓 → 再驗就相符。"""
+        sftp = fake_sftp_factory(files={"/remote/wheels/x.whl": self.GOOD}, mtimes={"/remote/wheels/x.whl": 1000})
+        d = downloader_factory()
+        d.sftp = sftp
+        d._download_one_file("/remote/wheels/x.whl", "wheels/x.whl", tmp_path)
+        d._download_one_file("/remote/wheels/x.whl", "wheels/x.whl", tmp_path)   # 略過一次，雜湊仍在
+        d._save_manifest(tmp_path)
+        local = tmp_path / "wheels" / "x.whl"
+        local.write_bytes(self.ROTTEN)                                           # 寫入後才壞掉
+
+        # 不隔離的話，下一輪仍然會把它當成已完整下載 —— 這正是要補的洞。
+        d_round = downloader_factory()
+        d_round._manifest = d_round._load_manifest(tmp_path)
+        d_round.sftp = sftp
+        assert d_round._download_one_file("/remote/wheels/x.whl", "wheels/x.whl", tmp_path) == "skipped"
+
+        assert downloader_factory().verify_local(quarantine=True) is False
+        assert not local.exists()
+        assert (tmp_path / "wheels" / ("x.whl" + dl.QUARANTINE_SUFFIX)).read_bytes() == self.ROTTEN
+
+        d2 = downloader_factory()
+        d2._manifest = d2._load_manifest(tmp_path)
+        d2.sftp = sftp
+        assert d2._download_one_file("/remote/wheels/x.whl", "wheels/x.whl", tmp_path) == "downloaded"
+        assert local.read_bytes() == self.GOOD
+        d2._save_manifest(tmp_path)
+        assert downloader_factory().verify_local() is True
+
+    def test_quarantine_never_overwrites_an_earlier_corrupt_file(self, downloader_factory, tmp_path):
+        d = downloader_factory()
+        self._write_manifest(d, tmp_path, {"x.whl": self._complete(tmp_path, "x.whl", self.GOOD)})
+        (tmp_path / ("x.whl" + dl.QUARANTINE_SUFFIX)).write_bytes(b"earlier evidence")
+        (tmp_path / "x.whl").write_bytes(self.ROTTEN)
+        d.verify_local(quarantine=True)
+        assert (tmp_path / ("x.whl" + dl.QUARANTINE_SUFFIX)).read_bytes() == b"earlier evidence"
+        assert (tmp_path / ("x.whl" + dl.QUARANTINE_SUFFIX + ".1")).read_bytes() == self.ROTTEN
+
+    def test_duplicate_mode_reports_but_never_quarantines(self, downloader_factory, tmp_path, caplog):
+        """duplicate 模式的雜湊可能是 _copy 的，原檔名底下是刻意保留的舊版，不能被改名藏起來。"""
+        d = downloader_factory(duplicate_mode="duplicate")
+        self._write_manifest(d, tmp_path, {"x.whl": self._complete(tmp_path, "x.whl", self.GOOD)})
+        (tmp_path / "x.whl").write_bytes(self.ROTTEN)
+        with caplog.at_level(logging.INFO):
+            assert d.verify_local(quarantine=True) is False
+        assert (tmp_path / "x.whl").read_bytes() == self.ROTTEN
+        assert any("[VERIFY_QUARANTINE_DISABLED]" in r.message for r in caplog.records)
+
+    def test_entries_without_a_whole_file_baseline_are_counted_not_failed(
+        self, downloader_factory, tmp_path, caplog
+    ):
+        d = downloader_factory()
+        (tmp_path / "legacy.bin").write_bytes(b"whatever")
+        (tmp_path / "partial.bin").write_bytes(b"old version")
+        (tmp_path / "grown.bin").write_bytes(b"longer than recorded")
+        grown = self._complete(tmp_path, "grown.bin", b"short")
+        (tmp_path / "grown.bin").write_bytes(b"longer than recorded")
+        self._write_manifest(d, tmp_path, {
+            "legacy.bin": {"size": 8, "mtime": 1},                                   # 舊筆：沒雜湊
+            # 半截檢查點：雜湊只涵蓋前 4 bytes，拿來比整檔必定不符 —— 不能被當成壞檔
+            "partial.bin": {"size": 11, "mtime": 1, "local_sha256": _sha(b"old "), "local_bytes": 4},
+            "gone.bin": {"size": 3, "mtime": 1, "local_sha256": _sha(b"abc"), "local_bytes": 3},
+            "grown.bin": grown,
+            "broken": "not a dict",
+            "../escape.bin": {"size": 3, "mtime": 1, "local_sha256": _sha(b"abc"), "local_bytes": 3},
+        })
+        with caplog.at_level(logging.INFO):
+            assert d.verify_local(quarantine=True) is True
+        summary = next(r.message for r in caplog.records if "[VERIFY_SUMMARY]" in r.message)
+        for field in ("ok=0", "mismatch=0", "no_baseline=4", "missing=1", "size_differs=1"):
+            assert field in summary
+        assert (tmp_path / "partial.bin").read_bytes() == b"old version"
+
+    def test_each_expanded_project_root_is_verified(self, downloader_factory, tmp_path, caplog):
+        """local_path 帶尾斜線＝共同父目錄：每個專案各自一份 manifest，都要驗到。"""
+        d = downloader_factory(remote_path=["/STANDARD/radar", "/STANDARD/ecdis"], local_path=str(tmp_path) + "/")
+        for name in ("radar", "ecdis"):
+            root = tmp_path / name
+            root.mkdir()
+            self._write_manifest(d, root, {"w.whl": self._complete(root, "w.whl", self.GOOD)})
+        (tmp_path / "ecdis" / "w.whl").write_bytes(self.ROTTEN)
+        with caplog.at_level(logging.INFO):
+            assert d.verify_local() is False
+        mismatch = next(r.message for r in caplog.records if "[VERIFY_MISMATCH]" in r.message)
+        assert "ecdis" in mismatch
+        summary = next(r.message for r in caplog.records if "[VERIFY_SUMMARY]" in r.message)
+        assert "ok=1" in summary and "mismatch=1" in summary
+
+    def test_missing_manifest_verifies_nothing_but_says_so(self, downloader_factory, tmp_path, caplog):
+        """local_path 相對於 cwd，跑錯目錄時要看得出「根本沒讀到 manifest」，而不是一句全部 0 筆。"""
+        with caplog.at_level(logging.INFO):
+            assert downloader_factory().verify_local() is True
+        root_line = next(r.message for r in caplog.records if "[VERIFY_ROOT]" in r.message)
+        assert "manifest_found=false" in root_line and "entries=0" in root_line
+
+
 class TestDownloadOneFileLocalBigger:
     def test_local_bigger_overwrite_mode_replaces_in_place(self, downloader_factory, fake_sftp_factory, tmp_path):
         (tmp_path / "f.bin").write_bytes(b"THIS-LOCAL-FILE-IS-QUITE-LONG")

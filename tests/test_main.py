@@ -23,7 +23,7 @@ def make_args(**overrides):
         retry_count=None, retry_delay=None, upload_log=False, log_remote_dir=None, log_dir=None,
         duplicate_mode=None, duplicate_suffix=None, delete_source=False,
         delete_source_min_age_minutes=None, delete_source_pattern=None,
-        force_redownload=None, force_redownload_id=None,
+        force_redownload=None, force_redownload_id=None, verify=False, quarantine=False,
     )
     defaults.update(overrides)
     return main_module.argparse.Namespace(**defaults)
@@ -546,6 +546,125 @@ class TestRunAllDownloadsForceArgs:
     def test_force_args_are_forwarded(self, monkeypatch):
         cmd = self._parse(monkeypatch, ["--force-redownload", "wheels/", "--force-redownload-id", "20261020"])
         assert cmd[-4:] == ["--force-redownload", "wheels/", "--force-redownload-id", "20261020"]
+
+
+class TestRunVerify:
+    """--verify：離線驗證，不連線、不要帳密、不寫 logs/ 底下的 CSV。"""
+
+    def _settings(self, tmp_path, **overrides):
+        data = dict(remote_path="/STANDARD/radar", local_path=str(tmp_path / "radar"))
+        data.update(overrides)
+        path = tmp_path / "settings.json"
+        path.write_text(json.dumps(data), encoding="utf-8")
+        return path
+
+    def _fake(self, monkeypatch, result=True):
+        captured = {}
+
+        class FakeDownloader:
+            def __init__(self, **kwargs):
+                captured["kwargs"] = kwargs
+
+            def verify_local(self, quarantine=False):
+                captured["quarantine"] = quarantine
+                return result
+
+            def run(self):
+                raise AssertionError("--verify 不能真的下載")
+
+        monkeypatch.setattr(main_module, "SFTPDownloader", FakeDownloader)
+        monkeypatch.setattr(main_module, "create_logger", MagicMock(side_effect=AssertionError("不寫 CSV log")))
+        monkeypatch.setattr(main_module.getpass, "getpass", MagicMock(side_effect=AssertionError("不問密碼")))
+        monkeypatch.setattr(main_module, "is_dev_machine", lambda: False)
+        return captured
+
+    def test_needs_only_paths_no_credentials(self, tmp_path, monkeypatch):
+        captured = self._fake(monkeypatch)
+        rc = main_module.run_cli(make_args(config=str(self._settings(tmp_path)), verify=True))
+        assert rc == 0
+        assert captured["kwargs"]["remote_path"] == "/STANDARD/radar"
+        assert captured["kwargs"]["duplicate_mode"] == "overwrite"
+        assert captured["quarantine"] is False
+
+    def test_mismatch_returns_1(self, tmp_path, monkeypatch):
+        self._fake(monkeypatch, result=False)
+        assert main_module.run_cli(make_args(config=str(self._settings(tmp_path)), verify=True)) == 1
+
+    def test_quarantine_and_duplicate_mode_are_passed_through(self, tmp_path, monkeypatch):
+        captured = self._fake(monkeypatch)
+        settings_path = self._settings(tmp_path, duplicate_mode="duplicate")
+        main_module.run_cli(make_args(config=str(settings_path), verify=True, quarantine=True))
+        assert captured["quarantine"] is True
+        assert captured["kwargs"]["duplicate_mode"] == "duplicate"
+
+    def test_quarantine_is_disabled_on_the_dev_machine(self, tmp_path, monkeypatch, capsys):
+        captured = self._fake(monkeypatch)
+        monkeypatch.setattr(main_module, "is_dev_machine", lambda: True)
+        main_module.run_cli(make_args(config=str(self._settings(tmp_path)), verify=True, quarantine=True))
+        assert captured["quarantine"] is False
+        assert "CLINK" in capsys.readouterr().err
+
+    def test_upload_settings_are_rejected(self, tmp_path, monkeypatch):
+        captured = self._fake(monkeypatch)
+        rc = main_module.run_cli(make_args(config=str(self._settings(tmp_path, mode="upload")), verify=True))
+        assert rc == 1
+        assert "kwargs" not in captured
+
+    def test_missing_local_path_is_an_error(self, tmp_path, monkeypatch):
+        self._fake(monkeypatch)
+        settings_path = self._settings(tmp_path, local_path="")
+        assert main_module.run_cli(make_args(config=str(settings_path), verify=True)) == 1
+
+    def test_quarantine_without_verify_is_rejected(self, monkeypatch):
+        monkeypatch.setattr(sys, "argv", ["main.py", "--cli", "--quarantine"])
+        with pytest.raises(SystemExit):
+            main_module.main()
+
+    def test_end_to_end_with_real_downloader(self, tmp_path, monkeypatch, capsys):
+        """不 mock 下載器：真的讀 manifest、真的重算雜湊。"""
+        import hashlib
+        monkeypatch.setattr(main_module, "is_dev_machine", lambda: False)
+        root = tmp_path / "radar"
+        root.mkdir()
+        (root / "x.whl").write_bytes(b"ROTTEN")
+        manifest = {"x.whl": {"size": 6, "mtime": 1, "local_sha256": hashlib.sha256(b"GOOD!!").hexdigest(),
+                              "local_bytes": 6}}
+        (root / ".sftp_download_manifest.json").write_text(json.dumps(manifest), encoding="utf-8")
+        rc = main_module.run_cli(make_args(config=str(self._settings(tmp_path)), verify=True, quarantine=True))
+        assert rc == 1
+        assert (root / "x.whl.corrupt").exists()
+        assert "[VERIFY_MISMATCH]" in capsys.readouterr().out
+
+
+class TestRunAllDownloadsVerify:
+    def _run(self, monkeypatch, argv, dev=False):
+        import run_all_downloads
+        calls = []
+        monkeypatch.setattr(sys, "argv", ["run_all_downloads.py"] + argv)
+        monkeypatch.setattr(run_all_downloads, "is_dev_machine", lambda: dev)
+        monkeypatch.setattr(run_all_downloads, "find_setting_files", lambda _d: [Path("x_download_settings.json")])
+        monkeypatch.setattr(run_all_downloads.subprocess, "run",
+                            lambda cmd, cwd=None: calls.append(cmd) or MagicMock(returncode=0))
+        return run_all_downloads.main(), calls
+
+    def test_verify_is_forwarded(self, monkeypatch):
+        rc, calls = self._run(monkeypatch, ["--verify", "--quarantine"])
+        assert rc == 0
+        assert calls[0][-2:] == ["--verify", "--quarantine"]
+
+    def test_verify_runs_on_the_dev_machine_but_downloads_do_not(self, monkeypatch):
+        _, calls = self._run(monkeypatch, ["--verify"], dev=True)
+        assert calls and calls[0][-1] == "--verify"
+        _, calls = self._run(monkeypatch, [], dev=True)
+        assert calls == []
+
+    @pytest.mark.parametrize("argv", [
+        ["--quarantine"],
+        ["--verify", "--force-redownload", "wheels/"],
+    ])
+    def test_invalid_combinations_are_rejected(self, monkeypatch, argv):
+        with pytest.raises(SystemExit):
+            self._run(monkeypatch, argv)
 
 
 class TestBuildParser:

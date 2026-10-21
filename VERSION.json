@@ -1,5 +1,5 @@
 {
-  "version": "0.26.1",
+  "version": "0.27.0",
   "date": "2026-10-20",
-  "notes": "修正下載略過判斷的鎖死:來源換成同大小、不同 mtime 的新版,下載到一半被中斷後,manifest 已記成新版的 size/mtime(local_bytes < size),下一輪會把仍是舊版的目的地當成已完整下載而永遠略過、.part 變孤兒。現在 entry 是未完成的檢查點時不略過,交給既有的 .part 接續驗證(RESUME_ACCEPTED/REJECTED);duplicate 模式照常另存 _copy。強制重下的 \"continue\" 改用同一個 checkpoint_incomplete 判斷"
+  "notes": "manifest 保留整檔 sha256:略過分支不再把完整下載留下的 local_sha256/local_bytes(local_bytes == size 的那筆)整筆覆寫掉，船上被略過過一次的檔從此不會再失去基準。新增離線驗證入口 main.py --verify [--quarantine](run_all_downloads.py 同名參數):不連線、不讀寫 manifest，用保留的整檔雜湊重算本地檔、列出寫入後才壞掉的檔，--quarantine 改名成 .corrupt 讓下一輪自然重抓(duplicate 模式與 CLINK 開發機不隔離)。抓不到岸端來源本身就壞的情況;既有已被略過過的檔沒有雜湊，要等重新下載(或 force_redownload)才有基準"
 }

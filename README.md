@@ -106,6 +106,7 @@ export SFTP_PASSWORD="your_password"
 | `--retry-count 10` | 重試次數上限；不指定或填 `0` 代表無限次重試（預設無限次） |
 | `--config settings_A.json` | 指定要讀取的設定檔路徑（預設讀取工具資料夾內的 `settings.json`） |
 | `--ignore-file download_ignore.txt` | 指定「下載忽略設定檔」路徑，符合其中規則的檔案/資料夾不會被下載（格式同 `.gitignore`，詳見下方【下載忽略設定檔】） |
+| `--verify [--quarantine]` | 不連線、不下載，只用 manifest 保留的整檔 SHA-256 驗證本地檔（詳見下方【驗證本地檔案】） |
 
 完整參數說明可執行 `python main.py --help` 查看。
 
@@ -391,7 +392,7 @@ SFTP 連線，並把 `.part` 的**精確位元組數、SHA-256、遠端 size/mti
 > **檢查點的節奏為什麼不是百分比**：門檻若跟檔案大小綁在一起（舊版是「每 10% 進度」），慢鏈路上的大檔永遠碰不到第一個門檻 —— 1.2 GB 的包裹在船岸 5～20 KB/s 的鏈路上，10% 要連續傳 1.6 小時，而排程給的時間窗只有 25 分鐘、逾時是 `SIGKILL`（連收尾都跑不到）。實際結果是永遠寫不下任何檢查點、每趟都從 byte 0 重傳，遠端檔案每小時被砍掉重練一次。改成位元組／秒數的絕對節奏後，硬中止丟掉的進度是 `min(16 MB, 當下速率 × 60 秒)`：慢鏈路由秒數門檻把關（20 KB/s × 60 s ≈ 1.2 MB），快鏈路由位元組門檻把關。
 
 - **大小相同**：用版本紀錄（若有）判斷是否真的未變更；沒有紀錄可比對時，姑且信任大小相同代表未變更。
-  - 判斷為未變更 → 略過，並（重新）建立版本紀錄。
+  - 判斷為未變更 → 略過，並（重新）建立版本紀錄。上一次**完整下載**時算好的整檔 SHA-256（`local_bytes == size` 的那筆 `local_sha256`）會原樣保留，供【驗證本地檔案】使用；略過本身不讀檔、不重算。
   - 有紀錄但跟目前遠端對不上（代表大小沒變但內容其實已更新過）→ 視為來源已更新，依 `duplicate_mode` 處理（見下方）。
 - **本地檔案比遠端大** → 直接視為需要整份重新下載，依 `duplicate_mode` 處理（見下方）：`overwrite` 覆蓋回原檔名，`duplicate` 一樣保留舊檔、另存新檔。
 - **本地檔案比遠端小** → 這是斷點續傳最常遇到的情況。只靠檔案大小/修改時間無法確定本地已下載的這段內容是否真的沒被更動過——伺服器的修改時間精確度、或剛好巧合相符的情形都可能造成誤判，且本地端檔案也可能在下載過程之外被人為修改過。因此：
@@ -441,7 +442,38 @@ python run_all_downloads.py --force-redownload 'wheels/' --force-redownload-id 2
 - **`resume: false`** 時本來就每次整份重抓，強制重下沒有作用。
 - 每個被強制的檔案會記一行 `[FORCE_REDOWNLOAD]`（含 `state="restart"` 或 `"continue"`）；下載統計照常算在「成功」裡，結尾那行的格式不變。
 - 沒設定任何樣式時，下載行為與 manifest 內容與改版前完全相同。
-- 與 radar / SHM-stream-manager `install_env.sh` 的 CRC 擋門互補：擋門驗到壞檔會改名成 `<檔名>.corrupt`，原檔名不在了，下一輪自然會重抓；`force_redownload` 補的是「壞了沒人發現」或「就是想重抓」的情況。
+- 與 radar / SHM-stream-manager `install_env.sh` 的 CRC 擋門互補：擋門驗到壞檔會改名成 `<檔名>.corrupt`，原檔名不在了，下一輪自然會重抓；`force_redownload` 補的是「就是想重抓」，以及下一節 `--verify` 找到壞檔之後的修復。
+
+## 【驗證本地檔案（--verify）】
+
+強制重下解決的是「**知道**哪裡壞了要怎麼修」，這一節解決「**怎麼知道**哪裡壞了」。
+
+每個檔案完整下載時，傳輸迴圈本來就一邊收一邊算 SHA-256，收尾時連同 `local_bytes`（= 檔案大小）寫進 `.sftp_download_manifest.json`。`--verify` 就是拿這個值重算本地檔來比對：
+
+```bash
+# 單一專案：只列出不符的檔，有不符時回傳 1
+python main.py --cli --config config/radar_download_settings.json --verify
+
+# 並把不符的檔改名成 <檔名>.corrupt —— 原檔名不在了，下一輪下載自然整份重抓
+python main.py --cli --config config/radar_download_settings.json --verify --quarantine
+
+# 所有下載設定一起驗
+python run_all_downloads.py --verify
+```
+
+- **完全不連線**：只讀 `local_path`／`remote_path`（用來決定路徑展開成哪幾個專案目錄），不需要帳密、不會提示輸入密碼；也**不讀寫** manifest，與正在跑的下載並存不會搶寫。log 只印到 stdout，不寫進 `logs/D_*.csv`（那裡會被 log_monitor 當成下載紀錄）。
+- **不在每輪下載裡做**：驗證得把整個檔讀回來 —— radar 347 MB 熱快取實測 0.49 秒，冷讀 eMMC 估 1~3 秒；岸端 `fleet_logs` 九萬多筆更不可能每輪讀一遍。它適合在 `install_env.sh` 之前或每日抽驗時跑。
+- **只驗有整檔雜湊的筆**：`local_bytes < size` 是傳到一半的檢查點，雜湊只涵蓋前段，拿來比整檔必定不符，一律不驗。其餘情況只計數、不算失敗：`no_baseline`（沒有整檔雜湊）、`missing`（檔案不在，下一輪自己會補）、`size_differs`（大小已變，略過規則本來就會讓它重下）。每個專案目錄先記一行 `[VERIFY_ROOT]`（實際路徑、有沒有找到 manifest、幾筆 —— `local_path` 多半是相對路徑，cwd 不對時這行會是 `manifest_found=false`；`run_all_downloads.py` 一律以工具資料夾為 cwd），結尾一行 `[VERIFY_SUMMARY]` 帶各類筆數、讀了多少位元組、花多少秒。
+- **閉環**：`--verify --quarantine` 發現壞檔 → 改名成 `.corrupt`（與 radar / SHM-stream-manager `install_env.sh` 的 CRC 擋門同一個後綴；已存在就加 `.1`、`.2`，不蓋掉前一次的證據）→ 下一輪下載整份重抓 → `install_env.sh` 的 CRC 擋門再驗一次。不想讓檔案在下一輪之前消失的話，改用上一節的 `force_redownload` 指定那些路徑。
+- **CLINK 開發機**：`--verify` 照跑（只讀），`--quarantine` 會被停用 —— 開發機工作樹本來就與 manifest 不符（改過還沒發佈），隔離等於把開發中的檔藏起來。`run_all_downloads.py` 在開發機上仍然擋掉下載，只放行 `--verify`。
+
+**這個雜湊能證明什麼、不能證明什麼**（上線前要先知道）：
+
+1. **抓得到寫入之後的本地 bit rot，抓不到岸端來源本身就壞的情況。** 雜湊算的是「當時收到並寫進磁碟的位元組」；來源壞了，雜湊就照著壞的內容算，比對永遠相符。SFTP 協定拿不到來源端的雜湊，這一層本來就做不了端到端校驗 —— 那是 `install_env.sh` CRC 擋門的工作。
+2. **`duplicate_mode: duplicate` 下，雜湊可能屬於 `_copy` 檔。** 來源換版時新版另存成 `原檔名_copy`，manifest 那筆的 key 卻仍是原檔名（原檔名底下是刻意保留的舊版）。因此 duplicate 模式只列出、**不隔離**（log 會記 `[VERIFY_QUARANTINE_DISABLED]`）。船隊實機設定目前全是 `overwrite`，不受影響。
+3. **已經在船上、而且已經被略過過的檔，現在全都沒有雜湊。** v0.27.0 以前，略過分支會把 entry 整筆覆寫成 `{size, mtime}`：實測 radar（0/161）、ecdis（0/581）、scheduler（0/34）一筆都不剩，只有從沒略過過的 CLINK 還留著。這些檔要等**重新下載過一次**（來源改版，或用 `force_redownload` 強制）才會有基準；在那之前 `--verify` 會把它們算進 `no_baseline`、不會報錯。也可以另外在本地補算一次，但補算出來的只是「**當下**的內容」，不保證那就是正確的版本 —— 已經壞掉的檔補算後反而會被當成正確基準。
+
+**成本**：每筆 manifest 多 88~114 B。船端最大的 ecdis manifest 581 筆約 75 KB，幾乎沒差；岸端 `fleet_logs` 鏡像 94,514 筆會從 12.9 MB 變成 1.7~1.8 倍，每次寫回從 0.90 秒變成約 2 秒（寫回頻率見【來源檔案更新時的版本處理】，是批次結尾與每 60 秒一次，不是每檔一次）。
 
 ## 【傳輸完畢後刪除來源檔（delete_source）】
 
@@ -652,6 +684,8 @@ manifest 不能當證據：2026-09-22 實測 `.sftp_download_manifest.json` 的 
 | `RESUME_REJECTED` | 續傳被拒絕；包含精確原因、雙方大小、checkpoint offset 與 hash 是否存在 |
 | `CHECKPOINT_SAVED` | 取消或傳輸錯誤後保存的進度、signal、offset 與 manifest 寫入結果 |
 | `MODE_ALIGNED` | 內容未變更、但兩端 mode 不同，已只補權限不重傳；含 `old_mode` / `new_mode`（八進位字串） |
+| `VERIFY_MISMATCH` / `VERIFY_QUARANTINED` | `--verify` 發現本地檔內容與完整下載當時的整檔 SHA-256 不符（含 `expected_sha256` / `actual_sha256`）；有 `--quarantine` 時接著記改名後的 `quarantined_as` |
+| `VERIFY_SUMMARY` | `--verify` 結尾彙總：`ok` / `mismatch` / `quarantined` / `no_baseline` / `missing` / `size_differs` / `unreadable` 筆數、`hashed_bytes`、`elapsed_seconds` |
 | `LIST_RETRY` / `TRANSFER_RETRY` / `TRANSFER_ERROR` | 清單、單檔傳輸的階段、重試資訊、例外及最終動作 |
 | `LOG_UPLOAD_ATTEMPT` / `LOG_UPLOAD_RETRY` | 回傳 Log 的目的地，以及 `reused_connection`（是否沿用傳輸階段的連線，見下方【連線次數】）；沿用的連線失效時會出現 `LOG_UPLOAD_RETRY` 並重連一次 |
 

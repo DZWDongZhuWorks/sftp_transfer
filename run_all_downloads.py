@@ -9,6 +9,8 @@
     python run_all_downloads.py
     python run_all_downloads.py --config-dir other_config
     python run_all_downloads.py --force-redownload 'wheels/' --force-redownload-id 20261020
+    python run_all_downloads.py --verify               # 不下載，只用 manifest 的整檔雜湊驗本地檔
+    python run_all_downloads.py --verify --quarantine  # 並把不符的檔改名成 .corrupt，下一輪重抓
 """
 
 import argparse
@@ -61,11 +63,23 @@ def main():
     parser.add_argument("--force-redownload", action="append", default=[],
                         help="強制重新下載符合此樣式（gitignore 格式）的檔案，可重複指定；套用到每一份下載設定")
     parser.add_argument("--force-redownload-id", help="強制重下的批次號：有填時每個命中的檔案只重抓一次")
+    # 原樣轉給每一個專案的 main.py --verify（見 SFTPDownloader.verify_local）：不連線、不下載。
+    parser.add_argument("--verify", action="store_true",
+                        help="不下載，改用 manifest 保留的整檔 SHA-256 驗證每個專案的本地檔，列出不符的檔")
+    parser.add_argument("--quarantine", action="store_true",
+                        help="搭配 --verify：把不符的檔改名成 <檔名>.corrupt，下一輪下載自然重抓")
     args = parser.parse_args()
+    if args.quarantine and not args.verify:
+        parser.error("--quarantine 只能搭配 --verify 使用")
+    if args.verify and (args.force_redownload or args.force_redownload_id):
+        parser.error("--verify 不下載，不能與 --force-redownload / --force-redownload-id 同時使用")
 
-    if is_dev_machine():
+    # 只列出不符的 --verify 不寫任何東西，開發機上也可以跑；隔離會改名，main.py 那邊會再擋一次。
+    if is_dev_machine() and not args.verify:
         print("偵測到開發機 (vsl_name=CLINK)，略過所有下載，避免覆蓋未提交的修改。", file=sys.stderr)
         return 0
+    action = "驗證" if args.verify else "下載"
+    extra = (["--verify"] + (["--quarantine"] if args.quarantine else [])) if args.verify else force_args(args)
 
     files = find_setting_files(Path(args.config_dir))
     if not files:
@@ -74,17 +88,17 @@ def main():
 
     results = []
     for i, path in enumerate(files, 1):
-        print(f"\n===== [{i}/{len(files)}] 開始下載：{path.name} =====")
+        print(f"\n===== [{i}/{len(files)}] 開始{action}：{path.name} =====")
         proc = subprocess.run(
             [sys.executable, str(MAIN_SCRIPT), "--cli", "--mode", "download", "--config", str(path)]
-            + force_args(args),
+            + extra,
             cwd=str(BASE_DIR),
         )
         ok = proc.returncode == 0
         results.append((path.name, ok))
         print(f"===== [{i}/{len(files)}] {path.name} {'完成' if ok else '失敗'} =====")
 
-    print("\n========== 下載結果彙總 ==========")
+    print(f"\n========== {action}結果彙總 ==========")
     for name, ok in results:
         print(f"  {'[成功]' if ok else '[失敗]'} {name}")
     failed = sum(1 for _, ok in results if not ok)

@@ -9,8 +9,9 @@ import os
 import stat
 import sys
 import time
-from pathlib import Path
-from unittest.mock import MagicMock
+from collections import Counter
+from pathlib import Path, PurePosixPath
+from unittest.mock import MagicMock, patch
 
 import pytest
 
@@ -18,6 +19,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
 import downloader as dl  # noqa: E402  （檢查點節奏常數與共用基底都住在這裡）
 import uploader as up  # noqa: E402
+from conftest import FakeSFTPClient  # noqa: E402
 
 
 def _write(path: Path, data: bytes):
@@ -1192,3 +1194,307 @@ class TestDeleteSourceFilters:
         assert d.run() is True
 
         assert "fresh.log" in d._load_manifest(tmp_path)
+
+
+# ---------------------------------------------------------------------------
+# 遠端往返次數：略過已上傳檔不該每個檔都問伺服器
+# ---------------------------------------------------------------------------
+
+DASHBOARD_REMOTE = "/fleet/LOG/WH505/IPC-1/dashboard_reports"
+LISTDIR_MIN_FILES = up.LISTDIR_MIN_FILES
+
+
+class _CountingSFTP(FakeSFTPClient):
+    """會數「打到伺服器的請求」的假 client。
+
+    strict_dirs=True 時 open 寫入要求父目錄存在（真的 SFTP 伺服器就是這樣），用來模擬
+    目錄在本輪中途被外部清掉；FakeSFTPClient 預設不檢查，任何路徑都寫得進去。
+    """
+
+    def __init__(self, files=None, strict_dirs=False, **kwargs):
+        super().__init__(files=files, **kwargs)
+        self.calls = Counter()
+        self.strict_dirs = strict_dirs
+
+    def stat(self, path):
+        self.calls["stat"] += 1
+        return super().stat(path)
+
+    def listdir_attr(self, path):
+        self.calls["listdir_attr"] += 1
+        return super().listdir_attr(path)
+
+    def mkdir(self, path):
+        self.calls["mkdir"] += 1
+        return super().mkdir(path)
+
+    def open(self, path, mode="rb"):
+        self.calls["open"] += 1
+        if self.strict_dirs and ("w" in mode or "a" in mode):
+            parent = str(PurePosixPath(path).parent)
+            if parent not in self.dirs and not any(p.startswith(parent + "/") for p in self.files):
+                raise FileNotFoundError(f"No such file: {path}")
+        return super().open(path, mode)
+
+    def lookups(self):
+        """判斷「遠端在不在、多大」花掉的請求數。"""
+        return self.calls["stat"] + self.calls["listdir_attr"]
+
+    def wipe(self, remote_dir):
+        """外部程序把整個目錄清掉（岸端 /fleet/LOG 一天會發生好幾次）。"""
+        prefix = remote_dir.rstrip("/") + "/"
+        for p in [p for p in self.files if p.startswith(prefix)]:
+            del self.files[p]
+        self.dirs = {d for d in self.dirs if d != remote_dir and not d.startswith(prefix)}
+
+
+def _reports(directory: Path, count):
+    """模擬 scheduler/logs/dashboard_report：每小時一份、檔名由舊到新。"""
+    for i in range(count):
+        _write(directory / ("dashboard_report_%04d.csv" % i), b"row,%d\n" % i)
+
+
+def _already_uploaded(local_dir: Path, remote_dir, names=None):
+    """遠端已有一份內容相同的檔（例如上一輪傳過）。"""
+    return {
+        remote_dir + "/" + p.name: p.read_bytes()
+        for p in sorted(local_dir.iterdir())
+        if p.is_file() and (names is None or p.name in names)
+    }
+
+
+class TestRemoteRoundTrips:
+    """改版前每個檔：_ensure_remote_dir 從 / 逐層 stat（dashboard_reports 是 5 次）+ 檔案本身 1 次。
+
+    168 份報表全部略過就是 1008 次請求；船岸 RTT 0.25～2.6 秒，光略過就 250～2600 秒，
+    撞上 scheduler 給的 900 秒逾時（2026-10 岸端鏡像 58% 的回合）。
+    """
+
+    def _prepare(self, uploader_factory, tmp_path, fake, **overrides):
+        kwargs = dict(wait_for_network=False, recursive=False, remote_path=DASHBOARD_REMOTE)
+        kwargs.update(overrides)
+        d = uploader_factory(**kwargs)
+        d._connect_with_retry = MagicMock(side_effect=lambda: setattr(d, "sftp", fake))
+        return d
+
+    def test_168_already_uploaded_reports_cost_two_lookups_not_1008(
+        self, uploader_factory, tmp_path, caplog
+    ):
+        _reports(tmp_path, 168)
+        fake = _CountingSFTP(files=_already_uploaded(tmp_path, DASHBOARD_REMOTE))
+        d = self._prepare(uploader_factory, tmp_path, fake)
+
+        with caplog.at_level(logging.INFO):
+            assert d.run() is True
+
+        # 1 次 stat 確認目錄（最深一層一次到位）+ 1 次列目錄；沒有任何逐檔 stat。
+        assert fake.calls["stat"] == 1
+        assert fake.calls["listdir_attr"] == 1
+        assert fake.calls["open"] == 0 and fake.calls["mkdir"] == 0
+        assert any("略過 168，失敗 0" in r.message for r in caplog.records)
+
+    def test_manifest_backed_second_run_is_just_as_cheap(self, uploader_factory, tmp_path):
+        # 船上的常態：上一輪傳過、manifest 記著版本（不是「沒有 manifest 姑且略過」那條路）。
+        _reports(tmp_path, 168)
+        fake = _CountingSFTP(files={})
+        d = self._prepare(uploader_factory, tmp_path, fake)
+        assert d.run() is True
+        assert len(fake.files) == 168
+        fake.calls.clear()
+
+        assert d.run() is True
+
+        assert fake.lookups() == 2
+        assert fake.calls["open"] == 0
+
+    @pytest.mark.parametrize("per_dir", [10, 60])
+    def test_recursive_lookups_scale_with_directories_not_files(
+        self, uploader_factory, tmp_path, per_dir
+    ):
+        subdirs = ["a", "b", "c"]
+        for sub in [""] + subdirs:
+            for i in range(per_dir):
+                _write(tmp_path / sub / ("f%03d.txt" % i), b"x" * (i + 1))
+        files = {}
+        for p in tmp_path.rglob("*.txt"):
+            files["/remote/" + p.relative_to(tmp_path).as_posix()] = p.read_bytes()
+        fake = _CountingSFTP(files=files)
+        d = self._prepare(uploader_factory, tmp_path, fake, recursive=True, remote_path="/remote")
+
+        assert d.run() is True
+
+        # 4 個目錄：每個 1 次 stat（走訪時確認/鏡射空目錄）+ 1 次列目錄，跟每目錄幾個檔無關。
+        assert fake.calls["stat"] == 4
+        assert fake.calls["listdir_attr"] == 4
+        assert fake.calls["open"] == 0
+
+    def test_few_files_still_stat_one_by_one(self, uploader_factory, tmp_path):
+        # 列目錄至少 4 次來回；本地沒幾個檔時逐檔 stat 比較便宜，維持改版前的做法。
+        _reports(tmp_path, 3)
+        fake = _CountingSFTP(files=_already_uploaded(tmp_path, DASHBOARD_REMOTE))
+        d = self._prepare(uploader_factory, tmp_path, fake)
+
+        assert d.run() is True
+
+        assert fake.calls["listdir_attr"] == 0
+        assert fake.calls["stat"] == 1 + 3   # 目錄 1 次（不再逐層）+ 每個檔 1 次
+
+    def test_delete_source_tasks_never_list_the_remote_archive(self, uploader_factory, tmp_path):
+        # 搬運型任務的遠端是越積越多的檔案庫（ecdis 截圖），列一次可能比逐檔 stat 貴好幾倍。
+        _reports(tmp_path, 20)
+        fake = _CountingSFTP(files=_already_uploaded(tmp_path, DASHBOARD_REMOTE))
+        d = self._prepare(uploader_factory, tmp_path, fake, delete_source=True)
+
+        assert d.run() is True
+
+        assert fake.calls["listdir_attr"] == 0
+        assert fake.calls["stat"] == 1 + 20
+
+    def test_fresh_upload_after_external_wipe_does_not_restat_the_tree(self, uploader_factory, tmp_path):
+        # 遠端整批被清掉（連目錄）之後重傳：目錄只建一次，之後每個檔不再逐層確認。
+        _reports(tmp_path, 168)
+        fake = _CountingSFTP(files={})
+        d = self._prepare(uploader_factory, tmp_path, fake)
+
+        assert d.run() is True
+
+        assert len(fake.files) == 168
+        assert fake.calls["mkdir"] == 5
+        assert fake.calls["listdir_attr"] == 1
+        # 最深一層 1 次 + 第一層 /fleet 1 次（不在 → 底下各層直接建，不再問）；
+        # 清單說都不在，也不再逐檔 stat。
+        assert fake.calls["stat"] == 2
+
+    def test_size_mismatch_is_restated_before_writing(self, uploader_factory, tmp_path):
+        # 清單只負責「在不在、大小是否相同」。要寫入的分支（這裡是遠端只有半截）照舊看伺服器
+        # 「現在」的長度，續傳的截斷/接續判斷不建立在本輪稍早列的清單上。
+        _reports(tmp_path, 10)
+        files = _already_uploaded(tmp_path, DASHBOARD_REMOTE)
+        partial = DASHBOARD_REMOTE + "/dashboard_report_0007.csv"
+        files[partial] = files[partial][:3]
+        fake = _CountingSFTP(files=files)
+        d = self._prepare(uploader_factory, tmp_path, fake)
+
+        assert d.run() is True
+
+        assert fake.calls["stat"] == 1 + 1    # 目錄 + 那一個大小不同的檔
+        assert fake.files[partial] == (tmp_path / "dashboard_report_0007.csv").read_bytes()
+
+    def test_file_written_after_listing_is_looked_up_again(self, uploader_factory, tmp_path):
+        # 清單列完之後本程式自己寫過的檔，清單上那一筆就不可信了：第二次碰到同一個遠端路徑
+        # （多來源合併到同一個 rel_path）要重新 stat，不能照清單當成「不存在」再傳一次。
+        _reports(tmp_path, LISTDIR_MIN_FILES)
+        fake = _CountingSFTP(files={})
+        d = uploader_factory(recursive=False, remote_path=DASHBOARD_REMOTE)
+        d.sftp = fake
+        local = tmp_path / "dashboard_report_0000.csv"
+        d._plan_remote_listings(DASHBOARD_REMOTE, d._list_local_files(tmp_path, DASHBOARD_REMOTE))
+
+        assert d._upload_one_file(local, local.name, DASHBOARD_REMOTE, tmp_path) == "uploaded"
+        assert d._upload_one_file(local, local.name, DASHBOARD_REMOTE, tmp_path) == "skipped"
+        assert fake.calls["open"] == 1
+
+    def test_mode_alignment_invalidates_the_listed_entry(self, uploader_factory, tmp_path):
+        _reports(tmp_path, LISTDIR_MIN_FILES)
+        local = tmp_path / "dashboard_report_0000.csv"
+        os.chmod(local, 0o640)
+        remote = DASHBOARD_REMOTE + "/" + local.name
+        fake = _CountingSFTP(files=_already_uploaded(tmp_path, DASHBOARD_REMOTE), modes={remote: 0o644})
+        d = uploader_factory(recursive=False, remote_path=DASHBOARD_REMOTE)
+        d.sftp = fake
+        d._plan_remote_listings(DASHBOARD_REMOTE, d._list_local_files(tmp_path, DASHBOARD_REMOTE))
+
+        assert d._upload_one_file(local, local.name, DASHBOARD_REMOTE, tmp_path) == "skipped"
+        assert (remote, 0o640) in fake.chmod_calls
+        assert d._listed_attr(remote) is up._UNLISTED
+
+    def test_directory_wiped_mid_run_is_recreated_not_failed(self, uploader_factory, tmp_path, caplog):
+        # 改版前每個檔都逐層確認目錄，中途被清掉會自己建回來；目錄確認有了快取之後，
+        # 這份自癒要靠 _open_remote 補上，否則之後每個檔都被當成「本地檔案不存在」判失敗。
+        _reports(tmp_path, LISTDIR_MIN_FILES)
+        fake = _CountingSFTP(files={}, strict_dirs=True)
+        d = uploader_factory(recursive=False, remote_path=DASHBOARD_REMOTE)
+        d.sftp = fake
+        d._plan_remote_listings(DASHBOARD_REMOTE, d._list_local_files(tmp_path, DASHBOARD_REMOTE))
+        first, second = tmp_path / "dashboard_report_0000.csv", tmp_path / "dashboard_report_0001.csv"
+        assert d._upload_one_file(first, first.name, DASHBOARD_REMOTE, tmp_path) == "uploaded"
+
+        fake.wipe("/fleet/LOG/WH505/IPC-1")
+        mkdirs_before = fake.calls["mkdir"]
+
+        assert d._upload_one_file(second, second.name, DASHBOARD_REMOTE, tmp_path) == "uploaded"
+        assert fake.files[DASHBOARD_REMOTE + "/" + second.name] == second.read_bytes()
+        assert fake.calls["mkdir"] - mkdirs_before == 2   # IPC-1、dashboard_reports 建回來
+
+    def test_append_is_never_retried_into_a_recreated_directory(self, uploader_factory, tmp_path):
+        # 續傳的前提是遠端已有前半段；目錄不見代表前半段也不見了，補建目錄再 append
+        # 只會留下一個只有後半段的檔。照改版前一樣往外拋。
+        fake = _CountingSFTP(files={}, strict_dirs=True)
+        d = uploader_factory()
+        d.sftp = fake
+
+        with pytest.raises(FileNotFoundError):
+            d._open_remote("/gone/x.bin", "ab")
+        assert fake.calls["mkdir"] == 0
+
+    def test_listing_refused_falls_back_to_per_file_stat(self, uploader_factory, tmp_path):
+        _reports(tmp_path, LISTDIR_MIN_FILES)
+        fake = _CountingSFTP(files=_already_uploaded(tmp_path, DASHBOARD_REMOTE))
+        fake.listdir_attr = MagicMock(side_effect=PermissionError(13, "Permission denied"))
+        d = self._prepare(uploader_factory, tmp_path, fake)
+
+        assert d.run() is True
+
+        assert fake.listdir_attr.call_count == 1          # 同一條連線不再重試列目錄
+        assert fake.calls["stat"] == 1 + LISTDIR_MIN_FILES
+
+    @patch("downloader.paramiko.SSHClient")
+    def test_reconnect_forgets_everything_seen_on_the_old_connection(
+        self, mock_ssh_client_cls, uploader_factory, tmp_path
+    ):
+        _reports(tmp_path, LISTDIR_MIN_FILES)
+        d = uploader_factory(recursive=False, remote_path=DASHBOARD_REMOTE, password="secret")
+        d.sftp = _CountingSFTP(files=_already_uploaded(tmp_path, DASHBOARD_REMOTE))
+        d._plan_remote_listings(DASHBOARD_REMOTE, d._list_local_files(tmp_path, DASHBOARD_REMOTE))
+        local = tmp_path / "dashboard_report_0000.csv"
+        assert d._upload_one_file(local, local.name, DASHBOARD_REMOTE, tmp_path) == "skipped"
+        assert d._remote_dirs_ok and d._remote_listings
+
+        d._connect()
+
+        assert d._remote_dirs_ok == set()
+        assert d._remote_listings == {}
+        assert d._listing_dirs   # 本輪的列目錄計畫不是連線狀態，重連後照用
+
+
+class TestReconnectGiveUp:
+    """重連放棄後要直接收尾，不能拿 None 當連線繼續處理下一個檔。"""
+
+    def test_gave_up_reconnecting_aborts_with_the_real_error(self, uploader_factory, tmp_path, caplog):
+        for name in ("a.csv", "b.csv", "c.csv"):
+            _write(tmp_path / name, b"data")
+        fake = _CountingSFTP(files={})
+        fake.open = MagicMock(side_effect=OSError("Socket is closed"))
+        d = uploader_factory(wait_for_network=False)
+        connects = []
+
+        def connect():
+            connects.append(1)
+            if len(connects) == 1:
+                d.sftp = fake
+                return
+            d.sftp = None                       # 真的 _connect 一開頭就 _close()
+            raise OSError("[Errno 101] Network is unreachable")
+
+        d._connect_with_retry = MagicMock(side_effect=connect)
+
+        with caplog.at_level(logging.INFO):
+            assert d.run() is False
+
+        messages = [r.message for r in caplog.records]
+        assert fake.open.call_count == 1         # 放棄之後沒有再碰任何檔
+        assert not any("NoneType" in m for m in messages)
+        aborted = [m for m in messages if "RUN_ABORTED" in m]
+        assert aborted and "Network is unreachable" in aborted[0]
+        from monitor.log_monitor import _RE_ABORT
+        assert "Network is unreachable" in _RE_ABORT.search(aborted[0]).group(1)

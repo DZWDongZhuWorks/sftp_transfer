@@ -1,5 +1,5 @@
 {
-  "version": "0.27.2",
+  "version": "0.27.4",
   "date": "2026-10-21",
-  "notes": "雜湊基準回填第 1 批:docs/hash-baseline-backfill.md(範圍、頻寬估算、執行與收尾步驟)、docs/force_redownload_b1.json(批次號 hash-baseline-b1,只含程式碼/設定/小型靜態檔,每台 IPC 約 31 MB)、script/force_redownload_batch.py(把批次套進/拿出 config/*_download_settings.json,不手改帶密碼的檔)。模型、wheels、venv 包刻意不在範圍內 —— 中位數的船要吃掉 15~28 天的空閒預算。下發前提:發佈的程式碼 ≥ v0.27.0"
+  "notes": "下載端重連放棄後不再拿 None 繼續下一個檔:SFTPDownloader._run 逐檔重試裡 _connect_with_retry 放棄時的例外原本被 except Exception 吞掉、只把這個檔記失敗,下一個檔的第一個遠端呼叫就是 'NoneType' object has no attribute ...,RUN_ABORTED 記到假原因。改為往外拋,跟一開始就連不上走同一條收尾:RUN_ABORTED 帶真正的連線錯誤、帳密錯誤走專屬訊息,中止前傳完的 manifest 由 finally 寫回。與 v0.27.3 上傳端的同一處順修對稱"
 }

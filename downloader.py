@@ -337,6 +337,12 @@ class SFTPBase:
         # 上一次 manifest 真的落盤的時刻（見 _flush_manifest_due）。
         self._last_manifest_flush = 0.0
         self._ignore_spec = None
+        # 這條連線上已確認存在（或剛建立）的遠端目錄，見 _ensure_remote_dir；_close() 時清空。
+        self._remote_dirs_ok = set()
+
+    def _reset_remote_cache(self):
+        """丟掉所有「這條連線上看過的遠端狀態」。斷線重連後伺服器那邊可能已經變了。"""
+        self._remote_dirs_ok.clear()
 
     def _retry_limit_reached(self, attempts):
         if self.retry_count is None or self.retry_count <= 0:
@@ -452,6 +458,8 @@ class SFTPBase:
                 time.sleep(self.retry_delay)
 
     def _close(self):
+        # _connect() 也是先走這裡，所以重連一定會清掉快取。
+        self._reset_remote_cache()
         try:
             if self.sftp:
                 self.sftp.close()
@@ -698,15 +706,44 @@ class SFTPBase:
         """從根目錄逐層確認/建立遠端目錄（等同 mkdir -p），已存在的層級略過。
 
         佔位符展開後的每船/每機目錄（如 /fleet/.../WH289/IPC-1/sftp_logs）
-        伺服器上通常尚未存在，直接 put 會失敗。"""
+        伺服器上通常尚未存在，直接 put 會失敗。
+
+        上傳端每個檔都會呼叫這裡，改版前每次都從根目錄逐層 stat：
+        /fleet/LOG/<船>/<IPC>/dashboard_reports 就是 5 次來回，乘上 168 份報表，在 RTT
+        0.25～2.6 秒的船岸鏈路上光是「確認目錄還在」就要約 3.5～36 分鐘。現在同一條連線內確認過的
+        目錄記在 _remote_dirs_ok，不再問第二次；第一次也先 stat 最深一層，整條路徑都在（最常見）
+        只要一次來回，不在才退回逐層建立。連線中途目錄被外部清掉的自癒見 uploader._open_remote。
+        """
         parts = [p for p in remote_dir.split("/") if p]
         current = "/" if remote_dir.startswith("/") else ""
+        levels = []
         for part in parts:
             current = current.rstrip("/") + "/" + part if current else part
-            try:
-                self.sftp.stat(current)
-            except FileNotFoundError:
-                self.sftp.mkdir(current)
+            levels.append(current)
+        if not levels or levels[-1] in self._remote_dirs_ok:
+            return
+        try:
+            self.sftp.stat(levels[-1])
+        except FileNotFoundError:
+            pass
+        else:
+            self._remote_dirs_ok.update(levels)
+            return
+        # 某一層不在，底下各層（包括剛剛確認不在的最深一層）也一定不在：直接建，不再問。
+        missing = False
+        for level in levels:
+            if level in self._remote_dirs_ok:
+                continue
+            if not missing and level != levels[-1]:
+                try:
+                    self.sftp.stat(level)
+                except FileNotFoundError:
+                    missing = True
+            else:
+                missing = True
+            if missing:
+                self.sftp.mkdir(level)
+            self._remote_dirs_ok.add(level)
 
     def _put_log_file(self):
         remote_name = self.remote_log_dir.rstrip("/") + "/" + Path(self.log_file).name

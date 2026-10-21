@@ -9,6 +9,7 @@ import hashlib
 import os
 import stat
 import time
+from collections import Counter
 from pathlib import Path, PurePosixPath
 
 import paramiko
@@ -32,6 +33,16 @@ UPLOAD_MANIFEST_FILENAME = ".sftp_upload_manifest.json"
 # 同時排除下載端的 manifest，避免同一目錄雙向使用時把對方的紀錄檔也上傳出去。
 _MANIFEST_NAMES = {UPLOAD_MANIFEST_FILENAME, MANIFEST_FILENAME}
 
+# 一個遠端目錄在本輪至少要比對這麼多個本地檔，才整個 listdir_attr 一次、改用清單判斷，
+# 否則照舊逐檔 stat。列目錄不是一次來回：OPENDIR + 每 100 筆一次 READDIR（OpenSSH 的上限）
+# + 收尾那次回 EOF 的 READDIR + CLOSE，項目不到百筆也要 4 次。鏡像型任務遠端與本地大致等大，
+# 4 個檔就打平；取 8 是留給「遠端比本地多一些」的餘裕。
+LISTDIR_MIN_FILES = 8
+
+# _listed_attr 的回傳值之一：這個檔沒辦法用清單回答（目錄沒列、或本程式在列完之後寫過它），
+# 要實打 stat。清單裡「沒有這個檔」則是 None。
+_UNLISTED = object()
+
 
 def _is_transfer_temp(name):
     """下載端未完成的暫存檔（見 downloader.PART_SUFFIX）——絕不上傳。
@@ -49,6 +60,123 @@ class SFTPUploader(SFTPBase):
     """SFTP 上傳（local → remote）：遞迴走訪本地目錄、斷點續傳、忽略規則與版本紀錄。"""
 
     manifest_filename = UPLOAD_MANIFEST_FILENAME
+
+    def __init__(self, *args, **kwargs):
+        super().__init__(*args, **kwargs)
+        # {遠端目錄: {檔名: SFTPAttributes 或 _UNLISTED} 或 None（伺服器不給列）}，見 _listed_attr。
+        # 跟 _remote_dirs_ok 一樣只在同一條連線內有效，_close() 時清空。
+        self._remote_listings = {}
+        # 本輪要整個列出來的遠端目錄（見 _plan_remote_listings）。這是每個來源的計畫，不是連線
+        # 狀態，重連不清；直接呼叫 _upload_one_file（不經 _run）時是空的，也就是一律逐檔 stat。
+        self._listing_dirs = set()
+
+    def _reset_remote_cache(self):
+        super()._reset_remote_cache()
+        self._remote_listings.clear()
+
+    def _plan_remote_listings(self, remote_root, file_list):
+        """決定本輪哪些遠端目錄值得整個列一次，取代逐檔 stat。
+
+        逐檔 stat 的成本跟著「本地要比對幾個檔」走，列目錄跟著「遠端有幾個項目」走（見
+        LISTDIR_MIN_FILES）。鏡像/同步型任務兩邊大致等大，本地檔數過門檻就一定划算：
+        dashboard 報表 168 份全部略過，從 168 次 stat 變成 1 次列目錄（約 5 次來回）。
+
+        搬運型任務（delete_source）刻意不列：本地只剩還沒搬走的新檔，遠端卻是越積越多的
+        檔案庫（ecdis 截圖目錄可達數千份），列一次可能比逐檔 stat 貴好幾倍；而且那些檔
+        幾乎都是新的，略過分支本來就罕見，清單省不到什麼。
+        """
+        self._listing_dirs = set()
+        if self.delete_source:
+            return
+        counts = Counter(
+            str(PurePosixPath(remote_root.rstrip("/") + "/" + rel_path).parent)
+            for _, rel_path in file_list
+        )
+        self._listing_dirs = {d for d, n in counts.items() if n >= LISTDIR_MIN_FILES}
+
+    def _listed_attr(self, remote_file):
+        """用目錄清單回答遠端檔案的屬性：SFTPAttributes、None（清單裡沒有）或 _UNLISTED（去 stat）。
+
+        清單每個目錄、每條連線只列一次。listdir_attr 的屬性本來就含 st_size / st_mode，
+        做法同下載端的 _resolve_remote_attr，連退回 stat 的條件都一樣：
+          * symlink —— readdir 給的是連結自身的 lstat，而 sftp.stat 會跟著連結看實體；
+          * 伺服器沒帶 mode 或 size —— SFTP 協定允許省略。
+        伺服器不讓列（目錄剛被清掉、沒有讀取權限）就整個目錄退回逐檔 stat，跟改版前一樣；
+        連線層級的錯誤則照常往外拋，交給 _run 既有的重連重試。
+        """
+        p = PurePosixPath(remote_file)
+        remote_dir = str(p.parent)
+        if remote_dir not in self._listing_dirs:
+            return _UNLISTED
+        if remote_dir not in self._remote_listings:
+            try:
+                entries = self.sftp.listdir_attr(remote_dir)
+            except (FileNotFoundError, PermissionError) as e:
+                self.logger.info(f"無法列出遠端目錄 {remote_dir}，改為逐檔確認: {format_exception(e)}")
+                self._remote_listings[remote_dir] = None
+            else:
+                self._remote_listings[remote_dir] = {entry.filename: entry for entry in entries}
+        entries = self._remote_listings[remote_dir]
+        if entries is None:
+            return _UNLISTED
+        attr = entries.get(p.name)
+        if attr is None or attr is _UNLISTED:
+            return attr
+        mode = getattr(attr, "st_mode", None)
+        if mode is None or stat.S_ISLNK(mode) or getattr(attr, "st_size", None) is None:
+            return _UNLISTED
+        return attr
+
+    def _forget_remote_attr(self, remote_file):
+        """本程式要改動這個遠端檔（寫入、截斷、chmod）：清單裡它那一筆從此不可信，改回實打 stat。
+
+        同一輪裡再看到同一個遠端路徑的機會不多（多來源合併到同一個 rel_path），但一旦發生，
+        拿舊清單判斷就會把剛傳上去的檔當成不存在或還是舊大小。
+        """
+        p = PurePosixPath(remote_file)
+        entries = self._remote_listings.get(str(p.parent))
+        if entries is not None:
+            entries[p.name] = _UNLISTED
+
+    def _remote_attr(self, remote_file, local_size):
+        """遠端檔案現在的屬性，不存在回 None；能用目錄清單回答就不打 stat。
+
+        清單只回答兩種情況：清單裡沒有（接下來整份 "wb" 上傳，不依賴遠端狀態），以及大小與
+        本地相同（略過分支，或 manifest 說換版而整份覆蓋）。大小不同代表接下來要寫入遠端，
+        其中續傳的截斷/接續判斷必須看伺服器「現在」的長度 —— 清單是本輪稍早列的，中間可能
+        被外部清掉（岸端 /fleet/LOG 一天會被整批清好幾次）—— 所以照改版前實打一次 stat。
+        那一次來回跟著一次傳輸，比例上可以忽略。
+        """
+        listed = self._listed_attr(remote_file)
+        if listed is None:
+            return None
+        if listed is not _UNLISTED and listed.st_size == local_size:
+            return listed
+        try:
+            return self.sftp.stat(remote_file)
+        except FileNotFoundError:
+            return None
+
+    def _open_remote(self, remote_file, mode):
+        """開遠端檔寫入；目錄在本輪中途被外部清掉時補建一次再開。
+
+        _ensure_remote_dir 在同一條連線內只確認一次目錄，但岸端 /fleet/LOG 會被外部程序整批
+        清掉，連 IPC 目錄一起。改版前每個檔都重新逐層 stat，所以中途被清也會自己建回來；有了
+        快取之後要靠這裡補上同樣的自癒，否則之後每個檔都會帶著 FileNotFoundError 被 _run
+        當成「本地檔案不存在」判失敗。
+
+        只限整份覆寫（"wb"）。續傳的 "ab" 是建立在「遠端已有前半段」的判斷上，目錄不見了
+        代表前半段也不見了，補建目錄再 append 只會留下一個只有後半段的檔。
+        """
+        self._forget_remote_attr(remote_file)
+        try:
+            return self.sftp.open(remote_file, mode)
+        except FileNotFoundError:
+            if "a" in mode:
+                raise
+            self._reset_remote_cache()
+            self._ensure_remote_dir(str(PurePosixPath(remote_file).parent))
+            return self.sftp.open(remote_file, mode)
 
     def _remote_exists(self, remote_path):
         try:
@@ -153,6 +281,7 @@ class SFTPUploader(SFTPBase):
         current = permission_bits(remote_stat)
         if desired is None or current is None or current == desired:
             return                      # 對面沒帶 mode 就當沒這回事
+        self._forget_remote_attr(remote_file)
         try:
             self.sftp.chmod(remote_file, desired)
         except (OSError, IOError) as error:
@@ -179,13 +308,9 @@ class SFTPUploader(SFTPBase):
         mode = "wb"
         running_hash = hashlib.sha256()  # 邊上傳邊累加，最後（或中斷當下）存進版本紀錄檔
 
-        try:
-            remote_stat = self.sftp.stat(remote_file)
-            remote_disk_size = remote_stat.st_size
-            remote_exists = True
-        except FileNotFoundError:
-            remote_disk_size = 0
-            remote_exists = False
+        remote_stat = self._remote_attr(remote_file, local_size)
+        remote_exists = remote_stat is not None
+        remote_disk_size = remote_stat.st_size if remote_exists else 0
 
         if remote_exists:
             if not self.resume:
@@ -286,6 +411,7 @@ class SFTPUploader(SFTPBase):
                             # 永遠上傳不完（實測 1.2 GB 的包裹每小時被砍掉重練一次）。
                             discarded = remote_disk_size - checkpoint_bytes
                             if discarded > 0:
+                                self._forget_remote_attr(target_remote)
                                 try:
                                     self.sftp.truncate(target_remote, checkpoint_bytes)
                                 except (OSError, paramiko.SSHException) as e:
@@ -347,7 +473,7 @@ class SFTPUploader(SFTPBase):
         try:
             with open(local_file, "rb") as local_f:
                 local_f.seek(uploaded_bytes)
-                with self.sftp.open(target_remote, mode) as remote_f:
+                with self._open_remote(target_remote, mode) as remote_f:
                     while True:
                         chunk = local_f.read(CHUNK_SIZE)
                         if not chunk:
@@ -625,6 +751,7 @@ class SFTPUploader(SFTPBase):
                                 return False
                             self._connect_with_retry()
 
+                    self._plan_remote_listings(remote_root, file_list)
                     if multi_job:
                         self.logger.info(f"{source} → {remote_root}，發現 {len(file_list)} 個檔案")
                     elif len(job_sources) > 1:
@@ -711,11 +838,13 @@ class SFTPUploader(SFTPBase):
                                     ))
                                     failed.append(rel_path)
                                     break
-                                try:
-                                    self._connect_with_retry()
-                                except Exception:
-                                    failed.append(rel_path)
-                                    break
+                                # 重連放棄時 _connect_with_retry 已記下 CONNECTION_ERROR 再往外拋，這裡
+                                # 不能吞掉、改去下一個檔：self.sftp 此時是 None，下一個檔的第一個遠端
+                                # 呼叫就是 'NoneType' object has no attribute 'stat'，RUN_ABORTED 記到
+                                # 的是假原因（岸端 WH505/IPC-1 dashboard_report 2026-10-18 18:52 的實例）。
+                                # 往外拋就跟「一開始就連不上」走同一條收尾：RUN_ABORTED 帶真正的連線
+                                # 錯誤、帳密錯誤照樣走專屬訊息，未落盤的 manifest 由 finally 寫回。
+                                self._connect_with_retry()
 
                     # 這個來源跑完：把累積的「略過」項目一次寫回。
                     self._flush_manifest(local_root)

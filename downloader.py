@@ -106,6 +106,19 @@ def checkpoint_offset(known):
     return None
 
 
+def checkpoint_incomplete(known):
+    """entry 是不是「傳到一半的檢查點」（local_bytes < size）。
+
+    這種 entry 的 size/mtime 描述的是**正在下載、尚未換名上位**的那一版，不是目的地上的檔。
+    下載中斷時 finally 一定會留下它；若來源換成同大小的新版，目的地（舊版）與 entry（新版）
+    的大小、mtime 都對得上，只看 size/mtime 的略過分支就會把舊版當成已完整下載、永遠鎖死。
+    完成的下載會把 local_bytes 寫成 size，略過分支的 entry 則沒有 local_bytes，兩者都回 False。
+    """
+    offset = checkpoint_offset(known)
+    size = known.get("size") if known else None
+    return offset is not None and isinstance(size, int) and offset < size
+
+
 def permission_bits(file_stat):
     """取出權限位元(不含格式位元);取不到 mode 時回 None。
 
@@ -848,19 +861,17 @@ class SFTPDownloader(SFTPBase):
                         CHECKPOINT_INTERVAL_BYTES 的說明）。
 
         判斷依據是 manifest entry 的 force_id：強制重下寫出的每一筆 entry（傳輸中的檢查點與
-        收尾）都帶著它，見 _manifest_record。完成與否看 local_bytes：收尾時 local_bytes 會等於
-        size、略過分支的 entry 則沒有 local_bytes，兩者都代表「目的地已經是這批次抓下來的檔」。
+        收尾）都帶著它，見 _manifest_record。完成與否看 checkpoint_incomplete。
+
+        「不能略過」這一半，一般下載的略過分支本來就會擋（見 checkpoint_incomplete）；"continue"
+        仍要保留，是因為 duplicate 模式下它必須覆蓋回原檔名、而不是當成來源換版另存 _copy。
         """
         if not self._force_matches(rel_path):
             return None
         if self.force_redownload_id is None:
             return "restart"
         if known and known.get("force_id") == self.force_redownload_id:
-            offset = checkpoint_offset(known)
-            size = known.get("size")
-            if offset is not None and isinstance(size, int) and offset < size:
-                return "continue"
-            return None
+            return "continue" if checkpoint_incomplete(known) else None
         return "restart"
 
     def _manifest_record(self, rel_path, **fields):
@@ -1016,7 +1027,9 @@ class SFTPDownloader(SFTPBase):
                     unchanged = known is None or (
                         known.get("size") == remote_size and known.get("mtime") == remote_mtime
                     )
-                    if unchanged and force is None:
+                    # entry 若是傳到一半的檢查點，它描述的是還在 .part 裡的那一版、不是目的地 ——
+                    # 不能略過，交給下面的 .part 接續驗證（見 checkpoint_incomplete）。
+                    if unchanged and force is None and not checkpoint_incomplete(known):
                         self.logger.info(f"略過（已完整下載）: {rel_path}")
                         self._align_local_mode(local_file, local_stat, remote_stat, rel_path)
                         self._manifest[rel_path] = self._manifest_record(
@@ -1024,7 +1037,7 @@ class SFTPDownloader(SFTPBase):
                         )
                         self._manifest_dirty = True  # 收尾一次寫回，見 _flush_manifest
                         return "skipped"
-                    if unchanged:
+                    if unchanged and force is not None:
                         # 被強制、而來源其實沒換版：duplicate_mode 處理的是「來源已更新、要不要
                         # 保留舊版」，這裡沒有新舊版之分 —— 本地那份就是同一版、只是不再可信。
                         # 所以兩種模式都覆蓋回原檔名；另存成 _copy 的話壞檔仍佔著原檔名，

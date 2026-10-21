@@ -1,5 +1,5 @@
 {
-  "version": "0.26.0",
+  "version": "0.26.1",
   "date": "2026-10-20",
-  "notes": "下載加上強制重下(force_redownload / --force-redownload,gitignore 格式樣式;force_redownload_id 批次號讓每個檔只重抓一次):堵住「本地大小 == 遠端就永遠略過」的洞 —— 內容 bit rot 但大小不變的檔(radar wheels 的 zlib invalid block type)過去會被每輪略過、永遠修不回來。強制重抓整份重來不接續舊 .part;同版本時兩種 duplicate_mode 都覆蓋回原檔名。未設定時行為完全不變"
+  "notes": "修正下載略過判斷的鎖死:來源換成同大小、不同 mtime 的新版,下載到一半被中斷後,manifest 已記成新版的 size/mtime(local_bytes < size),下一輪會把仍是舊版的目的地當成已完整下載而永遠略過、.part 變孤兒。現在 entry 是未完成的檢查點時不略過,交給既有的 .part 接續驗證(RESUME_ACCEPTED/REJECTED);duplicate 模式照常另存 _copy。強制重下的 \"continue\" 改用同一個 checkpoint_incomplete 判斷"
 }

@@ -444,6 +444,8 @@ python run_all_downloads.py --force-redownload 'wheels/' --force-redownload-id 2
 - 沒設定任何樣式時，下載行為與 manifest 內容與改版前完全相同。
 - 與 radar / SHM-stream-manager `install_env.sh` 的 CRC 擋門互補：擋門驗到壞檔會改名成 `<檔名>.corrupt`，原檔名不在了，下一輪自然會重抓；`force_redownload` 補的是「就是想重抓」，以及下一節 `--verify` 找到壞檔之後的修復。
 
+**一次性回填雜湊基準**：v0.27.0 之前被略過過的檔都沒有整檔雜湊。用強制重下回填第 1 批（只含程式碼、設定與小型靜態檔）的方案、頻寬估算與收尾步驟見 [docs/hash-baseline-backfill.md](docs/hash-baseline-backfill.md)；要寫樣式前先看那份文件的「`!` 排除只對第一層資料夾有效」。
+
 ## 【驗證本地檔案（--verify）】
 
 強制重下解決的是「**知道**哪裡壞了要怎麼修」，這一節解決「**怎麼知道**哪裡壞了」。

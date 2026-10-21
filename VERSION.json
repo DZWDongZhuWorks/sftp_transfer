@@ -1,5 +1,5 @@
 {
-  "version": "0.27.1",
+  "version": "0.27.2",
   "date": "2026-10-21",
-  "notes": "巡檢器的 TIMERS 清單補 nssms-verify-downloads —— scheduler v0.68.0 新增的每日完整性驗證 timer，跑的是本專案的 run_all_downloads.py --verify。這份清單必須涵蓋 scheduler/timers/ 內每一支 timer(device_monitor/tests/test_integration.sh 與本專案 tests/test_automation_health_check.py 都有斷言)，漏了會被巡檢誤判成沒被涵蓋。**要在 scheduler v0.68.0 之後才合**:unit 母體不在的話 unit-sync 會回報「找不到 repo 母體」而讓整份巡檢變 UNHEALTHY"
+  "notes": "雜湊基準回填第 1 批:docs/hash-baseline-backfill.md(範圍、頻寬估算、執行與收尾步驟)、docs/force_redownload_b1.json(批次號 hash-baseline-b1,只含程式碼/設定/小型靜態檔,每台 IPC 約 31 MB)、script/force_redownload_batch.py(把批次套進/拿出 config/*_download_settings.json,不手改帶密碼的檔)。模型、wheels、venv 包刻意不在範圍內 —— 中位數的船要吃掉 15~28 天的空閒預算。下發前提:發佈的程式碼 ≥ v0.27.0"
 }

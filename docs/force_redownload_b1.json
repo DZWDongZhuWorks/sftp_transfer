@@ -1,0 +1,16 @@
+{
+  "_comment": "雜湊基準回填第 1 批（只含小樹）。用 script/force_redownload_batch.py 套進 config/*_download_settings.json；方案與估算見 docs/hash-baseline-backfill.md。key 是設定檔名去掉 _download_settings.json。",
+  "force_redownload_id": "hash-baseline-b1",
+  "configs": {
+    "radar": ["*", "!YOLOv7_MODEL/", "!YOLOv7_MODEL/**", "!OCR_MODEL/", "!OCR_MODEL/**", "!wheels/", "!wheels/**", "!virtualenv_wheels/", "!virtualenv_wheels/**"],
+    "ecdis": ["/VERSION.json", "/VERSION.stamp.json", "/rt_enc_ias/*.md", "/rt_enc_ias/VERSION", "/rt_enc_ias/install_env.sh", "/rt_enc_ias/requirements.txt", "rt_enc_ias/src/", "rt_enc_ias/scripts/", "rt_enc_ias/config/", "rt_enc_ias/tests/", "rt_enc_ias/assets/fds_checkbox_template/"],
+    "shm": ["*", "!wheels/", "!wheels/**"],
+    "sftp": ["*", "!deploy/", "!deploy/**", "deploy/*.sh", "deploy/*.py", "deploy/*.md", "deploy/*.txt", "deploy/build/", "deploy/lib/"],
+    "scheduler": ["*"],
+    "device_monitor": ["*"],
+    "IPC1_share": ["*"],
+    "IPC2_nsms": ["*"],
+    "IPC3_nsms": ["*"],
+    "IPC3_share": ["*"]
+  }
+}

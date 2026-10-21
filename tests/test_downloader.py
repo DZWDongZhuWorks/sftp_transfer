@@ -772,6 +772,279 @@ class TestDownloadOneFileSameSize:
         assert (tmp_path / "f_copy.bin").read_bytes() == b"WORLD"
 
 
+class TestForceRedownload:
+    """強制重下：堵住「本地大小 == 遠端 → 永遠略過」的洞（見 SFTPDownloader.__init__）。
+
+    情境是 2026-10 radar 的 wheels：本地 .whl 中段 bit rot、大小與來源相同，於是每一輪都
+    被判成已完整下載。這組測試同時守兩邊 —— 有標記的會真的重抓，沒標記的照舊略過。"""
+
+    GOOD = b"GOOD-WHEEL-CONTENT"
+    ROTTEN = b"GOOD-WHEEL-C0NTENT"   # 同大小、中段一個位元組壞掉
+
+    def _seed(self, d, fake_sftp_factory, tmp_path, rel="wheels/x.whl", mtime=1000):
+        """模擬一個「上次完整下載過、之後在磁碟上壞掉」的檔：manifest 說已完成、內容卻是壞的。"""
+        local = tmp_path / rel
+        local.parent.mkdir(parents=True, exist_ok=True)
+        local.write_bytes(self.ROTTEN)
+        d._manifest = {rel: {"size": len(self.GOOD), "mtime": mtime}}
+        d.sftp = fake_sftp_factory(files={"/remote/" + rel: self.GOOD}, mtimes={"/remote/" + rel: mtime})
+        return local
+
+    def _track_offsets(self, d):
+        """記下每次開遠端檔後 seek 的位置：0 = 整份重來，>0 = 接續。"""
+        offsets = []
+        original_open = d.sftp.open
+
+        def open_(path, mode="rb"):
+            f = original_open(path, mode)
+            original_seek = f.seek
+
+            def seek(pos):
+                offsets.append(pos)
+                original_seek(pos)
+
+            f.seek = seek
+            return f
+
+        d.sftp.open = open_
+        return offsets
+
+    # ---- 防回歸：沒標記就跟改版前一模一樣 ----
+
+    def test_without_force_a_same_size_rotten_file_is_still_skipped(
+        self, downloader_factory, fake_sftp_factory, tmp_path
+    ):
+        d = downloader_factory()
+        local = self._seed(d, fake_sftp_factory, tmp_path)
+        assert d._download_one_file("/remote/wheels/x.whl", "wheels/x.whl", tmp_path) == "skipped"
+        assert local.read_bytes() == self.ROTTEN      # 沒有任何流量、沒有任何改變
+        assert d._manifest["wheels/x.whl"] == {"size": len(self.GOOD), "mtime": 1000}  # 不多任何欄位
+
+    def test_force_set_but_not_matching_still_skips(self, downloader_factory, fake_sftp_factory, tmp_path):
+        d = downloader_factory(force_redownload=["*.tar.gz"], force_redownload_id="20261020")
+        local = self._seed(d, fake_sftp_factory, tmp_path)
+        assert d._download_one_file("/remote/wheels/x.whl", "wheels/x.whl", tmp_path) == "skipped"
+        assert local.read_bytes() == self.ROTTEN
+        assert "force_id" not in d._manifest["wheels/x.whl"]  # 範圍外的檔不蓋章
+
+    # ---- 有標記就真的重抓 ----
+
+    def test_matching_file_with_same_size_is_redownloaded(
+        self, downloader_factory, fake_sftp_factory, tmp_path, caplog
+    ):
+        d = downloader_factory(force_redownload=["wheels/x.whl"])
+        local = self._seed(d, fake_sftp_factory, tmp_path)
+        with caplog.at_level(logging.WARNING):
+            assert d._download_one_file("/remote/wheels/x.whl", "wheels/x.whl", tmp_path) == "downloaded"
+        assert local.read_bytes() == self.GOOD
+        message = next(r.message for r in caplog.records if "[FORCE_REDOWNLOAD]" in r.message)
+        assert 'state="restart"' in message
+        assert 'file="wheels/x.whl"' in message
+
+    @pytest.mark.parametrize("pattern", ["wheels/x.whl", "*.whl", "wheels/", "wheels/*", "*", "/wheels/x.whl"])
+    def test_gitignore_style_patterns(self, downloader_factory, fake_sftp_factory, tmp_path, pattern):
+        """單一路徑、glob、資料夾、`*` 整個專案都要能表達（語意同 ignore_file）。"""
+        d = downloader_factory(force_redownload=pattern)   # 單一字串也收
+        local = self._seed(d, fake_sftp_factory, tmp_path)
+        assert d._download_one_file("/remote/wheels/x.whl", "wheels/x.whl", tmp_path) == "downloaded"
+        assert local.read_bytes() == self.GOOD
+
+    def test_without_id_every_call_redownloads(self, downloader_factory, fake_sftp_factory, tmp_path):
+        """沒填批次號 = 每次都重抓（給手動跑一次的 CLI 用）。"""
+        d = downloader_factory(force_redownload=["*.whl"])
+        self._seed(d, fake_sftp_factory, tmp_path)
+        assert d._download_one_file("/remote/wheels/x.whl", "wheels/x.whl", tmp_path) == "downloaded"
+        assert d._download_one_file("/remote/wheels/x.whl", "wheels/x.whl", tmp_path) == "downloaded"
+        assert "force_id" not in d._manifest["wheels/x.whl"]
+
+    def test_with_id_each_file_is_redownloaded_only_once(self, downloader_factory, fake_sftp_factory, tmp_path):
+        """寫在 OTA 散佈的設定檔裡也不會變成每輪重抓：同一個 id 只抓一次，換 id 才再抓。"""
+        d = downloader_factory(force_redownload=["*.whl"], force_redownload_id="20261020")
+        local = self._seed(d, fake_sftp_factory, tmp_path)
+        assert d._download_one_file("/remote/wheels/x.whl", "wheels/x.whl", tmp_path) == "downloaded"
+        assert d._manifest["wheels/x.whl"]["force_id"] == "20261020"
+        assert d._download_one_file("/remote/wheels/x.whl", "wheels/x.whl", tmp_path) == "skipped"
+        assert d._manifest["wheels/x.whl"]["force_id"] == "20261020"  # 略過時章要留著
+
+        local.write_bytes(self.ROTTEN)                 # 又壞了一次
+        d.force_redownload_id = "20261101"
+        assert d._download_one_file("/remote/wheels/x.whl", "wheels/x.whl", tmp_path) == "downloaded"
+        assert local.read_bytes() == self.GOOD
+
+    def test_id_persists_through_the_manifest_file(self, downloader_factory, fake_sftp_factory, tmp_path):
+        d = downloader_factory(force_redownload=["*.whl"], force_redownload_id=20261020)  # JSON 數字也行
+        self._seed(d, fake_sftp_factory, tmp_path)
+        d._download_one_file("/remote/wheels/x.whl", "wheels/x.whl", tmp_path)
+        d._save_manifest(tmp_path)
+
+        d2 = downloader_factory(force_redownload=["*.whl"], force_redownload_id="20261020")
+        d2._manifest = d2._load_manifest(tmp_path)
+        d2.sftp = d.sftp
+        assert d2._download_one_file("/remote/wheels/x.whl", "wheels/x.whl", tmp_path) == "skipped"
+
+    def test_later_normal_update_does_not_trigger_a_second_force(
+        self, downloader_factory, fake_sftp_factory, tmp_path
+    ):
+        """強制重抓完成後來源正常改版：新版照常下載，而且下一輪不該因為 id 還在就再抓一次。"""
+        d = downloader_factory(force_redownload=["*.whl"], force_redownload_id="20261020")
+        local = self._seed(d, fake_sftp_factory, tmp_path)
+        d._download_one_file("/remote/wheels/x.whl", "wheels/x.whl", tmp_path)
+        d.sftp = fake_sftp_factory(files={"/remote/wheels/x.whl": b"NEW-VERSION"}, mtimes={"/remote/wheels/x.whl": 2000})
+        assert d._download_one_file("/remote/wheels/x.whl", "wheels/x.whl", tmp_path) == "downloaded"
+        assert local.read_bytes() == b"NEW-VERSION"
+        assert d._download_one_file("/remote/wheels/x.whl", "wheels/x.whl", tmp_path) == "skipped"
+
+    # ---- duplicate_mode ----
+
+    @pytest.mark.parametrize("mode", ["overwrite", "duplicate"])
+    def test_forced_same_version_replaces_in_place_in_both_modes(
+        self, downloader_factory, fake_sftp_factory, tmp_path, mode
+    ):
+        """來源沒換版時沒有「新舊版」可言：兩種模式都覆蓋回原檔名，不另存 _copy
+        （另存的話壞檔仍佔著原檔名，等於什麼都沒修到）。"""
+        d = downloader_factory(duplicate_mode=mode, force_redownload=["*.whl"])
+        local = self._seed(d, fake_sftp_factory, tmp_path)
+        assert d._download_one_file("/remote/wheels/x.whl", "wheels/x.whl", tmp_path) == "downloaded"
+        assert local.read_bytes() == self.GOOD
+        assert sorted(p.name for p in local.parent.iterdir()) == ["x.whl"]
+
+    def test_forced_with_source_update_in_duplicate_mode_keeps_duplicate_semantics(
+        self, downloader_factory, fake_sftp_factory, tmp_path
+    ):
+        """來源真的換版了：那是 duplicate_mode 的本業，強制重下不改變它（舊版保留、新版另存）。"""
+        d = downloader_factory(duplicate_mode="duplicate", force_redownload=["*.whl"])
+        local = self._seed(d, fake_sftp_factory, tmp_path)
+        d.sftp = fake_sftp_factory(files={"/remote/wheels/x.whl": self.GOOD}, mtimes={"/remote/wheels/x.whl": 2000})
+        assert d._download_one_file("/remote/wheels/x.whl", "wheels/x.whl", tmp_path) == "downloaded"
+        assert local.read_bytes() == self.ROTTEN
+        assert (local.parent / "x_copy.whl").read_bytes() == self.GOOD
+
+    # ---- 與 .part 斷點續傳的互動 ----
+
+    def test_force_never_resumes_a_part_file_left_before_the_force(
+        self, downloader_factory, fake_sftp_factory, tmp_path, caplog
+    ):
+        """強制重下要整份重來：既有 .part 即使雜湊驗得過、平常會被接續，也一律從 byte 0 重抓。"""
+        d = downloader_factory(force_redownload=["*.whl"], force_redownload_id="20261020")
+        local = self._seed(d, fake_sftp_factory, tmp_path)
+        part = local.with_name(local.name + dl.PART_SUFFIX)
+        part.write_bytes(self.GOOD[:5])
+        d._manifest["wheels/x.whl"].update(
+            local_sha256=hashlib.sha256(self.GOOD[:5]).hexdigest(), local_bytes=5,
+        )
+        offsets = self._track_offsets(d)
+        with caplog.at_level(logging.INFO):
+            assert d._download_one_file("/remote/wheels/x.whl", "wheels/x.whl", tmp_path) == "downloaded"
+        assert offsets == [0]
+        assert local.read_bytes() == self.GOOD
+        assert not part.exists()
+        assert not any("[RESUME_ACCEPTED]" in r.message for r in caplog.records)
+        assert not any("[RESUME_REJECTED]" in r.message for r in caplog.records)  # 根本沒進接續判斷
+
+    def test_same_part_file_is_resumed_when_not_forced(self, downloader_factory, fake_sftp_factory, tmp_path):
+        """對照組：上一個測試的同一份 .part，沒有強制時確實會被接續 —— 證明上面擋的是真的接續。"""
+        d = downloader_factory()
+        local = tmp_path / "wheels" / "x.whl"
+        local.parent.mkdir(parents=True)
+        part = local.with_name(local.name + dl.PART_SUFFIX)
+        part.write_bytes(self.GOOD[:5])
+        d._manifest = {"wheels/x.whl": {
+            "size": len(self.GOOD), "mtime": 1000,
+            "local_sha256": hashlib.sha256(self.GOOD[:5]).hexdigest(), "local_bytes": 5,
+        }}
+        d.sftp = fake_sftp_factory(files={"/remote/wheels/x.whl": self.GOOD}, mtimes={"/remote/wheels/x.whl": 1000})
+        offsets = self._track_offsets(d)
+        d._download_one_file("/remote/wheels/x.whl", "wheels/x.whl", tmp_path)
+        assert offsets == [5]
+
+    def test_interrupted_forced_download_resumes_its_own_part_next_round(
+        self, downloader_factory, fake_sftp_factory, tmp_path, caplog
+    ):
+        """強制重下自己寫的 .part 被中斷後，下一輪要能驗證接續 —— 否則慢鏈路上的大檔每輪都從
+        byte 0 重來、永遠抓不完。而且接續期間目的地還是壞檔，不能被略過分支吃掉。"""
+        good = b"G" * (dl.CHUNK_SIZE * 3)
+        rotten = b"R" * len(good)
+        local = tmp_path / "wheels" / "big.whl"
+        local.parent.mkdir(parents=True)
+        local.write_bytes(rotten)
+        d = downloader_factory(force_redownload=["*.whl"], force_redownload_id="20261020")
+        d._manifest = {"wheels/big.whl": {"size": len(good), "mtime": 1000}}
+        sftp = fake_sftp_factory(files={"/remote/wheels/big.whl": good}, mtimes={"/remote/wheels/big.whl": 1000})
+        original_open = sftp.open
+        calls = {"n": 0}
+
+        def flaky_open(path, mode="rb"):
+            f = original_open(path, mode)
+            original_read = f.read
+
+            def read(n=-1):
+                calls["n"] += 1
+                if calls["n"] == 2:
+                    raise OSError("simulated dropped connection")
+                return original_read(n)
+
+            f.read = read
+            return f
+
+        sftp.open = flaky_open
+        d.sftp = sftp
+        with pytest.raises(OSError):
+            d._download_one_file("/remote/wheels/big.whl", "wheels/big.whl", tmp_path)
+        entry = d._load_manifest(tmp_path)["wheels/big.whl"]
+        assert entry["force_id"] == "20261020"
+        assert entry["local_bytes"] == dl.CHUNK_SIZE
+        assert local.read_bytes() == rotten        # 目的地在完成前不動
+
+        # 下一輪（新的行程）：同一個 id
+        d2 = downloader_factory(force_redownload=["*.whl"], force_redownload_id="20261020")
+        d2._manifest = d2._load_manifest(tmp_path)
+        d2.sftp = fake_sftp_factory(files={"/remote/wheels/big.whl": good}, mtimes={"/remote/wheels/big.whl": 1000})
+        offsets = self._track_offsets(d2)
+        with caplog.at_level(logging.INFO):
+            assert d2._download_one_file("/remote/wheels/big.whl", "wheels/big.whl", tmp_path) == "downloaded"
+        assert offsets == [dl.CHUNK_SIZE]
+        assert local.read_bytes() == good
+        assert any('state="continue"' in r.message for r in caplog.records if "[FORCE_REDOWNLOAD]" in r.message)
+        assert any("[RESUME_ACCEPTED]" in r.message for r in caplog.records)
+
+        # 再下一輪：完成了，照常略過
+        assert d2._download_one_file("/remote/wheels/big.whl", "wheels/big.whl", tmp_path) == "skipped"
+
+    # ---- 其他邊界 ----
+
+    def test_resume_disabled_ignores_force(self, downloader_factory, fake_sftp_factory, tmp_path):
+        """resume 停用時本來就每次整份重抓；強制重下不改變它（也不需要 manifest）。"""
+        d = downloader_factory(resume=False, force_redownload=["*"], force_redownload_id="x")
+        local = self._seed(d, fake_sftp_factory, tmp_path)
+        assert d._download_one_file("/remote/wheels/x.whl", "wheels/x.whl", tmp_path) == "downloaded"
+        assert local.read_bytes() == self.GOOD
+
+    def test_missing_local_file_downloads_normally_under_force(
+        self, downloader_factory, fake_sftp_factory, tmp_path
+    ):
+        """install_env.sh 的 CRC 擋門會把壞檔改名成 .corrupt：原檔名不在，本來就會重抓。"""
+        d = downloader_factory(force_redownload=["*.whl"], force_redownload_id="20261020")
+        local = self._seed(d, fake_sftp_factory, tmp_path)
+        local.rename(local.with_name("x.whl.corrupt"))
+        assert d._download_one_file("/remote/wheels/x.whl", "wheels/x.whl", tmp_path) == "downloaded"
+        assert local.read_bytes() == self.GOOD
+        assert d._download_one_file("/remote/wheels/x.whl", "wheels/x.whl", tmp_path) == "skipped"
+
+    def test_invalid_rule_is_skipped_with_warning_other_rules_apply(
+        self, downloader_factory, fake_sftp_factory, tmp_path, caplog
+    ):
+        with caplog.at_level(logging.WARNING):
+            d = downloader_factory(force_redownload=["!", "*.whl"])
+        assert any("[FORCE_RULE_ERROR]" in r.message for r in caplog.records)
+        self._seed(d, fake_sftp_factory, tmp_path)
+        assert d._download_one_file("/remote/wheels/x.whl", "wheels/x.whl", tmp_path) == "downloaded"
+
+    def test_blank_patterns_mean_disabled(self, downloader_factory):
+        d = downloader_factory(force_redownload=["", "  "], force_redownload_id="  ")
+        assert d._force_spec is None
+        assert d.force_redownload_id is None
+
+
 class TestDownloadOneFileLocalBigger:
     def test_local_bigger_overwrite_mode_replaces_in_place(self, downloader_factory, fake_sftp_factory, tmp_path):
         (tmp_path / "f.bin").write_bytes(b"THIS-LOCAL-FILE-IS-QUITE-LONG")
@@ -1660,6 +1933,44 @@ class TestRun:
 
         d2 = self._prepare(downloader_factory, fake_sftp_factory, files=files, mtimes=mtimes, local_path=d.local_path)
         assert d2.run() is True  # 第二次：內容未變，應該略過而非重新下載
+
+    def test_run_force_redownloads_only_matching_files_once_per_id(
+        self, downloader_factory, fake_sftp_factory, tmp_path, caplog
+    ):
+        """整輪層級：命中的檔重抓一次、其餘照常略過；同一個 id 的下一輪全部略過。"""
+        files = {"/remote/wheels/a.whl": b"WHEEL-A", "/remote/app.py": b"print(1)"}
+        mtimes = {"/remote/wheels/a.whl": 1, "/remote/app.py": 2}
+        local = tmp_path / "dest"
+        assert self._prepare(downloader_factory, fake_sftp_factory, files=files, mtimes=mtimes,
+                             local_path=str(local)).run() is True
+        (local / "wheels" / "a.whl").write_bytes(b"WHEEL-?")   # 同大小壞掉
+
+        def summary(d):
+            caplog.clear()
+            with caplog.at_level(logging.INFO):
+                assert d.run() is True
+            return next(r.message for r in caplog.records if "下載任務結束" in r.message)
+
+        plain = self._prepare(downloader_factory, fake_sftp_factory, files=files, mtimes=mtimes, local_path=str(local))
+        assert "成功 0，略過 2" in summary(plain)                 # 沒標記：壞檔照舊被略過
+        assert (local / "wheels" / "a.whl").read_bytes() == b"WHEEL-?"
+
+        forced = self._prepare(downloader_factory, fake_sftp_factory, files=files, mtimes=mtimes,
+                               local_path=str(local), force_redownload=["wheels/"], force_redownload_id="20261020")
+        assert "成功 1，略過 1" in summary(forced)
+        assert any("[FORCE_REDOWNLOAD_ENABLED]" in r.message and r.levelno == logging.INFO for r in caplog.records)
+        assert (local / "wheels" / "a.whl").read_bytes() == b"WHEEL-A"
+
+        again = self._prepare(downloader_factory, fake_sftp_factory, files=files, mtimes=mtimes,
+                              local_path=str(local), force_redownload=["wheels/"], force_redownload_id="20261020")
+        assert "成功 0，略過 2" in summary(again)
+
+    def test_run_force_without_id_warns(self, downloader_factory, fake_sftp_factory, tmp_path, caplog):
+        d = self._prepare(downloader_factory, fake_sftp_factory, files={"/remote/a.txt": b"A"},
+                          mtimes={"/remote/a.txt": 1}, local_path=str(tmp_path / "dest"), force_redownload=["*"])
+        with caplog.at_level(logging.WARNING):
+            assert d.run() is True
+        assert any("[FORCE_REDOWNLOAD_ENABLED]" in r.message and r.levelno == logging.WARNING for r in caplog.records)
 
     def test_wait_for_network_called_when_enabled(self, downloader_factory, fake_sftp_factory):
         d = downloader_factory(wait_for_network=True)

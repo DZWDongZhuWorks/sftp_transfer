@@ -767,6 +767,113 @@ class SFTPDownloader(SFTPBase):
 
     manifest_filename = MANIFEST_FILENAME
 
+    def __init__(self, *args, force_redownload=None, force_redownload_id=None, **kwargs):
+        """force_redownload / force_redownload_id 只屬於下載方向，所以不放進 SFTPBase。
+
+        【為什麼需要強制重下】「本地大小 == 遠端大小 → 略過」是對的，也不能拿掉：船岸頻寬是
+        整套設計的核心限制（scheduler 的 warm update 一輪預算 1680 秒，多數機器都跑不完），
+        每輪重抓等於讓更新永遠追不上。但這條規則有個死角：**本地檔案內容壞了、大小卻沒變**
+        的時候（儲存層或來源的 bit rot —— 2026-10 radar 的 wheels 就是這樣：pip 解壓時炸
+        zlib.error: invalid block type，zip 中央目錄完整、檔案打得開、大小與來源一模一樣），
+        略過分支會把壞檔永遠鎖死，每一輪都判成「已完整下載」，船上沒有任何自動修復路徑。
+        resume 的 running sha256 救不了這件事：它只驗 .part 前段能否接續，SFTP 協定本來就
+        拿不到來源 hash，做不了端到端校驗。
+
+        於是給維運人員一個開關：
+          force_redownload    —— gitignore 格式的樣式（字串或字串清單），語意與 ignore_file
+                                 完全相同：`wheels/`、`*.whl`、`/requirements.txt`、`*`（整個
+                                 專案）；比對的是相對於該組工作 local 根目錄的路徑。
+          force_redownload_id —— 這一批強制重下的「批次號」（任意字串，建議用日期）。有填時
+                                 **每個命中的檔案只重抓一次**：完成後 manifest 記下 force_id，
+                                 之後的輪次就照常略過；換一個 id 才會再重抓一次。沒填則每一輪
+                                 都重抓 —— 只適合手動跑一次的 CLI。
+
+        為什麼一次性要靠 id、不靠「設定檔記得拿掉」：config/ 是由 SFTP OTA 散佈到全船隊的
+        （overwrite），在共用設定檔寫一條樣式，每艘船都會讀到；沒有 id 的話它就成了「全船隊
+        每輪重抓」，直到有人想起來把它刪掉為止 —— 那正是這套設計最怕的頻寬流失。
+
+        沒有設定任何樣式時，下載行為（含略過、manifest 內容、.part 接續）與改版前完全相同。
+        """
+        super().__init__(*args, **kwargs)
+        if isinstance(force_redownload, str):
+            force_redownload = [force_redownload]
+        self.force_redownload = [p for p in (force_redownload or []) if isinstance(p, str) and p.strip()]
+        # JSON 裡寫成數字（例如 20261020）也要能用，所以一律轉字串；空白視同沒填。
+        force_id = "" if force_redownload_id is None else str(force_redownload_id).strip()
+        self.force_redownload_id = force_id or None
+        self._force_spec = self._compile_force_spec()
+
+    def _compile_force_spec(self):
+        """編譯強制重下樣式；格式錯誤的行逐行略過並警告（同 _load_ignore_spec），其餘照常生效。"""
+        if not self.force_redownload:
+            return None
+        valid = []
+        for line in self.force_redownload:
+            try:
+                GitIgnoreSpec.from_lines([line])
+                valid.append(line)
+            except ValueError:
+                if self.logger:
+                    self.logger.warning(diagnostic_message(
+                        "FORCE_RULE_ERROR",
+                        f"強制重下樣式格式錯誤，已略過此規則: {line!r}",
+                        rule=line,
+                        action="skip_rule",
+                    ))
+        return GitIgnoreSpec.from_lines(valid) if valid else None
+
+    def _force_matches(self, rel_path):
+        """rel_path 是否落在強制重下範圍內。
+
+        資料夾規則（`wheels/`）在 gitignore 裡只比對資料夾本身，而這裡手上只有檔案路徑，
+        所以逐層檢查祖先資料夾（加結尾 /）—— 對應 git「整個資料夾被排除，底下的檔就救不
+        回來」的行為。"""
+        if self._force_spec is None:
+            return False
+        parts = rel_path.split("/")
+        for i in range(1, len(parts)):
+            if self._force_spec.match_file("/".join(parts[:i]) + "/"):
+                return True
+        return self._force_spec.match_file(rel_path)
+
+    def _force_state(self, rel_path, known):
+        """回傳此檔案的強制重下狀態：
+
+          None       —— 不強制（不在範圍內，或本批次 id 已經重抓完成）→ 照常判斷。
+          "restart"  —— 要強制重抓，且必須**整份重來**：不能略過，也不能接續既有的 .part
+                        （那可能是強制重下之前就留下來的半截檔，接下去等於把舊內容延續到新檔）。
+          "continue" —— 本批次的強制重下已經開始、上一輪被中斷：不能略過（目的地還是那個壞
+                        檔），但 .part 是這次強制重下自己寫的，交給原本的 resume 驗證決定接不接。
+                        少了這一態，慢鏈路上的大檔每一輪都從 byte 0 重來，永遠抓不完（見
+                        CHECKPOINT_INTERVAL_BYTES 的說明）。
+
+        判斷依據是 manifest entry 的 force_id：強制重下寫出的每一筆 entry（傳輸中的檢查點與
+        收尾）都帶著它，見 _manifest_record。完成與否看 local_bytes：收尾時 local_bytes 會等於
+        size、略過分支的 entry 則沒有 local_bytes，兩者都代表「目的地已經是這批次抓下來的檔」。
+        """
+        if not self._force_matches(rel_path):
+            return None
+        if self.force_redownload_id is None:
+            return "restart"
+        if known and known.get("force_id") == self.force_redownload_id:
+            offset = checkpoint_offset(known)
+            size = known.get("size")
+            if offset is not None and isinstance(size, int) and offset < size:
+                return "continue"
+            return None
+        return "restart"
+
+    def _manifest_record(self, rel_path, **fields):
+        """組一筆 manifest entry；落在強制重下範圍且有批次 id 時蓋上 force_id。
+
+        不論這次是強制還是一般下載都要蓋：只要是「設定了這個 id 之後才抓下來的檔」，就已經滿足
+        這批強制重下的要求。否則來源日後正常改版、entry 被重寫成沒有 force_id，而 id 還留在
+        設定檔裡，下一輪又會把剛抓好的新檔再強制抓一次。沒有設定強制重下時 entry 與改版前一字不差。
+        """
+        if self.force_redownload_id is not None and self._force_matches(rel_path):
+            fields["force_id"] = self.force_redownload_id
+        return fields
+
     def _list_remote_files(self, remote_root, local_root):
         """回傳 [(遠端絕對路徑, rel_path, 走訪時取得的屬性或 None)]。
 
@@ -886,6 +993,8 @@ class SFTPDownloader(SFTPBase):
         mode = "wb"
         running_hash = hashlib.sha256()  # 邊下載邊累加，最後（或中斷當下）存進版本紀錄檔
         known = self._manifest_entry(rel_path, local_root)
+        # 強制重下只在 resume 啟用時有意義：停用時本來就每次整份重抓（manifest 也不載入）。
+        force = self._force_state(rel_path, known) if self.resume else None
 
         if local_file.exists():
             if not self.resume:
@@ -903,13 +1012,25 @@ class SFTPDownloader(SFTPBase):
                 if disk_size == remote_size:
                     # 大小相同：用版本紀錄（若有）判斷是否真的未變更；沒有紀錄則姑且視為未變更略過。
                     # 這裡不逐一雜湊比對整個檔案內容，避免每次執行都要重新讀取所有已下載完成的檔案。
-                    if known is None or (known.get("size") == remote_size and known.get("mtime") == remote_mtime):
+                    # 代價是內容壞掉但大小沒變的檔會一直被略過 —— 修復途徑是強制重下（見 __init__）。
+                    unchanged = known is None or (
+                        known.get("size") == remote_size and known.get("mtime") == remote_mtime
+                    )
+                    if unchanged and force is None:
                         self.logger.info(f"略過（已完整下載）: {rel_path}")
                         self._align_local_mode(local_file, local_stat, remote_stat, rel_path)
-                        self._manifest[rel_path] = {"size": remote_size, "mtime": remote_mtime}
+                        self._manifest[rel_path] = self._manifest_record(
+                            rel_path, size=remote_size, mtime=remote_mtime
+                        )
                         self._manifest_dirty = True  # 收尾一次寫回，見 _flush_manifest
                         return "skipped"
-                    if self.duplicate_mode == "overwrite":
+                    if unchanged:
+                        # 被強制、而來源其實沒換版：duplicate_mode 處理的是「來源已更新、要不要
+                        # 保留舊版」，這裡沒有新舊版之分 —— 本地那份就是同一版、只是不再可信。
+                        # 所以兩種模式都覆蓋回原檔名；另存成 _copy 的話壞檔仍佔著原檔名，
+                        # 等於什麼都沒修到。
+                        self.logger.info(f"強制重新下載，覆蓋原檔案: {rel_path}")
+                    elif self.duplicate_mode == "overwrite":
                         self.logger.info(f"偵測到來源檔案已更新，覆蓋舊檔案: {rel_path}")
                     else:
                         target_file = self._next_duplicate_path(local_file)
@@ -935,7 +1056,21 @@ class SFTPDownloader(SFTPBase):
         # 暫存檔而不是目的地；duplicate 模式另存新檔、本來就不接續，所以只有「目的地就是
         # 原檔名」時才嘗試接續。
         part_file = target_file.with_name(target_file.name + PART_SUFFIX)
-        if self.resume and target_file == local_file and part_file.exists():
+        if force is not None:
+            self.logger.warning(diagnostic_message(
+                "FORCE_REDOWNLOAD",
+                f"依強制重下設定重新下載: {rel_path}",
+                direction="download",
+                file=rel_path,
+                force_id=self.force_redownload_id,
+                state=force,
+                local_exists=local_file.exists(),
+                partial_bytes=part_file.stat().st_size if part_file.exists() else None,
+                action="restart" if force == "restart" else "resume_if_verified",
+            ))
+        # force == "restart" 時整份重來：不進接續驗證，"wb" 開檔即截斷既有的 .part。那份 .part
+        # 的雜湊就算驗得過也不接 —— 它是強制重下之前留下的，接下去就不是「整份重新取得」了。
+        if force != "restart" and self.resume and target_file == local_file and part_file.exists():
             part_size = part_file.stat().st_size
             # 遠端版本要與紀錄一致，且紀錄的雜湊要對得上暫存檔的前段，才敢接著往下寫。
             # 能接續的位置一律是 checkpoint_bytes（唯一有雜湊可驗證的 offset）；暫存檔目前
@@ -1064,12 +1199,13 @@ class SFTPDownloader(SFTPBase):
                             now = time.time()
                             if self._checkpoint_due(transferred, last_checkpoint_bytes, last_checkpoint_time, now):
                                 local_f.flush()
-                                self._manifest[rel_path] = {
-                                    "size": remote_size,
-                                    "mtime": remote_mtime,
-                                    "local_sha256": running_hash.hexdigest(),
-                                    "local_bytes": transferred,
-                                }
+                                self._manifest[rel_path] = self._manifest_record(
+                                    rel_path,
+                                    size=remote_size,
+                                    mtime=remote_mtime,
+                                    local_sha256=running_hash.hexdigest(),
+                                    local_bytes=transferred,
+                                )
                                 self._save_manifest(local_root)
                                 last_checkpoint_bytes = transferred
                                 last_checkpoint_time = now
@@ -1090,12 +1226,15 @@ class SFTPDownloader(SFTPBase):
             # 不論成功、失敗或中途被中斷，都存下目前實際寫到的位置與雜湊，讓下次重試時
             # 能正確判斷「這是同一版本尚未下載完的部分」，而不是每次中斷後都只能整份重來。
             if self.resume:
-                self._manifest[rel_path] = {
-                    "size": remote_size,
-                    "mtime": remote_mtime,
-                    "local_sha256": running_hash.hexdigest(),
-                    "local_bytes": transferred,
-                }
+                # 強制重下時這筆帶著 force_id：中斷了，下一輪看到的是 "continue"（可驗證接續），
+                # 傳完了，下一輪就照常略過（見 _force_state）。
+                self._manifest[rel_path] = self._manifest_record(
+                    rel_path,
+                    size=remote_size,
+                    mtime=remote_mtime,
+                    local_sha256=running_hash.hexdigest(),
+                    local_bytes=transferred,
+                )
                 saved = False
                 if cancelled or transfer_error or transferred < remote_size:
                     # 沒傳完：這筆是 .part 能不能接續的唯一依據，不能等。
@@ -1256,6 +1395,19 @@ class SFTPDownloader(SFTPBase):
         if jobs is None:
             return False
         self._ignore_spec = self._load_ignore_spec()
+        if self._force_spec is not None:
+            # 沒填 id 用 warning：那代表「每一輪都重抓命中的檔」，寫在 OTA 散佈的設定檔裡就是
+            # 全船隊的頻寬持續流失，要讓它在 log 裡顯眼（理由見 __init__）。
+            log = self.logger.info if self.force_redownload_id else self.logger.warning
+            log(diagnostic_message(
+                "FORCE_REDOWNLOAD_ENABLED",
+                "已啟用強制重下" + ("" if self.force_redownload_id else "（未設定 force_redownload_id，每一輪都會重抓命中的檔案）"),
+                direction="download",
+                patterns=self.force_redownload,
+                force_id=self.force_redownload_id,
+                once_per_id=self.force_redownload_id is not None,
+                resume=self.resume,
+            ))
         multi_job = len(jobs) > 1  # 配對或依 basename 展開時皆為多組獨立工作
 
         downloaded, skipped, failed = 0, 0, []

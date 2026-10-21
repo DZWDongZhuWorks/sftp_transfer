@@ -8,6 +8,7 @@
 使用方式：
     python run_all_downloads.py
     python run_all_downloads.py --config-dir other_config
+    python run_all_downloads.py --force-redownload 'wheels/' --force-redownload-id 20261020
 """
 
 import argparse
@@ -42,9 +43,24 @@ def find_setting_files(config_dir: Path):
     return sorted(config_dir.glob("*_download_settings.json"))
 
 
+def force_args(args):
+    """把強制重下參數轉成 main.py 的命令列片段；沒指定就是空串列（與改版前的指令一字不差）。"""
+    extra = []
+    for pattern in args.force_redownload:
+        extra += ["--force-redownload", pattern]
+    if args.force_redownload_id:
+        extra += ["--force-redownload-id", args.force_redownload_id]
+    return extra
+
+
 def main():
     parser = argparse.ArgumentParser(description="依序執行所有設定檔的 SFTP 下載")
     parser.add_argument("--config-dir", default=str(CONFIG_DIR), help="設定檔資料夾（預設 ./config）")
+    # 原樣轉給每一個專案的 main.py（見 main.py 的同名參數）。樣式是相對於各專案根目錄比對的，
+    # 所以 wheels/ 會一次涵蓋所有帶離線 wheels 的專案；* 則是全部專案整份重抓，船上頻寬慎用。
+    parser.add_argument("--force-redownload", action="append", default=[],
+                        help="強制重新下載符合此樣式（gitignore 格式）的檔案，可重複指定；套用到每一份下載設定")
+    parser.add_argument("--force-redownload-id", help="強制重下的批次號：有填時每個命中的檔案只重抓一次")
     args = parser.parse_args()
 
     if is_dev_machine():
@@ -60,7 +76,8 @@ def main():
     for i, path in enumerate(files, 1):
         print(f"\n===== [{i}/{len(files)}] 開始下載：{path.name} =====")
         proc = subprocess.run(
-            [sys.executable, str(MAIN_SCRIPT), "--cli", "--mode", "download", "--config", str(path)],
+            [sys.executable, str(MAIN_SCRIPT), "--cli", "--mode", "download", "--config", str(path)]
+            + force_args(args),
             cwd=str(BASE_DIR),
         )
         ok = proc.returncode == 0

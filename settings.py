@@ -121,6 +121,10 @@ SETTINGS_TEMPLATE = {
     "delete_source_min_age_minutes": 10,
     # 只刪檔名符合這些 glob 的來源（字串或字串陣列，空＝不限）。語意同 cleanup_old_files.py 的 pattern。
     "delete_source_pattern": [],
+    # 僅下載：強制重下的樣式（gitignore 格式，空＝不啟用）與批次號（有填＝每個檔只重抓一次）。
+    # 用來修復內容壞掉但大小沒變、因此每輪都被略過的檔案，見 downloader.SFTPDownloader.__init__。
+    "force_redownload": [],
+    "force_redownload_id": "",
 }
 
 

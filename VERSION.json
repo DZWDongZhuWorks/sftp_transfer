@@ -1,5 +1,5 @@
 {
-  "version": "0.25.4",
-  "date": "2026-10-19",
-  "notes": "部署巡檢(automation_health_check.py)認得 scheduler v0.64.0 的 `# NSSMS-ExceptVessel=` 船號排除閘門:列出的船上判 N/A(未安裝 = SKIP、仍殘留 = FAIL),讀不到船號照常要求安裝,與 require_vessel.sh --except 同方向。CLINK 上的 nssms-reboot / nssms-deploy-reconcile 不再被報成缺件"
+  "version": "0.26.0",
+  "date": "2026-10-20",
+  "notes": "下載加上強制重下(force_redownload / --force-redownload,gitignore 格式樣式;force_redownload_id 批次號讓每個檔只重抓一次):堵住「本地大小 == 遠端就永遠略過」的洞 —— 內容 bit rot 但大小不變的檔(radar wheels 的 zlib invalid block type)過去會被每輪略過、永遠修不回來。強制重抓整份重來不接續舊 .part;同版本時兩種 duplicate_mode 都覆蓋回原檔名。未設定時行為完全不變"
 }

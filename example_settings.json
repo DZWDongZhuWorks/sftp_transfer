@@ -23,5 +23,7 @@
   "duplicate_suffix": "copy",
   "delete_source": false,
   "delete_source_min_age_minutes": 10,
-  "delete_source_pattern": []
+  "delete_source_pattern": [],
+  "force_redownload": [],
+  "force_redownload_id": ""
 }

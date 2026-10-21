@@ -1,5 +1,5 @@
 {
-  "version": "0.27.3",
+  "version": "0.27.4",
   "date": "2026-10-21",
-  "notes": "上傳端略過已上傳檔不再每檔問伺服器:_ensure_remote_dir 同一條連線內記住確認過的目錄、先 stat 最深一層;本地檔數 ≥ 8 的遠端目錄改成整個 listdir_attr 一次判斷存在與大小(搬運型 delete_source 任務不列)。168 份 dashboard 報表全部略過從 1008 次 stat 降到 1 次 stat + 1 次列目錄。大小不同時照舊實打 stat 再決定續傳;目錄在本輪中途被外部清掉時 \"wb\" 會補建後重開。順修:重連放棄後不再拿 None 繼續下一個檔(AttributeError → RUN_ABORTED 記錯原因),改為帶真正的連線錯誤中止"
+  "notes": "下載端重連放棄後不再拿 None 繼續下一個檔:SFTPDownloader._run 逐檔重試裡 _connect_with_retry 放棄時的例外原本被 except Exception 吞掉、只把這個檔記失敗,下一個檔的第一個遠端呼叫就是 'NoneType' object has no attribute ...,RUN_ABORTED 記到假原因。改為往外拋,跟一開始就連不上走同一條收尾:RUN_ABORTED 帶真正的連線錯誤、帳密錯誤走專屬訊息,中止前傳完的 manifest 由 finally 寫回。與 v0.27.3 上傳端的同一處順修對稱"
 }

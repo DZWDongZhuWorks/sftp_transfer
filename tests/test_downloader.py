@@ -2582,33 +2582,6 @@ class TestRun:
         # b.txt 仍應該成功下載
         assert (Path(d.local_path) / "b.txt").exists()
 
-    def test_reconnect_failure_during_per_file_retry_marks_failed_and_continues(self, downloader_factory, fake_sftp_factory):
-        d = self._prepare(
-            downloader_factory, fake_sftp_factory,
-            files={"/remote/a.txt": b"A", "/remote/b.txt": b"B"},
-            mtimes={"/remote/a.txt": 1, "/remote/b.txt": 2},
-            retry_count=3,
-        )
-        original_download = d._download_one_file
-        original_connect = d._connect_with_retry
-        state = {"a_failed": False}
-
-        def flaky_download(remote_file, rel_path, local_root, listed_attr=None):
-            if rel_path == "a.txt" and not state["a_failed"]:
-                state["a_failed"] = True
-                raise OSError("dropped")
-            return original_download(remote_file, rel_path, local_root, listed_attr)
-
-        def reconnect_side_effect():
-            if state["a_failed"]:
-                raise paramiko.SSHException("cannot reconnect")
-            original_connect()
-
-        d._download_one_file = flaky_download
-        d._connect_with_retry = MagicMock(side_effect=reconnect_side_effect)
-        result = d.run()
-        assert result is False
-
     def test_unexpected_exception_aborts_task_and_returns_false(self, downloader_factory):
         d = downloader_factory(wait_for_network=False)
         d._connect_with_retry = MagicMock(side_effect=RuntimeError("totally unexpected"))
@@ -2810,6 +2783,79 @@ class TestRun:
         with pytest.raises(RuntimeError):
             d.run()
         assert d.sftp is None
+
+
+class TestReconnectGiveUp:
+    """逐檔重試中重連放棄後要直接收尾，不能拿 None 當連線繼續處理下一個檔
+    （與 test_uploader.py 的 TestReconnectGiveUp 同一件事）。"""
+
+    def _prepare(self, downloader_factory, fake_sftp_factory, reconnect_error):
+        files = {"/remote/a.txt": b"A", "/remote/b.txt": b"B", "/remote/c.txt": b"C"}
+        mtimes = {"/remote/a.txt": 1, "/remote/b.txt": 2, "/remote/c.txt": 3}
+        fake = fake_sftp_factory(files=files, mtimes=mtimes)
+        d = downloader_factory(wait_for_network=False, retry_count=3)
+        connects = []
+
+        def connect():
+            connects.append(1)
+            if len(connects) == 1:
+                d.sftp = fake
+                return
+            d.sftp = None                       # 真的 _connect 一開頭就 _close()
+            raise reconnect_error
+
+        d._connect_with_retry = MagicMock(side_effect=connect)
+        d._close = MagicMock()
+        original_download = d._download_one_file
+        tried = []
+
+        def download(remote_file, rel_path, local_root, listed_attr=None):
+            tried.append(rel_path)
+            if rel_path == "b.txt":
+                raise OSError("Socket is closed")
+            return original_download(remote_file, rel_path, local_root, listed_attr)
+
+        d._download_one_file = download
+        return d, tried
+
+    @pytest.mark.parametrize("error, text", [
+        (OSError("[Errno 101] Network is unreachable"), "Network is unreachable"),
+        (paramiko.SSHException("Error reading SSH protocol banner"), "Error reading SSH protocol banner"),
+    ])
+    def test_gave_up_reconnecting_aborts_with_the_real_error(
+        self, downloader_factory, fake_sftp_factory, caplog, error, text
+    ):
+        d, tried = self._prepare(downloader_factory, fake_sftp_factory, error)
+
+        with caplog.at_level(logging.INFO):
+            assert d.run() is False
+
+        messages = [r.message for r in caplog.records]
+        assert tried == ["a.txt", "b.txt"]       # 放棄之後沒有再碰任何檔
+        assert not any("NoneType" in m for m in messages)
+        aborted = [m for m in messages if "RUN_ABORTED" in m]
+        assert aborted and text in aborted[0]
+        from monitor.log_monitor import _RE_ABORT
+        assert text in _RE_ABORT.search(aborted[0]).group(1)
+        # 中止前傳完的檔，manifest 由 _run 的 finally 寫回
+        local_root = Path(d.local_path)
+        assert "a.txt" in d._load_manifest(local_root)
+        assert not (local_root / "c.txt").exists()
+
+    def test_auth_failure_while_reconnecting_keeps_its_own_message(
+        self, downloader_factory, fake_sftp_factory, caplog
+    ):
+        d, tried = self._prepare(
+            downloader_factory, fake_sftp_factory, paramiko.AuthenticationException("Authentication failed."),
+        )
+
+        with caplog.at_level(logging.INFO):
+            assert d.run() is False
+
+        messages = [r.message for r in caplog.records]
+        assert tried == ["a.txt", "b.txt"]
+        assert not any("RUN_ABORTED" in m for m in messages)
+        assert any("任務中止：帳號或密碼錯誤" in m for m in messages)
 
 
 # ---------------------------------------------------------------------------

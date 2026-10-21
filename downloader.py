@@ -1779,11 +1779,13 @@ class SFTPDownloader(SFTPBase):
                             # 一開始一次列完的，重試代表這中間已經歷過一段網路中斷，來源
                             # 版本是否還是同一份不該再用舊屬性斷定（manifest 會記下它）。
                             listed_attr = None
-                            try:
-                                self._connect_with_retry()
-                            except Exception:
-                                failed.append(rel_path)
-                                break
+                            # 重連放棄時 _connect_with_retry 已記下 CONNECTION_ERROR 再往外拋，這裡
+                            # 不能吞掉、改去下一個檔：self.sftp 此時是 None，下一個檔的第一個遠端
+                            # 呼叫就是 'NoneType' object has no attribute ...，RUN_ABORTED 記到的是
+                            # 假原因（uploader 同一個寫法在岸端留下的實例：WH505/IPC-1 dashboard_report
+                            # 2026-10-18 18:52）。往外拋就跟「一開始就連不上」走同一條收尾：RUN_ABORTED
+                            # 帶真正的連線錯誤、帳密錯誤照樣走專屬訊息，未落盤的 manifest 由 finally 寫回。
+                            self._connect_with_retry()
 
                 # 這組工作跑完：把累積的「略過」項目一次寫回。
                 self._flush_manifest(local_root)

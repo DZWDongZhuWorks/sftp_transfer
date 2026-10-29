@@ -1225,6 +1225,7 @@ class UnattendedReconcileTests(unittest.TestCase):
             "stage_docker_group",
             "stage_unattended_boot",
             "stage_scheduler_units",
+            "stage_teamviewer",
         )
         for name in stages:
             body = self._stage_body(name)
@@ -1238,3 +1239,34 @@ class UnattendedReconcileTests(unittest.TestCase):
         折成同一個離開碼等於把唯一能讓岸上動手的線索丟掉。"""
         self.assertIn('[ "$UNATTENDED_FAIL" -eq 0 ] || exit 1', self.SOURCE)
         self.assertIn('[ "$UNATTENDED_BLOCKED" -eq 0 ] || exit 3', self.SOURCE)
+
+    def test_teamviewer_update_never_aborts_the_round(self):
+        """TeamViewer 更新不是部署的必要條件:裝不起來不能讓後面的項目(或人工部署)停擺。
+        所以這一步沒有任何 exit,失敗一律走 unattended_note_fail。"""
+        body = self._stage_body("stage_teamviewer")
+        self.assertIsNone(re.search(r"^\s*exit\b", body, re.M), "stage_teamviewer 裡不該有 exit")
+        self.assertIn('unattended_note_fail "TeamViewer 更新失敗', body)
+
+    def test_teamviewer_update_judges_before_it_installs(self):
+        """要不要裝由 install_teamviewer.sh --status 判斷(依船策略、版本、deb、模擬安裝),
+        這裡不重寫一份。--check-only 與拿不到 sudo 都要在變更呼叫之前就 return。"""
+        body = self._stage_body("stage_teamviewer")
+        lines = [ln.strip() for ln in body.splitlines()]
+        status_at = lines.index('run_rc bash "$installer" --status')
+        install_at = lines.index('run_rc bash "$installer"')
+        self.assertLess(status_at, install_at)
+        before = "\n".join(lines[status_at:install_at])
+        for guard in ('if [ "$CHECK_ONLY" -eq 1 ]; then', "if ! sudo_obtainable; then",
+                      'mutating "以 apt-get 離線更新 TeamViewer"', "5) ;;"):
+            self.assertIn(guard, before, "安裝之前少了:{}".format(guard))
+
+    def test_teamviewer_update_runs_after_tmux_and_is_in_both_summaries(self):
+        """A8b:在階段 A(還允許輸入的那一段)裡;兩份總結都有它那一欄。"""
+        self.assertLess(self.SOURCE.index("  stage_tmux  "),
+                        self.SOURCE.index("  stage_teamviewer  "))
+        self.assertLess(self.SOURCE.index("  stage_teamviewer  "),
+                        self.SOURCE.index("  stage_launch_decision  "))
+        for summary in ("stage_summary", "stage_summary_unattended"):
+            self.assertIn("TeamViewer 更新", self._stage_body(summary), summary)
+        self.assertIn('TEAMVIEWER_STATUS="未執行"\n', self.SOURCE.split("stage_teamviewer() {")[0],
+                      "set -u 下兩份總結都會讀它:要在 file scope 先給值")

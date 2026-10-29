@@ -31,6 +31,10 @@
 #         **必須排在 10) 之前**:10) 的提示要據此警告「缺 tmux 時 session 型專案全起不來」。
 #         scheduler 的每一支 start_*.sh 都靠 tmux new-session,啟動器也靠 tmux has-session
 #         對帳 —— 少了它,啟動流程會一項一項 exit 2,而船上又沒有網路可以 apt install。
+#     8b) scheduler 的 install_teamviewer.sh → 把 TeamViewer 更新到 scheduler
+#         etc/teamviewer_update.json 指定的版本(需密碼;不問 [Y/n])。要不要更新由岸端的
+#         依船策略 teamviewer_update 決定(預設關,這一步就什麼都不做);deb 由 scheduler 的
+#         nssms-teamviewer-fetch 先下載並驗證。規格:scheduler/docs/teamviewer-update.md。
 #      9) install_setup_ssh_key.sh → 照片同步的免密碼登入(**僅實體 IPC-2**)。
 #         這一步輸入的是**遠端主機的密碼**(給 ssh-copy-id),不是本機 sudo。
 #         nssms-download-photos.timer 每 4 小時跑 script/download_photos.sh,而它以
@@ -73,7 +77,7 @@
 #   任何東西會去執行它;開機時的 `update_booster --apply-only` 也只重跑三支安裝器
 #   (install_timers / install_autostart / install_services)。所以**後續新增的、需要
 #   root 的一次性設定**——clink 遷移 + gpio 群組、docker 群組、udisks 掛載授權、
-#   GDM 自動登入、tmux 離線補齊、sudoers 白名單——永遠傳不到已部署的船上,除非有人
+#   GDM 自動登入、tmux 離線補齊、sudoers 白名單、TeamViewer 更新——永遠傳不到已部署的船上,除非有人
 #   再跑一次這支腳本。`stage_scheduler_units` 那段 sudoers 的歷史教訓就是這個形狀。
 #
 #   --unattended 就是那個缺口的補丁,由 scheduler 的 nssms-deploy-reconcile.timer
@@ -182,6 +186,8 @@ TMUX_STATUS="未執行"
 # 照片同步金鑰的設定結果。同上：stage_summary 會讀它，而該 stage 在非 IPC-2 上會提早
 # return —— 雖然它 return 前一定已賦值，仍在 file scope 先給值，理由與 TMUX_STATUS 相同。
 SSH_KEY_STATUS="未執行"
+# TeamViewer 更新的結果。同上:兩份總結都會讀它,而 stage_teamviewer 有好幾個提早 return 的出口。
+TEAMVIEWER_STATUS="未執行"
 
 # --- 免人工輸入密碼(見下方「密碼檔」一節)----------------------------------
 # 空字串＝沒有指定，會依序找下面兩個預設位置；兩個都不存在時，行為與本功能加入前
@@ -1705,6 +1711,62 @@ stage_tmux() {
   TMUX_STATUS="已安裝（dpkg / $NSSMS_PROFILE_ID）"
 }
 
+# --- TeamViewer 更新(scheduler/install_teamviewer.sh)---------------------
+# 規格在 scheduler 的 docs/teamviewer-update.md。這一步是那份規格裡唯一需要 root 的地方:
+# 要不要裝、裝不裝得起來全部由 install_teamviewer.sh --status 判斷(依船策略
+# teamviewer_update、已安裝版本、架構、deb 是否已由 nssms-teamviewer-fetch 下載並驗證、
+# 不需要 root 的模擬安裝),這裡**不重寫第二份判斷** —— 只把它的離開碼翻成總結的一欄,
+# 可以裝時再以 sudo 呼叫它一次(比照 stage_tmux)。
+#
+# 【不是部署的必要條件】TeamViewer 更新失敗不該讓部署中止,所以這一步任何結果都 return:
+# 無人模式下失敗記進 UNATTENDED_FAIL(unit 會是 failed,岸端看得到),拿不到 sudo 記進
+# UNATTENDED_BLOCKED(sudo_obtainable 自己記);人工部署只印出來。
+#
+# 【不問 [Y/n]】要不要更新由岸端的依船策略決定,不是現場的人。策略沒打開時 --status 回 7,
+# 這一步什麼都不做 —— 那也是整個船隊的預設。
+stage_teamviewer() {
+  local installer="${SHARE_DIR}/scheduler/install_teamviewer.sh"
+  TEAMVIEWER_STATUS="未執行"
+  echo ""
+  info "檢查 TeamViewer 更新(依船策略 teamviewer_update)..."
+  if [ ! -f "$installer" ]; then
+    TEAMVIEWER_STATUS="略過(這版 scheduler 沒有 install_teamviewer.sh)"
+    info "$TEAMVIEWER_STATUS"
+    return
+  fi
+  run_rc bash "$installer" --status
+  case "$RC" in
+    0) TEAMVIEWER_STATUS="已是目標版本"; return ;;
+    7) TEAMVIEWER_STATUS="依船策略沒打開"; return ;;
+    4) TEAMVIEWER_STATUS="等 deb 下載(nssms-teamviewer-fetch)"; return ;;
+    6) TEAMVIEWER_STATUS="不相容,不自動安裝(原因見上方 --status 輸出)"; return ;;
+    5) ;;
+    *)
+      TEAMVIEWER_STATUS="無法判斷(--status exit=$RC)"
+      unattended_note_fail "TeamViewer 更新的判斷失敗(--status exit=$RC)" || true
+      return ;;
+  esac
+  if [ "$CHECK_ONLY" -eq 1 ]; then
+    TEAMVIEWER_STATUS="可以更新$DRYRUN_NOTE"
+    return
+  fi
+  if ! sudo_obtainable; then
+    TEAMVIEWER_STATUS="可以更新,但這台拿不到 sudo(密碼檔)"
+    warn "$TEAMVIEWER_STATUS"
+    return
+  fi
+  mutating "以 apt-get 離線更新 TeamViewer"
+  run_rc bash "$installer"
+  case "$RC" in
+    0) TEAMVIEWER_STATUS="已更新"; ok "TeamViewer 已更新。" ;;
+    3) TEAMVIEWER_STATUS="可以更新,但 sudo 沒有預先授權(exit=3)"
+       [ "$UNATTENDED" -eq 1 ] && UNATTENDED_BLOCKED=$((UNATTENDED_BLOCKED + 1)) ;;
+    *) TEAMVIEWER_STATUS="更新失敗(exit=$RC)"
+       err "TeamViewer 更新失敗(exit=$RC);原本的版本不受影響,明天這一輪會再試。"
+       unattended_note_fail "TeamViewer 更新失敗(exit=$RC)" || true ;;
+  esac
+}
+
 # --- 照片同步的 SSH 金鑰（scheduler/install_setup_ssh_key.sh）---------------
 # nssms-download-photos.timer（每 4 小時，僅實體 IPC-2）會跑 script/download_photos.sh，
 # 而那支腳本以 `ssh -o BatchMode=yes` 連遠端 nsms master —— **沒有金鑰就是立刻失敗**，
@@ -2258,6 +2320,7 @@ stage_summary() {
   printf "  資料碟掛載授權  ：%s\n" "$MOUNT_POLICY_STATUS"
   printf "  GDM 自動登入    ：%s\n" "$GDM_AUTOLOGIN_STATUS"
   printf "  tmux            ：%s\n" "$TMUX_STATUS"
+  printf "  TeamViewer 更新 ：%s\n" "$TEAMVIEWER_STATUS"
   printf "  照片同步金鑰    ：%s\n" "$SSH_KEY_STATUS"
   [ "$RUN_HEALTH" -eq 1 ] && printf "  健康檢查        ：%s\n" \
     "$( [ "$HEALTH_RC" -eq 0 ] && echo HEALTHY || echo "有問題（exit=$HEALTH_RC）" )"
@@ -2353,6 +2416,7 @@ stage_summary_unattended() {
   printf "  資料碟掛載授權  ：%s\n" "${MOUNT_POLICY_STATUS:-未執行}"
   printf "  GDM 自動登入    ：%s\n" "${GDM_AUTOLOGIN_STATUS:-未執行}"
   printf "  tmux            ：%s\n" "${TMUX_STATUS:-未執行}"
+  printf "  TeamViewer 更新 ：%s\n" "${TEAMVIEWER_STATUS:-未執行}"
   printf "  照片同步金鑰    ：%s\n" "${SSH_KEY_STATUS:-未執行}"
   echo "──────────────────────────────"
   if [ "$UNATTENDED_FAIL" -gt 0 ]; then
@@ -2519,6 +2583,7 @@ main() {
   stage_unattended_boot              # A4b 無人值守開機的兩個前提（掛載授權 / 自動登入）
   stage_scheduler_units              # A5/A6/A7 timer + sudoers + 常駐服務
   stage_tmux                         # A8 tmux 離線補齊 —— **必須早於 A10**（見該函式）
+  stage_teamviewer                   # A8b TeamViewer 更新（依船策略;scheduler/install_teamviewer.sh）
   stage_ssh_key                      # A9 照片同步的 SSH 金鑰（僅實體 IPC-2）
   stage_launch_decision              # A10 只收集決定，執行在階段 C
 

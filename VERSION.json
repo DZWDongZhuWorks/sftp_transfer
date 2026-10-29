@@ -1,5 +1,5 @@
 {
-  "version": "0.27.4",
-  "date": "2026-10-21",
-  "notes": "下載端重連放棄後不再拿 None 繼續下一個檔:SFTPDownloader._run 逐檔重試裡 _connect_with_retry 放棄時的例外原本被 except Exception 吞掉、只把這個檔記失敗,下一個檔的第一個遠端呼叫就是 'NoneType' object has no attribute ...,RUN_ABORTED 記到假原因。改為往外拋,跟一開始就連不上走同一條收尾:RUN_ABORTED 帶真正的連線錯誤、帳密錯誤走專屬訊息,中止前傳完的 manifest 由 finally 寫回。與 v0.27.3 上傳端的同一處順修對稱"
+  "version": "0.28.0",
+  "date": "2026-10-29",
+  "notes": "deploy_offline.sh 新增 stage_teamviewer(A8b,緊接 tmux 之後):呼叫 scheduler 的 install_teamviewer.sh,把 TeamViewer 更新到 scheduler etc/teamviewer_update.json 指定的版本(規格 scheduler/docs/teamviewer-update.md)。要不要裝全部由 install_teamviewer.sh --status 判斷(依船策略 teamviewer_update、已安裝版本、架構、deb 是否已由 nssms-teamviewer-fetch 下載並驗證、不需要 root 的模擬安裝),這一步不重寫判斷,只把離開碼翻成總結的一欄;可以裝時以 sudo 呼叫一次(比照 stage_tmux)。不是部署的必要條件:沒有任何 exit,無人模式下失敗記進 UNATTENDED_FAIL、拿不到 sudo 記進 UNATTENDED_BLOCKED;不問 [Y/n](由岸端依船策略決定,預設關 = 什麼都不做);--check-only 只回報。兩份總結都多一欄「TeamViewer 更新」。scheduler 還沒有 install_teamviewer.sh 時這一步略過。測試:test_offline_deploy.py 補三條(沒有 exit、判斷在變更之前且有 --check-only / sudo_obtainable / mutating 守衛、排在 tmux 之後並出現在兩份總結),閘門清單加入 stage_teamviewer"
 }

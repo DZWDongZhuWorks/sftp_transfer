@@ -659,3 +659,111 @@ def test_timezone_reports_unknown_when_nothing_answers(monkeypatch, tmp_path):
     monkeypatch.setattr(hc, "ETC_LOCALTIME", tmp_path / "absent-localtime")
 
     assert hc.detect_timezone() == "unknown"
+
+
+# ---------------------------------------------------------------------------
+# unit 執行腳本完整性(check_exec_scripts)
+#
+# 被截成 0 byte 的 .sh / .py 執行起來 rc=0:systemd 照樣 success,failed units 與
+# 「最近執行結果」都看不出來。lib/unit_log.sh 只擋得住經過它的幾支 unit,這一節涵蓋全部。
+# ---------------------------------------------------------------------------
+
+def _write(path, text):
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(text, encoding="utf-8")
+    return path
+
+
+def _fake_scheduler(monkeypatch, tmp_path):
+    sched = tmp_path / "scheduler"
+    monkeypatch.setattr(hc, "SCHEDULER_DIR", sched)
+    monkeypatch.setattr(hc, "TIMERS_DIR", sched / "timers")
+    monkeypatch.setattr(hc, "SERVICES_DIR", sched / "services")
+    monkeypatch.setattr(hc, "BOOT_UNIT_SOURCE", sched / "boot" / "nssms-boot.service")
+    monkeypatch.setattr(hc, "record", lambda *a: hc.RESULTS.append(hc.Check(*a)))
+    monkeypatch.setattr(hc, "heading", lambda *a: None)
+    hc.RESULTS.clear()
+    return sched
+
+
+def test_parse_exec_scripts_covers_pre_wrapped_and_prefixed(tmp_path):
+    unit = _write(tmp_path / "x.service", "\n".join([
+        "[Service]",
+        "ExecStartPre=/bin/sleep 20",
+        "ExecStartPre=-/bin/bash %h/s/heal.sh --heal-only",
+        "ExecStart=/bin/bash /s/lib/unit_log.sh name /bin/bash /s/deploy/deploy_offline.sh --unattended",
+        "ExecStart=/usr/bin/python3 /s/script/probe.py",
+        "ExecStartPost=/bin/bash /s/lib/unit_log.sh again",   # 重複出現只收一次
+        "# ExecStart=/bin/bash /s/commented.sh",
+    ]))
+    got = [str(p) for p in hc.parse_exec_scripts(unit)]
+    assert got == [
+        str(Path.home() / "s" / "heal.sh"),
+        "/s/lib/unit_log.sh",
+        "/s/deploy/deploy_offline.sh",
+        "/s/script/probe.py",
+    ]
+
+
+def test_script_defect_flags_only_silent_failures(tmp_path):
+    good = _write(tmp_path / "good.sh", "#!/bin/bash\nif true; then echo ok; fi\n")
+    empty_sh = _write(tmp_path / "empty.sh", "")
+    empty_py = _write(tmp_path / "empty.py", "")
+    cut = _write(tmp_path / "cut.sh", "#!/bin/bash\nif true; then\n  echo half\n")
+    broken_py = _write(tmp_path / "broken.py", "def f(:\n")
+    assert hc.script_defect(good) is None
+    assert "空檔" in hc.script_defect(empty_sh)
+    assert "空檔" in hc.script_defect(empty_py)
+    assert "bash -n" in hc.script_defect(cut)
+    # 語法壞掉的 .py 自己會非 0 結束(不是無聲的);不存在由 ExecStart 目標那一節負責
+    assert hc.script_defect(broken_py) is None
+    assert hc.script_defect(tmp_path / "absent.sh") is None
+
+
+def test_check_exec_scripts_fails_every_kind_of_unit(monkeypatch, tmp_path):
+    sched = _fake_scheduler(monkeypatch, tmp_path)
+    ok = _write(tmp_path / "bin" / "ok.sh", "#!/bin/bash\necho ok\n")
+    empty = _write(tmp_path / "bin" / "empty.py", "")
+    cut = _write(tmp_path / "bin" / "cut.sh", "if true; then\n")
+    _write(sched / "boot" / "nssms-boot.service",
+           "ExecStartPre=-/bin/bash {}\nExecStart=/bin/bash {}\n".format(cut, ok))
+    _write(sched / "services" / "nssms-x.service", "ExecStart=/usr/bin/python3 {}\n".format(empty))
+    _write(sched / "timers" / "{}.service".format(hc.TIMERS[0]), "ExecStart=/bin/bash {}\n".format(ok))
+
+    hc.check_exec_scripts("ipc1", "WH289")
+    fails = {c.name: c.detail for c in hc.RESULTS if c.section == "scripts" and c.status == "FAIL"}
+    assert set(fails) == {"nssms-boot.service", "nssms-x.service"}
+    assert "bash -n" in fails["nssms-boot.service"] and "cut.sh" in fails["nssms-boot.service"]
+    assert "空檔" in fails["nssms-x.service"]
+    assert not any(c.status == "PASS" for c in hc.RESULTS if c.section == "scripts")
+
+
+def test_check_exec_scripts_passes_and_skips_not_applicable(monkeypatch, tmp_path):
+    sched = _fake_scheduler(monkeypatch, tmp_path)
+    ok = _write(tmp_path / "bin" / "ok.sh", "#!/bin/bash\necho ok\n")
+    empty = _write(tmp_path / "bin" / "empty.sh", "")
+    _write(sched / "services" / "nssms-a.service", "ExecStart=/bin/bash {}\n".format(ok))
+    # 本機(ipc1)不適用的 unit:它的腳本壞不壞與這台無關,不報
+    _write(sched / "services" / "nssms-b.service",
+           "# NSSMS-BaseIPC=ipc2\nExecStart=/bin/bash {}\n".format(empty))
+
+    hc.check_exec_scripts("ipc1", "WH289")
+    scripts = [c for c in hc.RESULTS if c.section == "scripts"]
+    assert [c.status for c in scripts] == ["PASS"]
+    assert "1 支 unit" in scripts[0].detail and "1 個腳本" in scripts[0].detail
+
+
+def test_check_exec_scripts_runs_in_main_after_timers():
+    source = Path(hc.__file__).read_text(encoding="utf-8")
+    main = source[source.index("def main()"):]
+    assert main.index("check_timers(") < main.index("check_exec_scripts(role, vessel)")
+
+
+@pytest.mark.skipif(not hc.TIMERS_DIR.is_dir(), reason="scheduler 不在場:{}".format(hc.TIMERS_DIR))
+def test_real_units_have_no_broken_scripts(monkeypatch):
+    """對真實的 scheduler unit 跑一次:不能有誤報(否則每天的部署巡檢都會紅)。"""
+    monkeypatch.setattr(hc, "record", lambda *a: hc.RESULTS.append(hc.Check(*a)))
+    monkeypatch.setattr(hc, "heading", lambda *a: None)
+    hc.RESULTS.clear()
+    hc.check_exec_scripts("ipc1", "")
+    assert [c.status for c in hc.RESULTS if c.section == "scripts"] == ["PASS"]

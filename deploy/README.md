@@ -331,6 +331,7 @@ wheel」只能看 `.log` 那一份，船上回報問題時寄它。路徑會印�
 - `systemctl --user` 與 linger 是否可用；
 - `nssms-boot`、`nssms-heartbeat`、所有 `nssms-*` timer 的實際狀態；
 - timer 對應 service 的最近執行結果與 `ExecStart` 目標是否存在；
+- **所有 unit 的執行腳本完整性**（v0.30.0）：`nssms-boot`、`services/` 的常駐服務、所有 timer 的 service，其 `ExecStart` / `ExecStartPre` / `ExecStartPost` 裡出現的 `.sh` / `.py`（包在 `lib/unit_log.sh` 後面的目標也算）—— 空檔或 `.sh` 過不了 `bash -n` 就 FAIL。被截成 0 byte 的腳本執行起來 rc=0，systemd 顯示 success，上面幾項都看不出來；scheduler 的 `unit_log.sh` 守門只涵蓋經過它的幾支 unit。`.py` 不編譯（語法壞掉會自己非 0 結束），路徑不存在由上一項負責；本機不適用的 unit 不檢查；
 - repo unit 母體與 `~/.config/systemd/user/` 實際安裝版本是否一致；
 - sudoers 權限及 reboot / TeamViewer 的精確 NOPASSWD 白名單；
 - heartbeat 實際 TCP 回應、failover 狀態與角色；

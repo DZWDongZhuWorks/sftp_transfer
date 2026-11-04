@@ -469,3 +469,138 @@ def test_persist_days_is_configurable(tmp_path):
     state = tmp_path / "state.json"
     run_at(T0, root, "--state", state, "--persist-days", "1")
     assert run_at(T0 + DAY, root, "--state", state, "--persist-days", "1")[0] == B.EXIT_FAIL
+
+
+# --- 修復(--repair):在下載 manifest 標成失效,下一輪下載整份覆蓋 ---------------------
+
+def lock_args(tmp_path):
+    return ["--repair", "--lock", str(tmp_path / "launcher.lock")]
+
+
+def read_manifest(root):
+    path = root / B.DOWNLOAD_MANIFEST_NAME
+    return json.loads(path.read_text(encoding="utf-8")) if path.exists() else None
+
+
+def test_repair_invalidates_corrupt_entries_and_keeps_the_file(tmp_path):
+    root = make_root(tmp_path, manifest=True)
+    rotted = bytearray(GOOD_FILES["notes.txt"])
+    rotted[2] ^= 0x01
+    (root / "notes.txt").write_bytes(bytes(rotted))
+    code, text = run(root, *lock_args(tmp_path))
+    assert code == B.EXIT_FAIL, "修過這一輪仍算 FAIL:要到下一輪下載後才真的好"
+    assert "repaired=1" in verdict(text) and "[REPAIR] notes.txt" in text
+    manifest = read_manifest(root)
+    assert manifest["notes.txt"]["mtime"] == -1
+    assert manifest["main.py"]["mtime"] == 1, "沒壞的檔不能動"
+    assert (root / "notes.txt").read_bytes() == bytes(rotted), "被檢查的檔一個 byte 都不動"
+
+
+def test_repair_adds_entry_when_manifest_has_none(tmp_path):
+    """下載器對「沒有紀錄、同大小」是略過的 —— 不補一筆,壞檔永遠不會被重抓。"""
+    root = make_root(tmp_path)   # 沒有下載 manifest
+    (root / "main.py").write_bytes(b"")
+    run(root, *lock_args(tmp_path))
+    assert read_manifest(root) == {"main.py": {"size": -1, "mtime": -1}}
+
+
+def test_repair_skips_shore_side_and_missing(tmp_path):
+    """持續的版本交錯 = 岸端那份壞了,重抓只會抓回同一份;缺少的檔下載本來就會補。"""
+    root = make_root(tmp_path)
+    shore = b"what the shore serves\n"
+    (root / "notes.txt").write_bytes(shore)
+    (root / "pkg" / "__init__.py").unlink()
+    (root / B.DOWNLOAD_MANIFEST_NAME).write_text(json.dumps({
+        "notes.txt": {"size": len(shore), "mtime": 7, "local_bytes": len(shore),
+                      "local_sha256": sha(shore)}}), encoding="utf-8")
+    state = tmp_path / "state.json"
+    run_at(T0, root, "--state", state, *lock_args(tmp_path))
+    code, text = run_at(T0 + 3 * DAY, root, "--state", state, *lock_args(tmp_path))
+    assert code == B.EXIT_FAIL and "repaired=0" in verdict(text)
+    assert read_manifest(root) == {"notes.txt": {"size": len(shore), "mtime": 7,
+                                                 "local_bytes": len(shore), "local_sha256": sha(shore)}}
+
+
+def test_repair_fixes_persisting_local_mismatch(tmp_path):
+    root = make_root(tmp_path)
+    (root / "notes.txt").write_bytes(b"rotted without evidence\n")
+    state = tmp_path / "state.json"
+    run_at(T0, root, "--state", state, *lock_args(tmp_path))
+    assert read_manifest(root) is None, "還沒滿 3 天:可能只是更新進行中,不修"
+    run_at(T0 + 3 * DAY, root, "--state", state, *lock_args(tmp_path))
+    assert read_manifest(root)["notes.txt"] == {"size": -1, "mtime": -1}
+
+
+@pytest.mark.skipif(B.fcntl is None, reason="沒有 fcntl")
+def test_repair_backs_off_while_a_download_holds_the_lock(tmp_path):
+    import fcntl
+    root = make_root(tmp_path)
+    (root / "main.py").write_bytes(b"")
+    lock = tmp_path / "launcher.lock"
+    with open(str(lock), "w") as holder:
+        fcntl.flock(holder, fcntl.LOCK_EX)
+        code, text = run(root, "--repair", "--lock", lock)
+    assert code == B.EXIT_FAIL and "本輪不修" in text and "repaired=0" in verdict(text)
+    assert read_manifest(root) is None
+
+
+def test_repair_is_off_by_default_and_never_in_dev(tmp_path):
+    root = make_root(tmp_path)
+    (root / "main.py").write_bytes(b"")
+    run(root)
+    assert read_manifest(root) is None, "沒有 --repair 就是唯讀"
+    run(root, "--dev", *lock_args(tmp_path))
+    assert read_manifest(root) is None
+
+
+def test_repair_leaves_unreadable_manifest_alone(tmp_path):
+    """manifest 讀不出來就不動:覆蓋掉等於丟掉下載器所有的斷點紀錄。"""
+    root = make_root(tmp_path)
+    (root / "main.py").write_bytes(b"")
+    (root / B.DOWNLOAD_MANIFEST_NAME).write_text("{broken", encoding="utf-8")
+    code, text = run(root, *lock_args(tmp_path))
+    assert "下載 manifest 讀不出來" in text and "repaired=0" in verdict(text)
+    assert (root / B.DOWNLOAD_MANIFEST_NAME).read_text(encoding="utf-8") == "{broken"
+
+
+def test_repair_requires_lock(capsys):
+    """不拿鎖就修 = 可能跟正在跑的下載搶寫同一份 manifest。寧可拒絕。"""
+    code, text = run("/nonexistent", "--repair")
+    assert code == B.EXIT_USAGE and "status=ERROR" in verdict(text)
+    assert "需要 --lock" in capsys.readouterr().err
+
+
+def test_invalidated_entry_makes_the_real_downloader_redownload(tmp_path, logger):
+    """端到端:標成失效後,真正的下載器面對「遠端同大小」不再略過,而是整份重抓覆蓋。
+
+    這是整個修復的前提 —— 略過分支只比 size/mtime,同大小的壞檔原本每一輪都被略過。
+    """
+    from conftest import FakeSFTPClient, make_downloader
+    good = b"GOOD-CONTENT-0123"
+    rotted = b"ROT!-CONTENT-0123"
+    assert len(good) == len(rotted)
+    (tmp_path / "f.txt").write_bytes(rotted)
+    remote = FakeSFTPClient(files={"/remote/f.txt": good}, mtimes={"/remote/f.txt": 5000})
+
+    def fresh():
+        d = make_downloader(tmp_path, logger, resume=True)
+        d.sftp = remote
+        d._manifest = d._load_manifest(tmp_path)
+        return d
+
+    (tmp_path / B.DOWNLOAD_MANIFEST_NAME).write_text(json.dumps(
+        {"f.txt": {"size": len(good), "mtime": 5000}}), encoding="utf-8")
+    assert fresh()._download_one_file("/remote/f.txt", "f.txt", tmp_path) == "skipped", \
+        "前提:沒有修復時,同大小的壞檔會被略過"
+
+    assert B.invalidate_entries(str(tmp_path), ["f.txt"]) == 1
+    d = fresh()
+    assert d._download_one_file("/remote/f.txt", "f.txt", tmp_path) != "skipped"
+    assert (tmp_path / "f.txt").read_bytes() == good
+
+    # 沒有紀錄的情形(補 {size:-1, mtime:-1})一樣要重抓
+    (tmp_path / "f.txt").write_bytes(rotted)
+    (tmp_path / B.DOWNLOAD_MANIFEST_NAME).unlink()
+    assert B.invalidate_entries(str(tmp_path), ["f.txt"]) == 1
+    assert fresh()._download_one_file("/remote/f.txt", "f.txt", tmp_path) != "skipped"
+    assert (tmp_path / "f.txt").read_bytes() == good

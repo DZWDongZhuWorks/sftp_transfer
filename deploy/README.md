@@ -297,6 +297,15 @@ sftp_transfer 與 scheduler 是 OTA 的控制面（booster）：其他專案都�
 | **持續不一致**（FAIL，v0.31.0） | 上面三種 WARN 的同一個檔，簽名（本地 sha、發佈版 sha）持續 3 天都沒變 —— warm 一天兩輪早該補齊，所以不是更新進行中。依原類別判讀：不一致 → 本機內容很可能已損毀（大小沒變的 bit rot、截在語法仍完整之處的截斷）；版本交錯 → **岸端 STANDARD 上那份很可能本身就壞了**（重抓只會抓回同一份）；缺少 → 漏送或被刪 | 同損毀。狀態檔 `share/.env/booster_integrity_state.json`（不在 OTA 範圍內）；岸上發佈新版時 stamp 的 sha 變了，自動重新計時；CLINK 不計 |
 | 檢查器沒交結論 | 輸出裡沒有 `BOOSTER_INTEGRITY status=` 那一行（檢查器自己被截成 0 byte 時 rc 也是 0） | 當成損毀處理 |
 
+**自動修復**（v0.32.0，`--repair`）：損毀、以及持續不一致中「本機損毀」那一類的檔，會在**該專案自己的
+下載 manifest** 標成失效（有紀錄的 `mtime=-1`；沒有紀錄的補 `{size:-1, mtime:-1}` —— 下載器對「沒有紀錄、
+同大小」是略過的），下一輪 warm 就整份重抓、原子換名覆蓋。**不刪檔、不改名**，被檢查的檔一個 byte 都不動
+（`--verify --quarantine` 刻意不開的理由 —— 隔離後抓不回來的檔會永久消失 —— 在這裡不成立）。
+不修：持續的版本交錯（岸端那份壞了，重抓只會抓回同一份）、缺少（下載本來就會補）、CLINK、`--check-only`。
+修之前要拿 `share/.env/launcher.lock`（warm 下載時持有），拿不到就只回報，不跟下載搶寫 manifest。
+修過的檔這一輪仍算 FAIL，下一次部署會再驗一次。`main.py` / `downloader.py` 本身壞了下載器跑不動，那兩支由
+scheduler `update_booster` 的 last-good 修。
+
 不是部署的必要條件：沒有任何一種結果會中止部署（擋下部署修不好壞檔）。CLINK 開發機帶
 `--dev`：工作樹與發佈版不同是常態，只有空檔與語法壞掉算損毀。
 

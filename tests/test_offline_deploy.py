@@ -1342,7 +1342,7 @@ class UnattendedReconcileTests(unittest.TestCase):
         self.assertIn('BOOSTER_VERSIONS="未讀取"\n', head)
         self.assertIn('BOOSTER_INTEGRITY_STATUS="未執行"\n', head)
 
-    def _run_booster_stage(self, mutate=None, unattended=1, vessel="WH102"):
+    def _run_booster_stage(self, mutate=None, unattended=1, vessel="WH102", check_only=0):
         """抽出三個函式,在 set -euo pipefail 下對暫存的 share/ 跑一次。回傳 stdout。"""
         funcs = "\n".join(self._stage_body(n) for n in (
             "booster_version_of", "log_booster_versions", "stage_booster_integrity"))
@@ -1374,8 +1374,8 @@ class UnattendedReconcileTests(unittest.TestCase):
         script = "\n".join((
             "set -euo pipefail",
             'SHARE_DIR="$1"; PROJECT_DIR="$SHARE_DIR/sftp_transfer"; SCRIPT_DIR="$PROJECT_DIR/deploy"',
-            'UNATTENDED={}; DEPLOY_VSL_UPPER={}; PYTHON_BIN="{}"; VENV_DIR=/nonexistent'.format(
-                unattended, vessel, sys.executable),
+            'UNATTENDED={}; DEPLOY_VSL_UPPER={}; PYTHON_BIN="{}"; VENV_DIR=/nonexistent; CHECK_ONLY={}'.format(
+                unattended, vessel, sys.executable, check_only),
             'UNATTENDED_FAIL=0; BOOSTER_VERSIONS="未讀取"; BOOSTER_INTEGRITY_STATUS="未執行"',
             'info(){ echo "[INFO] $*"; }; ok(){ echo "[ OK ] $*"; }',
             'warn(){ echo "[WARN] $*"; }; err(){ echo "[FAIL] $*"; }',
@@ -1386,6 +1386,7 @@ class UnattendedReconcileTests(unittest.TestCase):
             "stage_booster_integrity",
             'echo "RESULT fail=$UNATTENDED_FAIL versions=[$BOOSTER_VERSIONS] status=[$BOOSTER_INTEGRITY_STATUS]"',
         ))
+        self.last_share = share
         proc = subprocess.run(["bash", "-c", script, "harness", share],
                               stdout=subprocess.PIPE, stderr=subprocess.STDOUT)
         out = proc.stdout.decode("utf-8")
@@ -1414,6 +1415,33 @@ class UnattendedReconcileTests(unittest.TestCase):
         self.assertIn("[CORRUPT] main.py", out)
         self.assertIn("RESULT fail=1", out)
         self.assertIn("損毀 1 個、持續不一致 0 個", out)
+
+    def _sftp_manifest(self):
+        path = os.path.join(self.last_share, "sftp_transfer", ".sftp_download_manifest.json")
+        if not os.path.exists(path):
+            return None
+        with open(path, encoding="utf-8") as fh:
+            return json.load(fh)
+
+    def test_booster_stage_schedules_redownload_of_corrupt_files(self):
+        """修復:壞檔在下載 manifest 標成失效,下一輪 warm 整份重抓(不刪檔、不改名)。"""
+        def truncate(share):
+            open(os.path.join(share, "sftp_transfer", "main.py"), "wb").close()
+        out = self._run_booster_stage(truncate)
+        self.assertIn("[REPAIR] main.py", out)
+        self.assertIn("已排程 1 個檔在下一輪 warm 重抓", out)
+        self.assertEqual(self._sftp_manifest(), {"main.py": {"size": -1, "mtime": -1}})
+        self.assertTrue(os.path.exists(os.path.join(self.last_share, "sftp_transfer", "main.py")),
+                        "修復不能刪檔")
+        self.assertNotIn("下一輪 OTA **不一定**修得好", out, "已排程重抓時不該再說修不好")
+
+    def test_booster_stage_check_only_and_clink_never_repair(self):
+        def truncate(share):
+            open(os.path.join(share, "sftp_transfer", "main.py"), "wb").close()
+        for kwargs in (dict(check_only=1, unattended=0), dict(vessel="CLINK")):
+            out = self._run_booster_stage(truncate, **kwargs)
+            self.assertNotIn("[REPAIR]", out, kwargs)
+            self.assertIsNone(self._sftp_manifest(), "{}:不該寫下載 manifest".format(kwargs))
 
     def test_booster_stage_flags_a_truncated_checker(self):
         def truncate(share):

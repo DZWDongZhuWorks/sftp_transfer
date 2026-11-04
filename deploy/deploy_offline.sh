@@ -1181,6 +1181,10 @@ stage_booster_integrity() {
     args+=(--dev)
   else
     args+=(--state "$SHARE_DIR/.env/booster_integrity_state.json")
+    # 修復:把壞檔在下載 manifest 標成失效,下一輪 warm 整份重抓覆蓋(不刪檔、不改名)。
+    # 要拿 launcher.lock —— warm 下載時持有它;nssms-deploy-reconcile 開跑前會先停 warm。
+    # --check-only 承諾不做任何變更,所以只回報。
+    [ "$CHECK_ONLY" -eq 1 ] || args+=(--repair --lock "$SHARE_DIR/.env/launcher.lock")
   fi
   RC=0
   out="$("$PYTHON_BIN" "$checker" "${args[@]}" 2>&1)" || RC=$?
@@ -1208,8 +1212,17 @@ stage_booster_integrity() {
     1)
       BOOSTER_INTEGRITY_STATUS="⚠ 損毀 $(printf '%s' "$verdict" | grep -oE 'corrupt=[0-9]+' | cut -d= -f2) 個、持續不一致 $(printf '%s' "$verdict" | grep -oE 'persistent=[0-9]+' | cut -d= -f2 || true) 個(見上方 [CORRUPT] / [PERSISTENT])"
       err "booster 完整性:$BOOSTER_INTEGRITY_STATUS"
-      err "  下一輪 OTA **不一定**修得好:同大小的壞檔會被略過,而 main.py 壞了下載器根本跑不動。"
-      err "  修法(擇一):"
+      local repaired
+      repaired="$(printf '%s' "$verdict" | grep -oE 'repaired=[0-9]+' | cut -d= -f2 || true)"
+      if [ "${repaired:-0}" -gt 0 ]; then
+        BOOSTER_INTEGRITY_STATUS="$BOOSTER_INTEGRITY_STATUS;已排程 $repaired 個檔在下一輪 warm 重抓"
+        err "  已自動排程 $repaired 個檔在下一輪 warm 整份重抓(見上方 [REPAIR])。下一次部署會再驗一次。"
+        err "  main.py / downloader.py 本身壞了的話下載器跑不動,由 update_booster 的 last-good 修。"
+        err "  要立即修(不等 warm),或 [PERSISTENT] 指向岸端的檔,用下面的人工修法:"
+      else
+        err "  下一輪 OTA **不一定**修得好:同大小的壞檔會被略過,而 main.py 壞了下載器根本跑不動。"
+        err "  修法(擇一):"
+      fi
       err "    * 下載器還能跑時,強制重抓那幾個檔(樣式同 ignore 檔,例 'reboot_script/update_booster.sh'):"
       # 用 VENV_DIR 而不是 VENV_PY:後者到階段 B 才賦值,set -u 下在這裡讀它會直接中止部署。
       err "        cd $PROJECT_DIR && \"$VENV_DIR/bin/python\" main.py --cli --mode download \\"

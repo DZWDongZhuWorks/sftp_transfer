@@ -1467,39 +1467,6 @@ class TestRemoteRoundTrips:
         assert d._listing_dirs   # 本輪的列目錄計畫不是連線狀態，重連後照用
 
 
-class TestReconnectGiveUp:
-    """重連放棄後要直接收尾，不能拿 None 當連線繼續處理下一個檔。"""
-
-    def test_gave_up_reconnecting_aborts_with_the_real_error(self, uploader_factory, tmp_path, caplog):
-        for name in ("a.csv", "b.csv", "c.csv"):
-            _write(tmp_path / name, b"data")
-        fake = _CountingSFTP(files={})
-        fake.open = MagicMock(side_effect=OSError("Socket is closed"))
-        d = uploader_factory(wait_for_network=False)
-        connects = []
-
-        def connect():
-            connects.append(1)
-            if len(connects) == 1:
-                d.sftp = fake
-                return
-            d.sftp = None                       # 真的 _connect 一開頭就 _close()
-            raise OSError("[Errno 101] Network is unreachable")
-
-        d._connect_with_retry = MagicMock(side_effect=connect)
-
-        with caplog.at_level(logging.INFO):
-            assert d.run() is False
-
-        messages = [r.message for r in caplog.records]
-        assert fake.open.call_count == 1         # 放棄之後沒有再碰任何檔
-        assert not any("NoneType" in m for m in messages)
-        aborted = [m for m in messages if "RUN_ABORTED" in m]
-        assert aborted and "Network is unreachable" in aborted[0]
-        from monitor.log_monitor import _RE_ABORT
-        assert "Network is unreachable" in _RE_ABORT.search(aborted[0]).group(1)
-
-
 class TestSkipSummaryLine:
     """「版本相符而略過」收成一行（2026-11-04：dashboard 紀錄 82% 是逐檔略過行）。"""
 
@@ -1564,3 +1531,36 @@ class TestSkipSummaryLine:
         assert ok is False
         summary = [m for m in messages if 'reason="manifest_version_match"' in m]
         assert len(summary) == 1 and "count=4" in summary[0]
+
+
+class TestReconnectGiveUp:
+    """重連放棄後要直接收尾，不能拿 None 當連線繼續處理下一個檔。"""
+
+    def test_gave_up_reconnecting_aborts_with_the_real_error(self, uploader_factory, tmp_path, caplog):
+        for name in ("a.csv", "b.csv", "c.csv"):
+            _write(tmp_path / name, b"data")
+        fake = _CountingSFTP(files={})
+        fake.open = MagicMock(side_effect=OSError("Socket is closed"))
+        d = uploader_factory(wait_for_network=False)
+        connects = []
+
+        def connect():
+            connects.append(1)
+            if len(connects) == 1:
+                d.sftp = fake
+                return
+            d.sftp = None                       # 真的 _connect 一開頭就 _close()
+            raise OSError("[Errno 101] Network is unreachable")
+
+        d._connect_with_retry = MagicMock(side_effect=connect)
+
+        with caplog.at_level(logging.INFO):
+            assert d.run() is False
+
+        messages = [r.message for r in caplog.records]
+        assert fake.open.call_count == 1         # 放棄之後沒有再碰任何檔
+        assert not any("NoneType" in m for m in messages)
+        aborted = [m for m in messages if "RUN_ABORTED" in m]
+        assert aborted and "Network is unreachable" in aborted[0]
+        from monitor.log_monitor import _RE_ABORT
+        assert "Network is unreachable" in _RE_ABORT.search(aborted[0]).group(1)

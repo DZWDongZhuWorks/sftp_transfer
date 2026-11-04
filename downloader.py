@@ -334,40 +334,13 @@ class SFTPBase:
         self._manifest = {}
         # 記憶體中的 manifest 是否已有尚未落盤的異動（見 _flush_manifest）。
         self._manifest_dirty = False
+        # 本來源累積、還沒寫進 log 的「版本相符而略過」檔數，見 _emit_skip_summary。
+        self._skip_tally = 0
         # 上一次 manifest 真的落盤的時刻（見 _flush_manifest_due）。
         self._last_manifest_flush = 0.0
         self._ignore_spec = None
         # 這條連線上已確認存在（或剛建立）的遠端目錄，見 _ensure_remote_dir；_close() 時清空。
         self._remote_dirs_ok = set()
-        # 本來源累積、還沒寫進 log 的「版本相符而略過」檔數，見 _emit_skip_summary。
-        self._skip_tally = 0
-
-    def _emit_skip_summary(self, direction, source):
-        """把「版本相符而略過」的檔收成一行寫進 log（每個來源跑完、以及任務收尾時各叫一次）。
-
-        【為什麼不逐檔記】2026-11-04 抽樣 300 份 dashboard_report 上傳紀錄：中位數一份 89 行、
-        26 KB，其中 50 行是「略過（已完整上傳）」、實際上傳 1 個檔 —— 略過行占容量 82%。
-        dashboard 紀錄占岸端 sftp_logs 的 65%，每一份都從船上經衛星傳回岸端。逐檔略過行
-        沒有任何程式在讀（log_monitor 只解析結尾的「成功 N，略過 N，失敗 N」），而它記的
-        內容（大小、mtime 都與版本紀錄相符）本來就在 manifest 裡。
-
-        只收這一種：只用大小比對的略過（沒有版本紀錄）、覆蓋、改名另存這些真的有做判斷的
-        決定照樣逐檔記，它們少而且查問題時用得到。
-        """
-        count, self._skip_tally = self._skip_tally, 0
-        if not count:
-            return
-        word = "上傳" if direction == "upload" else "下載"
-        self.logger.info(diagnostic_message(
-            "FILE_DECISION",
-            f"略過 {count} 個已完整{word}的檔（大小與 mtime 皆與版本紀錄相符）",
-            direction=direction,
-            reason="manifest_version_match",
-            count=count,
-            source=source,
-            verification="size_and_mtime",
-            action="skip",
-        ))
 
     def _reset_remote_cache(self):
         """丟掉所有「這條連線上看過的遠端狀態」。斷線重連後伺服器那邊可能已經變了。"""
@@ -624,6 +597,33 @@ class SFTPBase:
                 action="continue_without_persisted_checkpoint",
             ))
             return False
+
+    def _emit_skip_summary(self, direction, source):
+        """把「版本相符而略過」的檔收成一行寫進 log（每個來源跑完、以及任務收尾時各叫一次）。
+
+        【為什麼不逐檔記】2026-11-04 抽樣 300 份 dashboard_report 上傳紀錄：中位數一份 89 行、
+        26 KB，其中 50 行是「略過（已完整上傳）」、實際上傳 1 個檔 —— 略過行占容量 82%。
+        dashboard 紀錄占岸端 sftp_logs 的 65%，每一份都從船上經衛星傳回岸端。逐檔略過行
+        沒有任何程式在讀（log_monitor 只解析結尾的「成功 N，略過 N，失敗 N」），而它記的
+        內容（大小、mtime 都與版本紀錄相符）本來就在 manifest 裡。
+
+        只收這一種：只用大小比對的略過（沒有版本紀錄）、覆蓋、改名另存這些真的有做判斷的
+        決定照樣逐檔記，它們少而且查問題時用得到。
+        """
+        count, self._skip_tally = self._skip_tally, 0
+        if not count:
+            return
+        word = "上傳" if direction == "upload" else "下載"
+        self.logger.info(diagnostic_message(
+            "FILE_DECISION",
+            f"略過 {count} 個已完整{word}的檔（大小與 mtime 皆與版本紀錄相符）",
+            direction=direction,
+            reason="manifest_version_match",
+            count=count,
+            source=source,
+            verification="size_and_mtime",
+            action="skip",
+        ))
 
     def _flush_manifest(self, local_root):
         """把累積在記憶體中的 manifest 異動一次寫回磁碟（沒有異動就什麼都不做）。

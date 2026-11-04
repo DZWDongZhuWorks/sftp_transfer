@@ -683,6 +683,7 @@ manifest 不能當證據：2026-09-22 實測 `.sftp_download_manifest.json` 的 
 | `RUN_CONTEXT` | 已解析的執行設定；包含方向、路徑、重試與續傳開關，但不記錄密碼或私鑰內容 |
 | `CONNECTION_RETRY` / `CONNECTION_ERROR` | 連線錯誤、例外類型、次數、上限及下一步 |
 | `MANIFEST_ERROR` | manifest 讀寫或資料結構錯誤，以及採用的安全回退動作 |
+| `FILE_DECISION` | 單檔判斷（覆蓋、另存、只憑大小略過等）逐檔記錄；**大小與 mtime 都與版本紀錄相符而略過的檔不逐檔記**，每個來源跑完時收成一行 `略過 N 個已完整上傳／下載的檔`（`reason="manifest_version_match"`、`count=N`）。逐檔略過行曾占 dashboard 上傳紀錄 82% 的容量，而且每份都經衛星傳回岸端 |
 | `RESUME_ACCEPTED` | 續傳驗證通過；包含 offset、總大小、剩餘位元組數，以及為了切回檢查點而捨棄的 `discarded_bytes` |
 | `RESUME_REJECTED` | 續傳被拒絕；包含精確原因、雙方大小、checkpoint offset 與 hash 是否存在 |
 | `CHECKPOINT_SAVED` | 取消或傳輸錯誤後保存的進度、signal、offset 與 manifest 寫入結果 |

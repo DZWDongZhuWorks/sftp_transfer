@@ -1,5 +1,5 @@
 {
-  "version": "0.32.1",
+  "version": "0.32.2",
   "date": "2026-11-04",
-  "notes": "傳輸紀錄瘦身:大小與 mtime 都與版本紀錄相符而略過的檔(reason=manifest_version_match)不再逐檔寫 log,每個來源跑完(及任務收尾的 finally)收成一行 [FILE_DECISION] 略過 N 個已完整上傳/下載的檔(count=N);只憑大小比對的略過(沒有版本紀錄)、覆蓋、另存照舊逐檔記。上傳與下載兩端都改。起因:2026-11-04 抽樣 300 份 dashboard_report 上傳紀錄,中位數一份 89 行/26 KB,其中 50 行是逐檔略過、實際上傳 1 個檔,略過行占容量 82%;dashboard 紀錄占岸端 sftp_logs 的 65%,每份都經衛星從船上傳回。沒有程式讀逐檔略過行(log_monitor 只解析結尾的「成功 N,略過 N,失敗 N」,數字不變)。以真實紀錄回放估算:dashboard 上傳紀錄 28.9→4.7 KB/份(-84%)、全部上傳紀錄 -74%、下載紀錄 -85%。測試:test_uploader.TestSkipSummaryLine(4 條,含中止時仍寫出彙總、log_monitor 的 _RE_SUMMARY 解析不變)、test_downloader.TestSkipSummaryLineDownload(2 條)。"
+  "notes": "伺服器以狀態碼拒絕(OSError('Failure') 等,errno 為 None、只帶 SFTP_DESC 訊息)時不再當成斷線:不重連、同一條連線上退避 retry_delay×2^(n-1)(封頂 300 秒),同檔被拒 3 次放棄該檔、連續 3 檔即中止整趟(RemoteServerRejecting → RUN_ABORTED),retry_count 的無限次只適用於真斷線;上下載的逐檔重試與 LIST_RETRY 都套用。起因:2026-11-04 岸端 /fleet 磁碟滿,舊行為每檔 3 秒握手 8 次、無上限,船隊疊起來讓 sshd Exceeded MaxStartups。log_monitor TUI:--watch 時明細/說明彈窗、CSV 檢視、搜尋列閒置超過 max(watch, 600 秒)自動關閉,讓自動同步恢復;起因:10-28~11-04 TUI 行程活著卻 7 天沒同步(彈窗各自阻塞讀鍵),fleet_logs 停更、remote-log-retention 每天 fail-closed。測試:test_uploader/test_downloader 新增 TestServerStatusFailure*,test_tui 新增 _ModalKeys 與彈窗閒置關閉;另以 pty 實際驅動 TUI 驗證(main 上彈窗開 8 秒重載 0 次,修正後自動關閉並恢復重載)。"
 }

@@ -149,6 +149,7 @@ cp example_settings.json settings.json
 - 開關類參數的 CLI 覆蓋方式是「單向」的：`--no-auto-reconnect` 只能把設定檔中的 `true` 覆蓋成停用，無法用 CLI 把設定檔中已停用的功能臨時開啟；若要改變開關狀態，直接修改 `settings.json` 最單純。
 - **安全性提醒**：`password` 欄位若填寫，會以明碼存在 `settings.json` 中，方便無人值守的排程執行；若環境允許，建議改用 `key_file`（SSH 私鑰）取代密碼，或至少限制此資料夾的存取權限，避免密碼外洩。
 - **注意**：`retry_count` 預設無限次重試，若是主機位址、帳號等打錯導致永遠連不上，程式會持續重試並持續寫入 Log 而不會自行停止；請確認參數正確，或視情況改設一個合理的重試上限（如 `10`）。
+- **伺服器拒絕不吃「無限次」**：SFTP 伺服器以狀態碼拒絕（log 裡的 `OSError('Failure')`／`Bad message`／`Operation unsupported`，最常見的是遠端磁碟滿或配額用完）時連線本身是好的，所以**不重連**，改在同一條連線上等 `retry_delay × 2^(n-1)` 秒（封頂 300 秒）再試；同一個檔被拒 3 次就放棄該檔（`reason="server_status_persistent"`），連續 3 個檔都這樣就中止整趟（`RUN_ABORTED`），等下一次排程再試。`retry_count` 的無限次只適用於真正的斷線。2026-11-04 岸端磁碟滿時，舊行為是每檔 3 秒內握手 8 次、永不放棄，船隊疊起來把 sshd 打到 `Exceeded MaxStartups`。
 
 ### 欄位說明
 
@@ -689,7 +690,7 @@ manifest 不能當證據：2026-09-22 實測 `.sftp_download_manifest.json` 的 
 | `MODE_ALIGNED` | 內容未變更、但兩端 mode 不同，已只補權限不重傳；含 `old_mode` / `new_mode`（八進位字串） |
 | `VERIFY_MISMATCH` / `VERIFY_QUARANTINED` | `--verify` 發現本地檔內容與完整下載當時的整檔 SHA-256 不符（含 `expected_sha256` / `actual_sha256`）；有 `--quarantine` 時接著記改名後的 `quarantined_as` |
 | `VERIFY_SUMMARY` | `--verify` 結尾彙總：`ok` / `mismatch` / `quarantined` / `no_baseline` / `missing` / `size_differs` / `unreadable` 筆數、`hashed_bytes`、`elapsed_seconds` |
-| `LIST_RETRY` / `TRANSFER_RETRY` / `TRANSFER_ERROR` | 清單、單檔傳輸的階段、重試資訊、例外及最終動作 |
+| `LIST_RETRY` / `TRANSFER_RETRY` / `TRANSFER_ERROR` | 清單、單檔傳輸的階段、重試資訊、例外及最終動作；重試的 `reason` 為 `server_status`（伺服器拒絕，`action="wait_retry"`，不重連）或 `transfer_error`（斷線類，`action="reconnect"`） |
 | `LOG_UPLOAD_ATTEMPT` / `LOG_UPLOAD_RETRY` | 回傳 Log 的目的地，以及 `reused_connection`（是否沿用傳輸階段的連線，見下方【連線次數】）；沿用的連線失效時會出現 `LOG_UPLOAD_RETRY` 並重連一次 |
 
 `RESUME_REJECTED` 的常見 `reason`：

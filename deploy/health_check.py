@@ -8,7 +8,7 @@
   3. 專案模組能力測試 (downloader / settings / gitignore / main 可否匯入)
   4. 單元測試 (若安裝了 pytest，跑一次專案測試套件)
   5. SFTP 連線測試 (TCP 可達性 -> SSH 認證 -> 開啟 SFTP -> 列出遠端路徑)
-  6. 彙整健康報告，輸出到終端機並寫入 logs/health_report_*.md
+  6. 彙整健康報告，輸出到終端機並寫入 deploy/logs/health_report_*.md
 
 用法：
   python3 deploy/health_check.py                       # 用預設設定檔
@@ -289,7 +289,8 @@ def check_sftp(config_path: Path) -> bool:
 # ---------------------------------------------------------------------------
 def write_report(env: dict, config_path: Path, overall: str) -> Path:
     ts = datetime.now().strftime("%Y%m%d_%H%M%S")
-    log_dir = PROJECT_DIR / "logs"
+    # deploy/logs/:部署相關的記錄與報告不和 sftp 傳輸的 D_/U_*.csv(專案根目錄的 logs/)混放。
+    log_dir = SCRIPT_DIR / "logs"
     log_dir.mkdir(exist_ok=True)
     report_path = log_dir / f"health_report_{ts}.md"
 

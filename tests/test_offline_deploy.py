@@ -364,18 +364,42 @@ class OfflineDeployTests(unittest.TestCase):
         看起來像是「Jammy 被認成 Bionic」，其實是這支測試用 NSSMS_TEST_OVERRIDES 假造
         Bionic 跑出來的產物 —— 而那個目錄會被 fleet log 收走上傳。
         """
-        logs_dir = PROJECT_DIR / "logs"
-        before = set(logs_dir.glob("deploy_offline_*.log")) if logs_dir.is_dir() else set()
+        def snapshot():
+            found = set()
+            for logs_dir in (PROJECT_DIR / "logs", DEPLOY_DIR / "logs"):
+                if logs_dir.is_dir():
+                    found |= set(logs_dir.glob("deploy_offline_*.log"))
+            return found
+        before = snapshot()
         fake_home = self.temp_dir / "home"
         fake_home.mkdir()
         proc = self._check_only_as_bionic(fake_home)
         self.assertEqual(proc.returncode, 0, proc.stdout)
         # 這一條路徑確實會開記錄檔（船上那份就是這樣來的），所以它真的在測東西。
         self.assertIn("完整終端記錄", proc.stdout)
-        after = set(logs_dir.glob("deploy_offline_*.log")) if logs_dir.is_dir() else set()
+        after = snapshot()
         self.assertEqual(
             set(), after - before,
             "測試留下了 {}；記錄應該寫到暫存目錄".format(sorted(p.name for p in after - before)))
+
+    def test_deploy_logs_live_under_deploy_logs_not_project_logs(self):
+        """部署的記錄與報告放 deploy/logs/,不和 sftp 傳輸的 D_/U_*.csv(專案根目錄 logs/)混放。
+
+        三個寫入者都要一起搬:只搬一個,另外兩份報告就還留在舊目錄,而 scheduler 的
+        cleanup_rules.json(sftp-health-reports)只會掃其中一個地方。
+        """
+        source = (DEPLOY_DIR / "deploy_offline.sh").read_text(encoding="utf-8")
+        self.assertIn('local dir="${SCRIPT_DIR}/logs"', source)
+        self.assertNotIn('"${PROJECT_DIR}/logs"', source)
+        health = (DEPLOY_DIR / "health_check.py").read_text(encoding="utf-8")
+        self.assertIn('log_dir = SCRIPT_DIR / "logs"', health)
+        self.assertNotIn('PROJECT_DIR / "logs"', health)
+        import importlib.util
+        spec = importlib.util.spec_from_file_location(
+            "_ahc_for_paths", str(DEPLOY_DIR / "automation_health_check.py"))
+        module = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(module)
+        self.assertEqual(module.REPORT_DIR, DEPLOY_DIR.resolve() / "logs")
 
     def test_release_has_no_portable_python_payload_contract(self):
         source = (DEPLOY_DIR / "deploy_offline.sh").read_text(encoding="utf-8")
@@ -1216,7 +1240,7 @@ class UnattendedReconcileTests(unittest.TestCase):
         body = self._stage_body("start_transcript")
         self.assertLess(
             body.index('if [ "$UNATTENDED" -eq 1 ]; then'),
-            body.index('local dir="${PROJECT_DIR}/logs"'),
+            body.index('local dir="${SCRIPT_DIR}/logs"'),
             "無人模式必須在算出記錄路徑之前就 return",
         )
 

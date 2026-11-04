@@ -167,11 +167,11 @@ sftp_transfer 使用**專屬虛擬環境**（與 radar / SHM 等其他專案慣�
 # 2) 安裝後健康檢查（能力測試 + SFTP 連線 + 健康報告）
 #    務必用 venv 內的 python 執行：
 ~/venv/wanhai_nssms/share/sftp_transfer/bin/python deploy/health_check.py
-#    報告會寫到  logs/health_report_<時間>.md
+#    報告會寫到 deploy/logs/health_report_<時間>.md
 
 # 3) 巡檢開機自動化、timer、heartbeat 等隱性設定（使用系統 python3 即可）
 python3 deploy/automation_health_check.py
-#    報告會寫到 logs/automation_health_report_<時間>.md
+#    報告會寫到 deploy/logs/automation_health_report_<時間>.md
 ```
 
 `deploy_offline.sh` 會優先使用船端的 `python3.10`，沒有時使用 `python3`。
@@ -217,7 +217,7 @@ sudo 密碼檔可以放**多組**密碼，一行一個（空白行略過），�
 > 的話整個船隊都會拿到 `664`（船上會自動收緊並警告，但該修的是源頭）。
 
 > **不要把密碼寫死在 `deploy_offline.sh` 裡。** 它在版本控制裡，而且全程 `tee` 進
-> `logs/`，而 `logs/` 會被 fleet log 收上岸——那兩個地方都刪不乾淨。密碼檔的內容只
+> `deploy/logs/`，而那個目錄會被 fleet log 收上岸——那兩個地方都刪不乾淨。密碼檔的內容只
 > 由一支臨時 askpass helper 讀取，不進命令列參數（`ps` 看得到），也不進任何一行記錄。
 
 ### 每日自動補裝（`--unattended`）
@@ -246,7 +246,7 @@ root 的一次性設定**——clink 遷移 + gpio 群組、docker 群組、udis
 | 身分檔無效時中止 | 沒有身分就判不出實體 IPC，會在錯的機器上裝錯的東西 |
 | 單項失敗不中止整輪 | tmux 裝不起來、離線包不完整，都不該讓與它們無關的 sudoers、群組、polkit 一起停擺 |
 
-**離開碼**（這是岸上唯一看得到的訊號——船上的 `logs/` 不會被收上岸、journald 重開機就清空）：
+**離開碼**（這是岸上唯一看得到的訊號——船上的 `deploy/logs/` 不會被收上岸、journald 重開機就清空）：
 
 | 碼 | 意義 | 要修的是 |
 | --- | --- | --- |
@@ -308,7 +308,8 @@ python3 deploy/booster_integrity.py ~/Documents/wanhai_nssms/share/sftp_transfer
 
 ### 部署會留下哪些檔案
 
-`logs/` 下每次部署會多三份，三份的用途不同：
+`deploy/logs/` 下每次部署會多三份，三份的用途不同（v0.29.0 起；之前放在專案根目錄的 `logs/`，
+跟 sftp 傳輸自己的 `D_*.csv` / `U_*.csv` 混在一起，難找、也讓清理規則只能逐一指名檔名）：
 
 | 檔案 | 內容 |
 | --- | --- |
@@ -319,7 +320,9 @@ python3 deploy/booster_integrity.py ~/Documents/wanhai_nssms/share/sftp_transfer
 兩份 Markdown 是部署完成後的狀態快照；要查「哪一步失敗、操作者選了什麼、pip 卡在哪個
 wheel」只能看 `.log` 那一份，船上回報問題時寄它。路徑會印在部署總結的最後一行。
 指定 `--no-health-check` 時只會少兩份 Markdown，逐字記錄照留；`--help` 與參數錯誤不留檔。
-三種檔案都帶時間戳、不覆蓋、也不自動清理。
+三種檔案都帶時間戳、不覆蓋。`automation_health_report_*.md` 由 scheduler 的 `nssms-cleanup-old-files`
+（`cleanup_rules.json` 的 `sftp-health-reports`）清掉 30 天以上的；其餘兩種不自動清理。
+`deploy/logs/` 跟 `logs/` 一樣不進版控、也不會被 OTA 上傳或下載（ignore 檔的 `logs/` 不限層級）。
 
 ### 自動化存活巡檢
 

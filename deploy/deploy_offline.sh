@@ -100,7 +100,7 @@
 #     2  參數錯(例如與 --check-only 併用)
 #     3  有項目因為拿不到 sudo 而沒做(要修的是密碼檔,見下一節)
 #   非 0 會讓 systemd 把 unit 標成 failed —— 那是岸上唯一看得到的訊號,因為船上的
-#   logs/ 不會被收上岸、journald 重開機就清空。
+#   deploy/logs/ 不會被收上岸、journald 重開機就清空。
 #
 # 免人工輸入密碼(選用,但 --unattended 依賴它):
 #   階段 A 有兩種密碼要人在鍵盤前輸入 —— 本機 sudo(A3/A4/A4b/A6/A8)與遠端主機
@@ -124,7 +124,7 @@
 #   各船下載覆蓋)。所以放在那裡的密碼檔是「改一次、全船隊都有」,同時 git diff 乾淨
 #   也不代表沒有東西要發佈。SFTP 是鏡像語意、權限會跟著傳,所以發布端那一份務必是
 #   600 —— 存成 664 的話整個船隊都會拿到 664(船上會自動收緊並警告,但該修的是源頭)。
-#   **不要把密碼寫死在這支腳本裡**:它在版本控制裡,而且全程 tee 進 logs/(那個目錄會
+#   **不要把密碼寫死在這支腳本裡**:它在版本控制裡,而且全程 tee 進 deploy/logs/(那個目錄會
 #   被 fleet log 收上岸)。密碼檔至少是 ignored 的、也不會被寫進任何一行記錄。
 #
 # 特性：
@@ -133,11 +133,13 @@
 #   * venv 與系統 site-packages 隔離。
 #   * 在任何系統變更前驗證平台、tmux deb 與其 sha256 manifest。
 #   * 安裝後在 venv 內驗證關鍵套件可正常匯入。
-#   * 全程輸出（stdout + stderr）逐字寫進 logs/deploy_offline_<時間>.log，與兩支巡檢器
-#     的 Markdown 報告放在同一個 logs/。報告記結果，這一份記過程；船上回報問題寄它。
+#   * 全程輸出（stdout + stderr）逐字寫進 deploy/logs/deploy_offline_<時間>.log，與兩支
+#     巡檢器的 Markdown 報告放在同一個 deploy/logs/。報告記結果，這一份記過程；船上回報
+#     問題寄它。刻意不放專案根目錄的 logs/:那裡是 sftp 傳輸自己的 D_/U_*.csv，混在一起
+#     既難找、也讓 scheduler cleanup_rules.json 的規則必須逐一指名檔名才不會誤刪。
 #   * tmux 依平台選用 Bionic/Jammy deb；缺 sudo 時安全停止，不使用 rootless 解包。
 #   * 密碼(若使用密碼檔)只經由 askpass helper 讀檔交給 sudo / ssh，絕不出現在命令列
-#     參數或輸出裡 —— 命令列參數 ps 看得到，而輸出會整份落進 logs/。
+#     參數或輸出裡 —— 命令列參數 ps 看得到，而輸出會整份落進 deploy/logs/。
 # ---------------------------------------------------------------------------
 set -euo pipefail
 
@@ -224,11 +226,11 @@ ok()    { printf "%s[ OK ]%s %s\n"  "$G" "$N" "$*"; }
 warn()  { printf "%s[WARN]%s %s\n"  "$Y" "$N" "$*"; }
 err()   { printf "%s[FAIL]%s %s\n"  "$R" "$N" "$*" >&2; }
 
-# --- 完整終端記錄（logs/deploy_offline_<時間>.log）--------------------------
+# --- 完整終端記錄（deploy/logs/deploy_offline_<時間>.log）-------------------
 # 兩支巡檢器各自會寫 Markdown 報告，但那兩份是「部署完成後的狀態」；部署當下的過程
 # ——哪個安裝器 exit 幾、操作者選了 Y 還是 n、pip 卡在哪個 wheel、sudo 有沒有輸入
 # ——原本只存在於終端機，關掉視窗就沒了。船上排錯時能寄回岸上的只有檔案，所以這一份
-# 逐字記錄跟兩份報告一樣落在 logs/。
+# 逐字記錄跟兩份報告一樣落在 deploy/logs/。
 #
 # 做法：把 stdout 與 stderr 一起接到 tee，一份原樣進終端機（保留顏色），一份經 sed
 # 去掉 ANSI 逃脫碼、再逐行加上時間戳後進檔案（讓 log 能 grep、能貼進工單）。合流
@@ -278,8 +280,8 @@ start_transcript() {
   if [ "$UNATTENDED" -eq 1 ]; then
     return 0
   fi
-  local dir="${PROJECT_DIR}/logs"
-  # 測試會真的把這支腳本跑起來(--check-only),而記錄檔預設寫進**專案的** logs/ ——
+  local dir="${SCRIPT_DIR}/logs"     # deploy/logs/,與傳輸 CSV 的 logs/ 分開(見檔頭)
+  # 測試會真的把這支腳本跑起來(--check-only),而記錄檔預設寫進 deploy/logs/ ——
   # 那個目錄會被 fleet log 收走上傳。WH102-2 就出現過這個形狀:船上的 logs/ 躺著一份
   # 平台寫著 ubuntu-18.04 的部署記錄,實際上是 tests/test_offline_deploy.py 用
   # NSSMS_TEST_OVERRIDES 假造 Bionic 跑出來的產物 —— 但操作者讀到的是「這台 Jammy 被
@@ -421,7 +423,7 @@ unattended_note_fail() {  # $1=一句話說明
 #   2) 遠端主機密碼 —— 只有 A9 的 ssh-copy-id(照片同步金鑰，僅實體 IPC-2)
 # 兩者都可以改由事先放好的密碼檔提供，讓整段階段 A 不必有人守在鍵盤前一題一題打。
 #
-# 為什麼是密碼檔而不是寫死在這支腳本裡:這支腳本在版本控制裡，而且全程 tee 進 logs/
+# 為什麼是密碼檔而不是寫死在這支腳本裡:這支腳本在版本控制裡，而且全程 tee 進 deploy/logs/
 # (那個目錄會被 fleet log 收上岸)。寫死等於把密碼寫進 commit 歷史與每一份部署記錄，
 # 而那兩個地方都刪不乾淨。密碼檔則是 ignored 的、也從不出現在任何一行輸出裡。
 #
@@ -2363,7 +2365,7 @@ stage_health_check() {
 # --- 隱性自動化存活巡檢 ----------------------------------------------------
 # 放在部署流程最後，以實際 systemd 狀態驗證：user manager / linger / unit /
 # timer / sudoers / heartbeat / tmux。使用 --compact --fail-on-warn，部署畫面
-# 只顯示 WARN/FAIL 與總結；完整明細仍寫入 logs/automation_health_report_<時間>.md。
+# 只顯示 WARN/FAIL 與總結；完整明細仍寫入 deploy/logs/automation_health_report_<時間>.md。
 # wave 尚未提供時由巡檢器列為 SKIP，不影響整體健康。
 stage_automation_check() {
   AUTOMATION_CHECKER="${SCRIPT_DIR}/automation_health_check.py"

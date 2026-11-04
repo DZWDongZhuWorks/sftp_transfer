@@ -60,7 +60,9 @@ ETC_LOCALTIME = Path("/etc/localtime")
 # 白名單舊拼法指向的路徑。它在本機存不存在，決定了「白名單還沒更新」是壞掉還是漂移
 # （見 check_sudoers）。
 LEGACY_SYSTEMCTL = Path("/usr/bin/systemctl")
-REPORT_DIR = PROJECT_DIR / "logs"
+# deploy/logs/:部署相關的記錄與報告不和 sftp 傳輸的 D_/U_*.csv(專案根目錄的 logs/)混放。
+# scheduler/script/cleanup_rules.json 的 sftp-health-reports 規則指著這裡 —— 改這裡要一起改。
+REPORT_DIR = Path(__file__).resolve().parent / "logs"
 
 # 接管持續超過這麼久就從 INFO 升為 WARN。真實接管撐過一天代表 ipc1 一直沒修好，
 # 該有人知道；為了測試而手動建立、事後忘了清除的殘留狀態檔也會從這裡浮出來。

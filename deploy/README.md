@@ -51,6 +51,7 @@ Python runtime 本身一律沿用船端映像既有的預安裝版本：不下�
 | `deploy_offline.sh` | 離線安裝腳本（全程 `--no-index`，不連外網） |
 | `health_check.py` | 安裝後能力測試 + SFTP 連線測試 + 產生健康報告 |
 | `automation_health_check.py` | systemd user service、timer、linger、sudoers、heartbeat、tmux 與 unit 同步狀態的一鍵唯讀巡檢 |
+| `booster_integrity.py` | sftp_transfer / scheduler 對照發佈端 `VERSION.stamp.json` 的唯讀完整性檢查（deploy 的 A1b，見下方〈booster 完整性與版本〉） |
 
 ```text
 deploy/
@@ -166,11 +167,11 @@ sftp_transfer 使用**專屬虛擬環境**（與 radar / SHM 等其他專案慣�
 # 2) 安裝後健康檢查（能力測試 + SFTP 連線 + 健康報告）
 #    務必用 venv 內的 python 執行：
 ~/venv/wanhai_nssms/share/sftp_transfer/bin/python deploy/health_check.py
-#    報告會寫到  logs/health_report_<時間>.md
+#    報告會寫到 deploy/logs/health_report_<時間>.md
 
 # 3) 巡檢開機自動化、timer、heartbeat 等隱性設定（使用系統 python3 即可）
 python3 deploy/automation_health_check.py
-#    報告會寫到 logs/automation_health_report_<時間>.md
+#    報告會寫到 deploy/logs/automation_health_report_<時間>.md
 ```
 
 `deploy_offline.sh` 會優先使用船端的 `python3.10`，沒有時使用 `python3`。
@@ -216,7 +217,7 @@ sudo 密碼檔可以放**多組**密碼，一行一個（空白行略過），�
 > 的話整個船隊都會拿到 `664`（船上會自動收緊並警告，但該修的是源頭）。
 
 > **不要把密碼寫死在 `deploy_offline.sh` 裡。** 它在版本控制裡，而且全程 `tee` 進
-> `logs/`，而 `logs/` 會被 fleet log 收上岸——那兩個地方都刪不乾淨。密碼檔的內容只
+> `deploy/logs/`，而那個目錄會被 fleet log 收上岸——那兩個地方都刪不乾淨。密碼檔的內容只
 > 由一支臨時 askpass helper 讀取，不進命令列參數（`ps` 看得到），也不進任何一行記錄。
 
 ### 每日自動補裝（`--unattended`）
@@ -245,7 +246,7 @@ root 的一次性設定**——clink 遷移 + gpio 群組、docker 群組、udis
 | 身分檔無效時中止 | 沒有身分就判不出實體 IPC，會在錯的機器上裝錯的東西 |
 | 單項失敗不中止整輪 | tmux 裝不起來、離線包不完整，都不該讓與它們無關的 sudoers、群組、polkit 一起停擺 |
 
-**離開碼**（這是岸上唯一看得到的訊號——船上的 `logs/` 不會被收上岸、journald 重開機就清空）：
+**離開碼**（這是岸上唯一看得到的訊號——船上的 `deploy/logs/` 不會被收上岸、journald 重開機就清空）：
 
 | 碼 | 意義 | 要修的是 |
 | --- | --- | --- |
@@ -267,9 +268,48 @@ root 的一次性設定**——clink 遷移 + gpio 群組、docker 群組、udis
 bash deploy/deploy_offline.sh --unattended
 ```
 
+### booster 完整性與版本
+
+sftp_transfer 與 scheduler 是 OTA 的控制面（booster）：其他專案都靠它們下載，它們也靠
+自己下載自己。它們的檔壞掉時，原本**沒有任何一層會報警**——實測 `main.py` 被截成 0 byte：
+
+- 空的 `.py` 執行起來 rc=0，`run_all_downloads.py` 回報「全部成功」，所有 timer 都是 success；
+- `health_check.py` 的 `import main` 照樣 PASS（只有互動部署的 pytest 碰巧抓得到）；
+- 下載器就是 `main.py`，所以**每日 warm 也抓不回好的版本**。同大小的 bit rot 則會被下載的
+  略過分支（只比 size/mtime）永遠當成「已完整下載」。warm 只修得好「大小變了、而且下載器
+  本身還能跑」的檔。
+
+所以每次 `deploy_offline.sh`（人工、`--check-only`、每日 `--unattended` 都一樣）會：
+
+1. **開頭記錄版本**（在任何 exit 之前）：兩者的 `VERSION.json` 版號，以及 `VERSION.stamp.json`
+   的版號、commit、產生時間；兩者版號不同時 warn（鏡像更新到一半）。兩份總結也各多一欄
+   「booster 版本」。
+2. **A1b `stage_booster_integrity`**（唯讀，排在 scheduler 安裝器動系統之前）：執行
+   `booster_integrity.py`，拿 stamp 的每檔 sha256 比對。
+
+判定（細節見 `booster_integrity.py` 檔頭）——鏡像更新不是原子的，stamp 不符本身不夠：
+
+| 結果 | 條件 | 部署的反應 |
+| --- | --- | --- |
+| **損毀**（FAIL） | stamp 不符，**而且**：0 byte（發佈版不是空檔）、`.py` 編譯失敗、`.sh` 過不了 `bash -n`、`.json` 解析失敗，或與下載 manifest 記下的整檔 sha256 / 大小不同（下載後變質） | 印出修法；`--unattended` 記進 `UNATTENDED_FAIL` → 離開碼 1、unit failed |
+| 版本交錯（WARN） | stamp 不符，但內容就是某次完整下載的結果 | 只 warn（warm 下一輪會補齊） |
+| 不一致 / 缺少（WARN） | stamp 不符而沒有證據分辨；或 stamp 有、本地沒有 | 只 warn；好幾天都還在就用 `--force-redownload` 重抓 |
+| 檢查器沒交結論 | 輸出裡沒有 `BOOSTER_INTEGRITY status=` 那一行（檢查器自己被截成 0 byte 時 rc 也是 0） | 當成損毀處理 |
+
+不是部署的必要條件：沒有任何一種結果會中止部署（擋下部署修不好壞檔）。CLINK 開發機帶
+`--dev`：工作樹與發佈版不同是常態，只有空檔與語法壞掉算損毀。
+
+單獨跑一次：
+
+```bash
+python3 deploy/booster_integrity.py ~/Documents/wanhai_nssms/share/sftp_transfer \
+                                    ~/Documents/wanhai_nssms/share/scheduler
+```
+
 ### 部署會留下哪些檔案
 
-`logs/` 下每次部署會多三份，三份的用途不同：
+`deploy/logs/` 下每次部署會多三份，三份的用途不同（v0.29.0 起；之前放在專案根目錄的 `logs/`，
+跟 sftp 傳輸自己的 `D_*.csv` / `U_*.csv` 混在一起，難找、也讓清理規則只能逐一指名檔名）：
 
 | 檔案 | 內容 |
 | --- | --- |
@@ -280,7 +320,9 @@ bash deploy/deploy_offline.sh --unattended
 兩份 Markdown 是部署完成後的狀態快照；要查「哪一步失敗、操作者選了什麼、pip 卡在哪個
 wheel」只能看 `.log` 那一份，船上回報問題時寄它。路徑會印在部署總結的最後一行。
 指定 `--no-health-check` 時只會少兩份 Markdown，逐字記錄照留；`--help` 與參數錯誤不留檔。
-三種檔案都帶時間戳、不覆蓋、也不自動清理。
+三種檔案都帶時間戳、不覆蓋。`automation_health_report_*.md` 由 scheduler 的 `nssms-cleanup-old-files`
+（`cleanup_rules.json` 的 `sftp-health-reports`）清掉 30 天以上的；其餘兩種不自動清理。
+`deploy/logs/` 跟 `logs/` 一樣不進版控、也不會被 OTA 上傳或下載（ignore 檔的 `logs/` 不限層級）。
 
 ### 自動化存活巡檢
 

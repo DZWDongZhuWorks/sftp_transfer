@@ -798,6 +798,106 @@ def check_timers(strict_wave: bool, role: str = "ipc2", vessel: str = "") -> Non
             )
 
 
+# ---------------------------------------------------------------------------
+# unit 執行腳本完整性
+# ---------------------------------------------------------------------------
+# 【為什麼】被截成 0 byte 的 .sh / .py 執行起來 rc=0、什麼都不做 —— systemd 照樣顯示
+# success,check_failed_units 與上面的「最近執行結果」都看不出來。scheduler 的
+# lib/unit_log.sh 只擋得住經過它的那幾支 unit;多數 unit 是 `ExecStart=/bin/bash xxx.sh`
+# 或 `/usr/bin/python3 xxx.py` 直接跑。這裡對**所有** unit(常駐服務、timer 的 service、
+# nssms-boot)的 Exec* 行裡出現的腳本檢查一次,不必改任何 unit 檔。
+#
+# 只判「確定會無聲失敗」的兩種:空檔(發佈的腳本不會是空的)與 .sh 過不了 bash -n。
+# .py 不編譯:語法壞掉的 .py 自己會以非 0 結束(failed unit 那一節就看得到),而且這支
+# 巡檢器用系統 python3 跑,目標可能是給另一個版本的直譯器的。路徑不存在由「ExecStart
+# 目標」那一節負責,這裡不重複報。
+EXEC_KEYS = ("ExecStart=", "ExecStartPre=", "ExecStartPost=", "ExecStop=", "ExecReload=")
+# systemd 允許 Exec* 值前面加的特殊前綴(- @ : + !),見 systemd.service(5)。
+_EXEC_PREFIX_CHARS = "-@:+!"
+BOOT_UNIT_SOURCE = SCHEDULER_DIR / "boot" / "nssms-boot.service"
+
+
+def parse_exec_scripts(service_file):
+    """unit 檔所有 Exec* 行裡出現的 .sh / .py 絕對路徑(依出現順序、不重複)。
+
+    包在 lib/unit_log.sh 後面的目標(例如 deploy_offline.sh)也是一個 token,一樣收進來。
+    """
+    found = []  # type: List[Path]
+    try:
+        lines = service_file.read_text(encoding="utf-8").splitlines()
+    except (OSError, UnicodeDecodeError):
+        return found
+    for raw in lines:
+        line = raw.strip()
+        key = next((k for k in EXEC_KEYS if line.startswith(k)), None)
+        if key is None:
+            continue
+        value = line[len(key):].replace("%h", str(Path.home()))
+        try:
+            tokens = shlex.split(value)
+        except ValueError:
+            continue
+        for token in tokens:
+            token = token.lstrip(_EXEC_PREFIX_CHARS)
+            if token.startswith("/") and token.endswith((".sh", ".py")):
+                path = Path(token)
+                if path not in found:
+                    found.append(path)
+    return found
+
+
+def script_defect(path):
+    """腳本確定會無聲失敗的原因;正常或不歸這裡判(不存在、讀不到)回 None。"""
+    try:
+        if not path.is_file():
+            return None
+        if path.stat().st_size == 0:
+            return "空檔(0 byte),執行起來 rc=0、什麼都不做"
+    except OSError:
+        return None
+    if path.suffix == ".sh" and shutil.which("bash"):
+        proc = subprocess.run(["bash", "-n", str(path)],
+                              stdout=subprocess.DEVNULL, stderr=subprocess.PIPE)
+        if proc.returncode != 0:
+            tail = proc.stderr.decode("utf-8", "replace").strip().splitlines()
+            return "bash -n 失敗(截斷或損毀):" + (tail[-1][:120] if tail else "rc={}".format(proc.returncode))
+    return None
+
+
+def check_exec_scripts(role: str = "ipc1", vessel: str = "") -> None:
+    heading("unit 執行腳本完整性")
+    units = []  # type: List[Tuple[str, Path]]
+    if BOOT_UNIT_SOURCE.exists():
+        units.append(("nssms-boot.service", BOOT_UNIT_SOURCE))
+    if SERVICES_DIR.is_dir():
+        units.extend((p.name, p) for p in sorted(SERVICES_DIR.glob("*.service")))
+    for stem in TIMERS:
+        source = TIMERS_DIR / "{}.service".format(stem)
+        if source.exists():
+            units.append((source.name, source))
+    if not units:
+        record("scripts", "unit 母體", "WARN", "找不到任何 unit 母體,無從檢查")
+        return
+
+    checked = applicable = 0
+    for unit, source in units:
+        if unit != "nssms-boot.service" and unit_na_reason(unit, role, vessel) is not None:
+            continue   # 本機不適用的 unit:上面幾節已經交代過,它的腳本壞不壞與這台無關
+        applicable += 1
+        scripts = parse_exec_scripts(source)
+        defects = []
+        for script in scripts:
+            reason = script_defect(script)
+            if reason is not None:
+                defects.append("{} —— {}".format(script, reason))
+        checked += len(scripts)
+        if defects:
+            record("scripts", unit, "FAIL", ";".join(defects))
+    if not any(c.section == "scripts" and c.status == "FAIL" for c in RESULTS):
+        record("scripts", "所有 unit 的執行腳本", "PASS",
+               "檢查了本機適用的 {} 支 unit、{} 個腳本:沒有空檔,.sh 都過 bash -n".format(applicable, checked))
+
+
 def check_failed_units(strict_wave: bool) -> None:
     heading("systemd failed units")
     proc = run(
@@ -1122,6 +1222,7 @@ def main() -> int:
     check_core_services(role)
     check_unit_sources(role, vessel)
     check_timers(args.strict_wave, role, vessel)
+    check_exec_scripts(role, vessel)
     check_failed_units(args.strict_wave)
     check_sudoers()
     heartbeat_probe(role)

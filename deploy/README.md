@@ -51,6 +51,7 @@ Python runtime 本身一律沿用船端映像既有的預安裝版本：不下�
 | `deploy_offline.sh` | 離線安裝腳本（全程 `--no-index`，不連外網） |
 | `health_check.py` | 安裝後能力測試 + SFTP 連線測試 + 產生健康報告 |
 | `automation_health_check.py` | systemd user service、timer、linger、sudoers、heartbeat、tmux 與 unit 同步狀態的一鍵唯讀巡檢 |
+| `booster_integrity.py` | sftp_transfer / scheduler 對照發佈端 `VERSION.stamp.json` 的唯讀完整性檢查（deploy 的 A1b，見下方〈booster 完整性與版本〉） |
 
 ```text
 deploy/
@@ -265,6 +266,44 @@ root 的一次性設定**——clink 遷移 + gpio 群組、docker 群組、udis
 
 ```bash
 bash deploy/deploy_offline.sh --unattended
+```
+
+### booster 完整性與版本
+
+sftp_transfer 與 scheduler 是 OTA 的控制面（booster）：其他專案都靠它們下載，它們也靠
+自己下載自己。它們的檔壞掉時，原本**沒有任何一層會報警**——實測 `main.py` 被截成 0 byte：
+
+- 空的 `.py` 執行起來 rc=0，`run_all_downloads.py` 回報「全部成功」，所有 timer 都是 success；
+- `health_check.py` 的 `import main` 照樣 PASS（只有互動部署的 pytest 碰巧抓得到）；
+- 下載器就是 `main.py`，所以**每日 warm 也抓不回好的版本**。同大小的 bit rot 則會被下載的
+  略過分支（只比 size/mtime）永遠當成「已完整下載」。warm 只修得好「大小變了、而且下載器
+  本身還能跑」的檔。
+
+所以每次 `deploy_offline.sh`（人工、`--check-only`、每日 `--unattended` 都一樣）會：
+
+1. **開頭記錄版本**（在任何 exit 之前）：兩者的 `VERSION.json` 版號，以及 `VERSION.stamp.json`
+   的版號、commit、產生時間；兩者版號不同時 warn（鏡像更新到一半）。兩份總結也各多一欄
+   「booster 版本」。
+2. **A1b `stage_booster_integrity`**（唯讀，排在 scheduler 安裝器動系統之前）：執行
+   `booster_integrity.py`，拿 stamp 的每檔 sha256 比對。
+
+判定（細節見 `booster_integrity.py` 檔頭）——鏡像更新不是原子的，stamp 不符本身不夠：
+
+| 結果 | 條件 | 部署的反應 |
+| --- | --- | --- |
+| **損毀**（FAIL） | stamp 不符，**而且**：0 byte（發佈版不是空檔）、`.py` 編譯失敗、`.sh` 過不了 `bash -n`、`.json` 解析失敗，或與下載 manifest 記下的整檔 sha256 / 大小不同（下載後變質） | 印出修法；`--unattended` 記進 `UNATTENDED_FAIL` → 離開碼 1、unit failed |
+| 版本交錯（WARN） | stamp 不符，但內容就是某次完整下載的結果 | 只 warn（warm 下一輪會補齊） |
+| 不一致 / 缺少（WARN） | stamp 不符而沒有證據分辨；或 stamp 有、本地沒有 | 只 warn；好幾天都還在就用 `--force-redownload` 重抓 |
+| 檢查器沒交結論 | 輸出裡沒有 `BOOSTER_INTEGRITY status=` 那一行（檢查器自己被截成 0 byte 時 rc 也是 0） | 當成損毀處理 |
+
+不是部署的必要條件：沒有任何一種結果會中止部署（擋下部署修不好壞檔）。CLINK 開發機帶
+`--dev`：工作樹與發佈版不同是常態，只有空檔與語法壞掉算損毀。
+
+單獨跑一次：
+
+```bash
+python3 deploy/booster_integrity.py ~/Documents/wanhai_nssms/share/sftp_transfer \
+                                    ~/Documents/wanhai_nssms/share/scheduler
 ```
 
 ### 部署會留下哪些檔案

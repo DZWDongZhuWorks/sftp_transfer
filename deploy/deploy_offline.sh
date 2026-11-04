@@ -188,6 +188,9 @@ TMUX_STATUS="未執行"
 SSH_KEY_STATUS="未執行"
 # TeamViewer 更新的結果。同上:兩份總結都會讀它,而 stage_teamviewer 有好幾個提早 return 的出口。
 TEAMVIEWER_STATUS="未執行"
+# booster(sftp_transfer / scheduler)的版本與完整性。同上:兩份總結都會讀它們。
+BOOSTER_VERSIONS="未讀取"
+BOOSTER_INTEGRITY_STATUS="未執行"
 
 # --- 免人工輸入密碼(見下方「密碼檔」一節)----------------------------------
 # 空字串＝沒有指定，會依序找下面兩個預設位置；兩個都不存在時，行為與本功能加入前
@@ -741,6 +744,52 @@ resolve_wheelhouse() {
   fi
 }
 
+# --- booster 版本(sftp_transfer / scheduler)--------------------------------
+# 部署記錄原本沒有寫「這次是用哪一版的 sftp_transfer / scheduler 部署的」,事後追問題只能
+# 猜。兩個來源都印:
+#   VERSION.json        宣告的版號(人工編輯、納入 git)
+#   VERSION.stamp.json  發佈端上傳前產生的事實:版號 + commit + 產生時間(見 version_stamp.py)
+# 兩者版號不同代表鏡像更新到一半(stamp 已是新版、其他檔還沒抓完,或反過來)—— 那正是下面
+# stage_booster_integrity 會看到「不一致」的時段,先在這裡講出來。
+#
+# 【刻意用 grep 而不是 python】這一段要在 preflight 驗 Python 之前、任何 exit 之前印出來
+# (preflight 失敗與 --check-only 的記錄最需要它),也不能依賴任何可能已經壞掉的 .py。
+# 頂層的 "version" 一定是第一個(version_stamp.write_stamp 的鍵順序),而 notes 裡的引號
+# 在 JSON 裡是 \" —— `"version"\s*:` 不會誤中。
+booster_version_of() {  # $1=根目錄 → 印出一行說明
+  local root="$1" declared stamp_ver stamp_commit stamp_built
+  declared="$(grep -oP '"version"\s*:\s*"\K[^"]+' "$root/VERSION.json" 2>/dev/null | head -1 || true)"
+  if [ ! -d "$root" ]; then
+    echo "（目錄不存在）"; return
+  fi
+  if [ -f "$root/VERSION.stamp.json" ]; then
+    stamp_ver="$(grep -oP '"version"\s*:\s*"\K[^"]+' "$root/VERSION.stamp.json" 2>/dev/null | head -1 || true)"
+    stamp_commit="$(grep -oP '"commit"\s*:\s*"\K[^"]+' "$root/VERSION.stamp.json" 2>/dev/null | head -1 || true)"
+    stamp_built="$(grep -oP '"build_time"\s*:\s*"\K[^"]+' "$root/VERSION.stamp.json" 2>/dev/null | head -1 || true)"
+    echo "${declared:-?}（stamp ${stamp_ver:-?} @ ${stamp_commit:-?}，產生於 ${stamp_built:-?}）"
+  else
+    echo "${declared:-?}（沒有 VERSION.stamp.json）"
+  fi
+}
+
+log_booster_versions() {
+  local name root line declared stamp_ver sep=""
+  BOOSTER_VERSIONS=""
+  for name in sftp_transfer scheduler; do
+    if [ "$name" = "sftp_transfer" ]; then root="$PROJECT_DIR"; else root="$SHARE_DIR/scheduler"; fi
+    line="$(booster_version_of "$root")"
+    info "$(printf '%-14s: %s' "$name" "$line")"
+    # 總結只放宣告的版號(括號前那一段);完整的 stamp 資訊在開頭這兩行。
+    BOOSTER_VERSIONS="${BOOSTER_VERSIONS}${sep}${name} ${line%%（*}"
+    sep="、"
+    declared="$(grep -oP '"version"\s*:\s*"\K[^"]+' "$root/VERSION.json" 2>/dev/null | head -1 || true)"
+    stamp_ver="$(grep -oP '"version"\s*:\s*"\K[^"]+' "$root/VERSION.stamp.json" 2>/dev/null | head -1 || true)"
+    if [ -n "$declared" ] && [ -n "$stamp_ver" ] && [ "$declared" != "$stamp_ver" ]; then
+      warn "$name 的 VERSION.json($declared)與 stamp($stamp_ver)版號不同 —— 鏡像可能更新到一半。"
+    fi
+  done
+}
+
 banner_and_preflight() {
   local preflight_failures=0
   local preflight_rc=4
@@ -750,6 +799,8 @@ banner_and_preflight() {
   # 開頭就報路徑（不只在總結）：--check-only 與各種 err + exit 1 都到不了 stage_summary，
   # 而那些正是最需要「記錄在哪」的情況。這一行本身也會進記錄，等於檔案自帶檔名。
   [ -n "$TRANSCRIPT" ] && info "完整終端記錄：$TRANSCRIPT"
+  # 用哪一版的 sftp_transfer / scheduler 部署 —— 排在任何 exit(含平台偵測)之前,見該函式。
+  log_booster_versions
 
   # --- 嚴格前置檢查：本函式完成前不得有任何持久變更 -------------------------
   # shellcheck source=deploy/lib/offline_common.sh
@@ -1093,6 +1144,76 @@ compute_identity() {
   fi
   # 開發機(CLINK)的 OTA 守門會讓「第一次開機自動下載程式碼」這件事不成立,後面要據此提醒。
   DEPLOY_VSL_UPPER="$(printf '%s' "$(vessel_get vsl_name)" | tr '[:lower:]' '[:upper:]')"
+}
+
+# --- booster 完整性(A1b;deploy/booster_integrity.py)----------------------------
+# sftp_transfer 與 scheduler 是 OTA 的控制面:其他專案都靠它們下載,它們也靠自己下載自己。
+# 實測過,main.py 被截成 0 byte 時整條路徑沒有任何一層報警 —— 空的 .py 執行起來 rc=0,
+# run_all_downloads 回報「全部成功」、health_check 的 import 照樣 PASS,而下載器就是 main.py,
+# 所以永遠抓不回好的版本。同大小的 bit rot 則會被下載的略過分支永遠當成「已完整下載」。
+# 換句話說,「每日 warm 會把壞檔更新回來」只對「大小變了、而且下載器本身還能跑」的檔成立。
+#
+# 這一步拿發佈端的 VERSION.stamp.json(每檔 sha256)比對;什麼算損毀、什麼只是更新到一半
+# 的不一致,判定規則在 booster_integrity.py 檔頭,這裡不重寫第二份。
+#
+# 【排在這裡】純讀取,所以 --check-only 也跑;排在 stage_scheduler_units 之前,因為那一步
+# 要拿 scheduler 的安裝器與 unit 檔去改系統 —— 先讓人看到它們是不是完整的。
+#
+# 【不是部署的必要條件】比照 stage_teamviewer:沒有任何 exit。擋下部署修不好壞檔,反而讓
+# 後面無關的補裝也停擺。損毀在無人模式下記進 UNATTENDED_FAIL —— 離開碼 1、unit 變 failed,
+# automation_health_check 撿得到;人工部署則大聲印出來並附修法。
+#
+# 【一定要看結論行,不能只看離開碼】檢查器自己也可能被截成 0 byte,而那樣執行起來就是
+# rc=0、什麼都不印 —— 正是它要抓的那種無聲失效。沒有 `BOOSTER_INTEGRITY status=` 那一行
+# 就當成檢查器損毀。
+stage_booster_integrity() {
+  local checker="$SCRIPT_DIR/booster_integrity.py" out verdict
+  local -a args=("$PROJECT_DIR" "$SHARE_DIR/scheduler")
+  BOOSTER_INTEGRITY_STATUS="未執行"
+  echo ""
+  info "檢查 booster(sftp_transfer / scheduler)完整性:對照發佈端的 VERSION.stamp.json ..."
+  [ "${DEPLOY_VSL_UPPER:-}" = "CLINK" ] && args+=(--dev)
+  RC=0
+  out="$("$PYTHON_BIN" "$checker" "${args[@]}" 2>&1)" || RC=$?
+  [ -n "$out" ] && printf '%s\n' "$out"
+  verdict="$(printf '%s\n' "$out" | grep -E '^BOOSTER_INTEGRITY status=' | tail -1 || true)"
+  if [ -z "$verdict" ]; then
+    BOOSTER_INTEGRITY_STATUS="檢查器本身損毀或缺席(沒有結論行,exit=$RC)"
+    err "$BOOSTER_INTEGRITY_STATUS:$checker"
+    err "這支檔也隨 sftp_transfer 的 OTA 散佈 —— 它壞了,代表同一棵樹上的其他檔也值得懷疑。"
+    unattended_note_fail "booster 完整性檢查器沒有交出結論(exit=$RC)" || true
+    return
+  fi
+  case "$RC" in
+    0)
+      BOOSTER_INTEGRITY_STATUS="OK"
+      [ "${DEPLOY_VSL_UPPER:-}" = "CLINK" ] && BOOSTER_INTEGRITY_STATUS="OK(開發機:只看空檔與語法)"
+      ok "booster 完整性:$BOOSTER_INTEGRITY_STATUS"
+      ;;
+    2)
+      BOOSTER_INTEGRITY_STATUS="有不一致(未確認損毀;$(printf '%s' "$verdict" | grep -oE 'mismatch=[0-9]+ skew=[0-9]+ missing=[0-9]+ unverified=[0-9]+'))"
+      warn "booster 完整性:$BOOSTER_INTEGRITY_STATUS"
+      warn "  多半是鏡像更新到一半(warm 下一輪會補齊)。好幾天都還在的話,用 main.py 的"
+      warn "  --force-redownload 重抓上方列出的檔(同大小的壞檔不會自己被重抓)。"
+      ;;
+    1)
+      BOOSTER_INTEGRITY_STATUS="⚠ 損毀 $(printf '%s' "$verdict" | grep -oE 'corrupt=[0-9]+' | cut -d= -f2) 個檔(見上方 [CORRUPT])"
+      err "booster 完整性:$BOOSTER_INTEGRITY_STATUS"
+      err "  下一輪 OTA **不一定**修得好:同大小的壞檔會被略過,而 main.py 壞了下載器根本跑不動。"
+      err "  修法(擇一):"
+      err "    * 下載器還能跑時,強制重抓那幾個檔(樣式同 ignore 檔,例 'reboot_script/update_booster.sh'):"
+      # 用 VENV_DIR 而不是 VENV_PY:後者到階段 B 才賦值,set -u 下在這裡讀它會直接中止部署。
+      err "        cd $PROJECT_DIR && \"$VENV_DIR/bin/python\" main.py --cli --mode download \\"
+      err "            --config config/<sftp|scheduler>_download_settings.json --force-redownload '<相對路徑>'"
+      err "    * main.py / downloader.py 本身壞了:從同船另一台 IPC 或離線包複製該檔(路徑相同)。"
+      unattended_note_fail "booster 有損毀的檔($verdict)" || true
+      ;;
+    *)
+      BOOSTER_INTEGRITY_STATUS="無法判斷(exit=$RC)"
+      err "booster 完整性:$BOOSTER_INTEGRITY_STATUS"
+      unattended_note_fail "booster 完整性檢查無法判斷(exit=$RC)" || true
+      ;;
+  esac
 }
 
 # --- 舊格式的接管狀態檔（已廢除）------------------------------------------
@@ -2311,6 +2432,8 @@ stage_summary() {
   # 直接印出啟動器實際會採用的有效角色,一眼可見。
   #（DEPLOY_ROLE / DEPLOY_VSL_UPPER 在身分檔定案後就算好了,見上方「由身分檔推導」段。）
   printf "  本機有效角色    ：%s\n" "$DEPLOY_ROLE"
+  printf "  booster 版本    ：%s\n" "$BOOSTER_VERSIONS"
+  printf "  booster 完整性  ：%s\n" "$BOOSTER_INTEGRITY_STATUS"
   printf "  開機自動執行設定：%s\n" "$AUTOSTART_STATUS"
   printf "  週期排程 timer   ：%s\n" "$SCHED_STATUS"
   printf "  常駐服務        ：%s\n" "$SERVICES_STATUS"
@@ -2407,6 +2530,8 @@ stage_summary() {
 stage_summary_unattended() {
   echo ""
   echo "──────── 每日補裝結果（--unattended）────────"
+  printf "  booster 版本    ：%s\n" "${BOOSTER_VERSIONS:-未讀取}"
+  printf "  booster 完整性  ：%s\n" "${BOOSTER_INTEGRITY_STATUS:-未執行}"
   printf "  開機自動執行    ：%s\n" "${AUTOSTART_STATUS:-未執行}"
   printf "  週期排程 timer  ：%s\n" "${SCHED_STATUS:-未執行}"
   printf "  sudo 白名單     ：%s\n" "${SUDOERS_STATUS:-未執行}"
@@ -2576,6 +2701,7 @@ main() {
   announce_check_only
   stage_vessel_info                  # A1 身分檔（含殘留接管旗標的判讀）
   compute_identity                   # 由身分檔推導 DEPLOY_ROLE / DEPLOY_VSL_UPPER
+  stage_booster_integrity            # A1b sftp_transfer / scheduler 對照 VERSION.stamp.json（唯讀）
   stage_legacy_failover_state        #    舊格式接管狀態檔
   stage_autostart                    # A2 nssms-boot.service + linger
   stage_clink_migration              # A3 舊 clink_* —— **必須早於 A7，否則撞 port**

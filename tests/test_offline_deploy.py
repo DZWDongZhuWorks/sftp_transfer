@@ -1,10 +1,12 @@
 import hashlib
 import io
+import json
 import os
 import re
 import tokenize
 import shutil
 import subprocess
+import sys
 import tempfile
 import unittest
 import zipfile
@@ -600,6 +602,8 @@ class ShipInterpreterCompatTests(unittest.TestCase):
     # python3 即可）。
     SYSTEM_PYTHON_FILES = (
         "deploy/automation_health_check.py",
+        # deploy_offline.sh 以 $PYTHON_BIN(系統 python3)執行,在階段 A、venv 建好之前。
+        "deploy/booster_integrity.py",
     )
 
     # 明確豁免、可以不維持 3.6 相容的檔，以及理由。空的也要留著這個機制：新增 3.7+ 的檔
@@ -1270,3 +1274,130 @@ class UnattendedReconcileTests(unittest.TestCase):
             self.assertIn("TeamViewer 更新", self._stage_body(summary), summary)
         self.assertIn('TEAMVIEWER_STATUS="未執行"\n', self.SOURCE.split("stage_teamviewer() {")[0],
                       "set -u 下兩份總結都會讀它:要在 file scope 先給值")
+
+    # --- booster 完整性 / 版本(A1b)-------------------------------------------
+
+    def test_booster_integrity_never_aborts_the_round(self):
+        """比照 TeamViewer:擋下部署修不好壞檔。損毀一律走 unattended_note_fail。"""
+        body = self._stage_body("stage_booster_integrity")
+        self.assertIsNone(re.search(r"^\s*exit\b", body, re.M), "stage_booster_integrity 裡不該有 exit")
+        self.assertIn('unattended_note_fail "booster 有損毀的檔', body)
+        self.assertIn('unattended_note_fail "booster 完整性檢查器沒有交出結論', body)
+
+    def test_booster_integrity_trusts_the_verdict_line_not_the_exit_code(self):
+        """空的 .py 執行起來 rc=0 —— 檢查器自己被截斷時,只看離開碼會得到「OK」。"""
+        body = self._stage_body("stage_booster_integrity")
+        self.assertIn("grep -E '^BOOSTER_INTEGRITY status='", body)
+        verdict_check = body.index('if [ -z "$verdict" ]; then')
+        self.assertLess(verdict_check, body.index('case "$RC" in'),
+                        "沒有結論行的判斷必須排在解讀離開碼之前")
+
+    def test_booster_integrity_runs_early_and_is_read_only(self):
+        """要在 scheduler 的安裝器動系統之前跑;它需要 DEPLOY_VSL_UPPER 判斷 CLINK。"""
+        main = self._stage_body("main")
+        self.assertLess(main.index("  compute_identity  "), main.index("  stage_booster_integrity  "))
+        self.assertLess(main.index("  stage_booster_integrity  "),
+                        main.index("  stage_scheduler_units  "))
+        body = self._stage_body("stage_booster_integrity")
+        self.assertNotIn("mutating", body)
+        self.assertIn("--dev", body)
+        # VENV_PY 到階段 B 才賦值;這裡讀它在 set -u 下會直接中止部署。
+        self.assertNotIn("$VENV_PY", body)
+
+    def test_booster_versions_are_logged_before_any_preflight_exit(self):
+        """版本要在 preflight 任何 exit 之前印出:preflight 失敗與 --check-only 的記錄最需要它。"""
+        body = self._stage_body("banner_and_preflight")
+        self.assertIn("log_booster_versions", body)
+        first_exit = re.search(r"^[^#\n]*\bexit\b", body, re.M)   # 只看程式碼,不看註解
+        self.assertIsNotNone(first_exit)
+        self.assertLess(body.index("\n  log_booster_versions\n"), first_exit.start())
+        for summary in ("stage_summary", "stage_summary_unattended"):
+            self.assertIn("booster 版本", self._stage_body(summary), summary)
+            self.assertIn("booster 完整性", self._stage_body(summary), summary)
+        head = self.SOURCE.split("booster_version_of() {")[0]
+        self.assertIn('BOOSTER_VERSIONS="未讀取"\n', head)
+        self.assertIn('BOOSTER_INTEGRITY_STATUS="未執行"\n', head)
+
+    def _run_booster_stage(self, mutate=None, unattended=1, vessel="WH102"):
+        """抽出三個函式,在 set -euo pipefail 下對暫存的 share/ 跑一次。回傳 stdout。"""
+        funcs = "\n".join(self._stage_body(n) for n in (
+            "booster_version_of", "log_booster_versions", "stage_booster_integrity"))
+        tmp = tempfile.mkdtemp()
+        self.addCleanup(shutil.rmtree, tmp)
+        share = os.path.join(tmp, "share")
+        for name, files in (
+            ("sftp_transfer", {"main.py": b"import sys\nsys.exit(0)\n", "run.sh": b"echo ok\n"}),
+            ("scheduler", {"reboot_launcher.sh": b"echo boot\n", "pkg/__init__.py": b""}),
+        ):
+            root = os.path.join(share, name)
+            for rel, data in files.items():
+                os.makedirs(os.path.dirname(os.path.join(root, rel)), exist_ok=True)
+                with open(os.path.join(root, rel), "wb") as fh:
+                    fh.write(data)
+            with open(os.path.join(root, "VERSION.json"), "w") as fh:
+                json.dump({"version": "1.0.0"}, fh)
+            with open(os.path.join(root, "VERSION.stamp.json"), "w") as fh:
+                json.dump({"version": "1.0.0", "commit": "abc1234",
+                           "build_time": "2026-11-04T00:00:00+00:00",
+                           "files": {rel: hashlib.sha256(d).hexdigest() for rel, d in files.items()}},
+                          fh)
+        os.makedirs(os.path.join(share, "sftp_transfer", "deploy"))
+        shutil.copy(str(PROJECT_DIR / "deploy" / "booster_integrity.py"),
+                    os.path.join(share, "sftp_transfer", "deploy"))
+        if mutate:
+            mutate(share)
+        script = "\n".join((
+            "set -euo pipefail",
+            'SHARE_DIR="$1"; PROJECT_DIR="$SHARE_DIR/sftp_transfer"; SCRIPT_DIR="$PROJECT_DIR/deploy"',
+            'UNATTENDED={}; DEPLOY_VSL_UPPER={}; PYTHON_BIN="{}"; VENV_DIR=/nonexistent'.format(
+                unattended, vessel, sys.executable),
+            'UNATTENDED_FAIL=0; BOOSTER_VERSIONS="未讀取"; BOOSTER_INTEGRITY_STATUS="未執行"',
+            'info(){ echo "[INFO] $*"; }; ok(){ echo "[ OK ] $*"; }',
+            'warn(){ echo "[WARN] $*"; }; err(){ echo "[FAIL] $*"; }',
+            'unattended_note_fail(){ [ "$UNATTENDED" -eq 1 ] || return 1; '
+            'UNATTENDED_FAIL=$((UNATTENDED_FAIL+1)); return 0; }',
+            funcs,
+            "log_booster_versions",
+            "stage_booster_integrity",
+            'echo "RESULT fail=$UNATTENDED_FAIL versions=[$BOOSTER_VERSIONS] status=[$BOOSTER_INTEGRITY_STATUS]"',
+        ))
+        proc = subprocess.run(["bash", "-c", script, "harness", share],
+                              stdout=subprocess.PIPE, stderr=subprocess.STDOUT)
+        out = proc.stdout.decode("utf-8")
+        self.assertEqual(proc.returncode, 0, out)
+        return out
+
+    def test_booster_stage_clean_tree(self):
+        out = self._run_booster_stage()
+        self.assertIn("RESULT fail=0 versions=[sftp_transfer 1.0.0、scheduler 1.0.0] status=[OK]", out)
+        self.assertIn("stamp 1.0.0 @ abc1234", out)
+
+    def test_booster_stage_flags_zero_byte_main_py(self):
+        def truncate(share):
+            open(os.path.join(share, "sftp_transfer", "main.py"), "wb").close()
+        out = self._run_booster_stage(truncate)
+        self.assertIn("[CORRUPT] main.py", out)
+        self.assertIn("RESULT fail=1", out)
+        self.assertIn("損毀 1 個檔", out)
+
+    def test_booster_stage_flags_a_truncated_checker(self):
+        def truncate(share):
+            open(os.path.join(share, "sftp_transfer", "deploy", "booster_integrity.py"), "wb").close()
+        out = self._run_booster_stage(truncate)
+        self.assertIn("RESULT fail=1", out)
+        self.assertIn("檢查器本身損毀", out)
+
+    def test_booster_stage_interactive_failure_does_not_count_as_unattended(self):
+        def truncate(share):
+            open(os.path.join(share, "scheduler", "reboot_launcher.sh"), "wb").close()
+        out = self._run_booster_stage(truncate, unattended=0)
+        self.assertIn("RESULT fail=0", out)
+        self.assertIn("--force-redownload", out)
+
+    def test_booster_stage_warns_on_version_skew(self):
+        def bump(share):
+            with open(os.path.join(share, "scheduler", "VERSION.json"), "w") as fh:
+                json.dump({"version": "2.0.0"}, fh)
+        out = self._run_booster_stage(bump)
+        self.assertIn("與 stamp(1.0.0)版號不同", out)
+        self.assertIn("RESULT fail=0 versions=[sftp_transfer 1.0.0、scheduler 2.0.0]", out)

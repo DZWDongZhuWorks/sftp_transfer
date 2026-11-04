@@ -1,5 +1,5 @@
 {
-  "version": "0.32.2",
+  "version": "0.32.3",
   "date": "2026-11-04",
-  "notes": "伺服器以狀態碼拒絕(OSError('Failure') 等,errno 為 None、只帶 SFTP_DESC 訊息)時不再當成斷線:不重連、同一條連線上退避 retry_delay×2^(n-1)(封頂 300 秒),同檔被拒 3 次放棄該檔、連續 3 檔即中止整趟(RemoteServerRejecting → RUN_ABORTED),retry_count 的無限次只適用於真斷線;上下載的逐檔重試與 LIST_RETRY 都套用。起因:2026-11-04 岸端 /fleet 磁碟滿,舊行為每檔 3 秒握手 8 次、無上限,船隊疊起來讓 sshd Exceeded MaxStartups。log_monitor TUI:--watch 時明細/說明彈窗、CSV 檢視、搜尋列閒置超過 max(watch, 600 秒)自動關閉,讓自動同步恢復;起因:10-28~11-04 TUI 行程活著卻 7 天沒同步(彈窗各自阻塞讀鍵),fleet_logs 停更、remote-log-retention 每天 fail-closed。測試:test_uploader/test_downloader 新增 TestServerStatusFailure*,test_tui 新增 _ModalKeys 與彈窗閒置關閉;另以 pty 實際驅動 TUI 驗證(main 上彈窗開 8 秒重載 0 次,修正後自動關閉並恢復重載)。"
+  "notes": "巡檢清單(deploy/automation_health_check.py 的 TIMERS)加入 scheduler v0.104.0 新增的 nssms-ecdis-snap-download(岸端收 ECDIS 截圖、收到就刪遠端;BaseIPC=ipc1 + Vessel=CLINK,船隊上是 N/A)。與 scheduler 那邊要一起送。"
 }

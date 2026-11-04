@@ -92,6 +92,9 @@ BOOT_ACTIVATING_FAIL_SECONDS = 900
 # nssms-fleet-status-retention（岸端 dashboard 報表的遠端保留政策）與上面那支是同一組
 # 閘門、同一個理由：BaseIPC=ipc1 AND Vessel=CLINK，船隊上同樣是 N/A，不需要特例。
 #
+# nssms-ecdis-snap-download（岸端收 ECDIS 截圖、收到就刪遠端）也是同一組閘門：
+# BaseIPC=ipc1 AND Vessel=CLINK，船隊上是 N/A，不需要特例。
+#
 # nssms-reboot 與 nssms-deploy-reconcile 反過來：全船隊都裝、唯獨開發機不裝 —— unit 內宣告
 # `# NSSMS-ExceptVessel=CLINK`（scheduler v0.64.0 起），本巡檢同樣自己讀。CLINK 上它們是
 # N/A：未安裝 = SKIP，仍殘留 = FAIL。讀不到船號時**照常要求安裝**,方向與 NSSMS-Vessel 相反,
@@ -108,6 +111,7 @@ TIMERS = (
     "nssms-device-monitor-report",
     "nssms-download-photos",
     "nssms-ecdis-screenshot-upload",
+    "nssms-ecdis-snap-download",
     "nssms-fleet-status-retention",
     "nssms-reboot",
     "nssms-remote-log-retention",

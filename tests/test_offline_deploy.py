@@ -1366,6 +1366,7 @@ class UnattendedReconcileTests(unittest.TestCase):
                            "files": {rel: hashlib.sha256(d).hexdigest() for rel, d in files.items()}},
                           fh)
         os.makedirs(os.path.join(share, "sftp_transfer", "deploy"))
+        os.makedirs(os.path.join(share, ".env"))
         shutil.copy(str(PROJECT_DIR / "deploy" / "booster_integrity.py"),
                     os.path.join(share, "sftp_transfer", "deploy"))
         if mutate:
@@ -1396,13 +1397,23 @@ class UnattendedReconcileTests(unittest.TestCase):
         self.assertIn("RESULT fail=0 versions=[sftp_transfer 1.0.0、scheduler 1.0.0] status=[OK]", out)
         self.assertIn("stamp 1.0.0 @ abc1234", out)
 
+    def test_booster_stage_remembers_mismatches_except_on_clink(self):
+        """持續不一致要靠狀態檔;它放 share/.env/(不在 OTA 範圍內)。CLINK 帶 --dev,不計持續。"""
+        def drift(share):
+            with open(os.path.join(share, "sftp_transfer", "run.sh"), "w") as fh:
+                fh.write("echo newer\n")
+        self._run_booster_stage(drift)
+        body = self._stage_body("stage_booster_integrity")
+        self.assertIn('args+=(--state "$SHARE_DIR/.env/booster_integrity_state.json")', body)
+        self.assertLess(body.index('args+=(--dev)'), body.index('args+=(--state'))
+
     def test_booster_stage_flags_zero_byte_main_py(self):
         def truncate(share):
             open(os.path.join(share, "sftp_transfer", "main.py"), "wb").close()
         out = self._run_booster_stage(truncate)
         self.assertIn("[CORRUPT] main.py", out)
         self.assertIn("RESULT fail=1", out)
-        self.assertIn("損毀 1 個檔", out)
+        self.assertIn("損毀 1 個、持續不一致 0 個", out)
 
     def test_booster_stage_flags_a_truncated_checker(self):
         def truncate(share):

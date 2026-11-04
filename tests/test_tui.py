@@ -1762,3 +1762,89 @@ def test_clock_row_survives_devices_without_offset(tmp_path):
     d.clock_offset = None
     assert tui._clock_cell(d) == ""
     assert tui.sort_value(d, "時鐘偏差") == 0
+
+
+# ── 彈窗閒置自動關閉（--watch 的同步不能被開著的彈窗擋住） ─────────────────────
+# 2026-10-28 ～ 11-04 岸端 TUI 行程活著、卻 7 天沒跑過一次同步：彈窗各自有讀鍵迴圈，
+# 主迴圈的自動重載回不來。
+
+
+class _IdleScreen(FakeScreen):
+    """getch 每呼叫一次，假時鐘就往前走一秒（等同 timeout(1000) 的真實行為）。"""
+
+    def __init__(self, keys=(), clock=None):
+        super().__init__(keys)
+        self.clock = clock if clock is not None else [0.0]
+        self.timeouts = []
+
+    def timeout(self, ms):
+        self.timeouts.append(ms)
+
+    def move(self, y, x):
+        pass
+
+    def getch(self):
+        self.clock[0] += 1.0
+        return super().getch()
+
+
+def test_modal_keys_without_watch_blocks_as_before():
+    screen = _IdleScreen(keys=[ord("x")])
+    keys = tui._ModalKeys(0, clock=lambda: screen.clock[0])
+    assert keys.getch(screen) == ord("x")
+    assert screen.timeouts == []             # 沒開 --watch 不動讀鍵設定
+
+
+def test_modal_keys_closes_after_idle_limit_under_watch():
+    screen = _IdleScreen()
+    keys = tui._ModalKeys(60, clock=lambda: screen.clock[0])
+    assert keys.limit == tui.MODAL_IDLE_CLOSE_SECONDS     # 取 max(watch, 下限)
+    assert keys.getch(screen) == tui.IDLE_CLOSE
+    assert screen.clock[0] == pytest.approx(tui.MODAL_IDLE_CLOSE_SECONDS)
+    assert screen.timeouts == [1000]
+
+
+def test_modal_keys_limit_follows_long_watch_interval():
+    keys = tui._ModalKeys(6000, clock=lambda: 0.0)
+    assert keys.limit == 6000
+
+
+def test_modal_keys_any_key_restarts_the_idle_clock():
+    clock = [0.0]
+    screen = _IdleScreen(clock=clock)
+    keys = tui._ModalKeys(60, clock=lambda: clock[0])
+    clock[0] = tui.MODAL_IDLE_CLOSE_SECONDS - 5
+    screen.keys = [curses.KEY_DOWN]
+    assert keys.getch(screen) == curses.KEY_DOWN      # 有人在看：不關
+    assert keys.getch(screen) == tui.IDLE_CLOSE
+    assert clock[0] >= (tui.MODAL_IDLE_CLOSE_SECONDS - 4) + tui.MODAL_IDLE_CLOSE_SECONDS
+
+
+def test_device_drilldown_idle_closed_csv_goes_straight_back():
+    """CSV 檢視閒置關掉後不能把明細彈窗再開回來重新計時（那樣同步又多晚一輪）。"""
+    dev = SimpleNamespace(latest=SimpleNamespace(path="x.csv"))
+    popups = []
+    with mock.patch.object(tui, "_popup", side_effect=lambda *a, **k: popups.append(1) or 13), \
+         mock.patch.object(tui, "device_detail_lines", return_value=["明細"]), \
+         mock.patch.object(tui, "_csv_viewer", return_value=tui.IDLE_CLOSE):
+        tui._device_drilldown(None, dev, 6000, repaint=lambda: None)
+    assert popups == [1]
+
+
+def test_device_drilldown_passes_watch_to_popup():
+    dev = SimpleNamespace(latest=SimpleNamespace(path="x.csv"))
+    with mock.patch.object(tui, "_popup", return_value=tui.IDLE_CLOSE) as popup, \
+         mock.patch.object(tui, "device_detail_lines", return_value=["明細"]):
+        tui._device_drilldown(None, dev, 6000, repaint=lambda: None)
+    assert popup.call_args[1]["watch"] == 6000          # call_args.kwargs 是 3.8 才有
+
+
+def test_prompt_search_idle_keeps_previous_query():
+    state = tui.TuiState()
+    tui.set_query(state, "177")
+    screen = _IdleScreen(keys=[ord("3")])
+    with mock.patch.object(tui.curses, "curs_set"), \
+         mock.patch.object(tui.time, "monotonic", side_effect=lambda: screen.clock[0]):
+        tui._prompt_search(screen, state, watch=60)
+    assert state.query == "177"                       # 打到一半人走了：不套用半截字
+    assert screen.timeouts[-1] == 1000                # 還原主迴圈的 1 秒輪詢

@@ -3173,3 +3173,28 @@ class TestDeleteSourceFilters:
         assert "已刪除來源 1，保留 1" in summary
         from run_selected_transfers import TRANSFER_SUMMARY_RE
         assert TRANSFER_SUMMARY_RE.search(summary).groups() == ("2", "0", "0")
+
+
+class TestServerStatusFailureDownload:
+    """下載端與上傳端共用同一套伺服器拒絕處理（見 test_uploader.TestServerStatusFailure）。"""
+
+    def test_persistent_refusal_does_not_reconnect_and_aborts(
+        self, downloader_factory, fake_sftp_factory, monkeypatch, caplog
+    ):
+        files = {f"/remote/{n}.txt": b"x" for n in "abcde"}
+        d = downloader_factory(wait_for_network=False, retry_count=0, retry_delay=10)
+        d._connect_with_retry = MagicMock(
+            side_effect=lambda: setattr(d, "sftp", fake_sftp_factory(files=files, mtimes={k: 1 for k in files}))
+        )
+        d._close = MagicMock()
+        d._download_one_file = MagicMock(side_effect=OSError("Failure"))
+        sleeps = []
+        monkeypatch.setattr(dl.time, "sleep", lambda s: sleeps.append(s))
+
+        with caplog.at_level(logging.INFO):
+            assert d.run() is False
+
+        assert d._download_one_file.call_count == dl.SERVER_STATUS_RETRY_LIMIT * dl.SERVER_STATUS_ABORT_AFTER_FILES
+        assert d._connect_with_retry.call_count == 1
+        assert sleeps == [10, 20] * dl.SERVER_STATUS_ABORT_AFTER_FILES
+        assert any("RUN_ABORTED" in r.message and "伺服器拒絕" in r.message for r in caplog.records)

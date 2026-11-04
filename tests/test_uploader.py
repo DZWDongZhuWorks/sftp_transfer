@@ -1498,3 +1498,147 @@ class TestReconnectGiveUp:
         assert aborted and "Network is unreachable" in aborted[0]
         from monitor.log_monitor import _RE_ABORT
         assert "Network is unreachable" in _RE_ABORT.search(aborted[0]).group(1)
+
+
+class TestServerStatusFailure:
+    """伺服器以狀態碼拒絕（OSError('Failure')，例如岸端磁碟滿）時不重連、要退避、要有上限。
+
+    2026-11-04 實例：岸端 /fleet 100% 滿，舊版每個檔 3 秒內握手 8 次、retry 無上限，
+    船隊疊起來把 sshd 打到 Exceeded MaxStartups。
+    """
+
+    def _prepare(self, uploader_factory, tmp_path, monkeypatch, names, fake, **overrides):
+        for name in names:
+            _write(tmp_path / name, b"data")
+        overrides.setdefault("retry_count", 0)          # 0 = 無上限，跟船上設定一樣
+        d = uploader_factory(wait_for_network=False, **overrides)
+        d._connect_with_retry = MagicMock(side_effect=lambda: setattr(d, "sftp", fake))
+        sleeps = []
+        monkeypatch.setattr(dl.time, "sleep", lambda s: sleeps.append(s))
+        return d, sleeps
+
+    def test_classifies_only_server_status_errors(self):
+        import errno
+        import socket
+        assert dl.is_server_status_error(OSError("Failure"))
+        assert dl.is_server_status_error(IOError("Operation unsupported"))
+        assert dl.is_server_status_error(OSError("Bad message"))
+        assert not dl.is_server_status_error(OSError("Socket is closed"))
+        assert not dl.is_server_status_error(OSError(errno.ENOSPC, "Failure"))
+        assert not dl.is_server_status_error(PermissionError(errno.EACCES, "Permission denied"))
+        assert not dl.is_server_status_error(socket.timeout("timed out"))
+        assert not dl.is_server_status_error(EOFError())
+        assert not dl.is_server_status_error(paramiko_ssh_exception("Failure"))
+
+    def test_transient_refusal_retries_on_same_connection_with_backoff(
+        self, uploader_factory, tmp_path, monkeypatch
+    ):
+        fake = _CountingSFTP(files={})
+        real_open = fake.open
+        refusals = {"left": 2}
+
+        def flaky_open(path, mode="r", *a, **kw):
+            if "w" in mode and refusals["left"]:
+                refusals["left"] -= 1
+                raise OSError("Failure")
+            return real_open(path, mode, *a, **kw)
+
+        fake.open = flaky_open
+        d, sleeps = self._prepare(uploader_factory, tmp_path, monkeypatch, ["a.csv"], fake,
+                                  retry_delay=10)
+
+        assert d.run() is True
+        assert d._connect_with_retry.call_count == 1     # 只有開場那一次，沒有重連
+        assert sleeps == [10, 20]                        # retry_delay × 2^(n-1)
+
+    def test_persistent_refusal_gives_up_and_aborts_the_run(
+        self, uploader_factory, tmp_path, monkeypatch, caplog
+    ):
+        fake = _CountingSFTP(files={})
+        fake.open = MagicMock(side_effect=OSError("Failure"))
+        names = ["a.csv", "b.csv", "c.csv", "d.csv", "e.csv"]
+        d, sleeps = self._prepare(uploader_factory, tmp_path, monkeypatch, names, fake,
+                                  retry_delay=10)
+
+        with caplog.at_level(logging.INFO):
+            assert d.run() is False
+
+        limit = dl.SERVER_STATUS_RETRY_LIMIT
+        files_tried = dl.SERVER_STATUS_ABORT_AFTER_FILES
+        assert fake.open.call_count == limit * files_tried   # 後面的檔不再碰
+        assert d._connect_with_retry.call_count == 1
+        assert sleeps == [10, 20] * files_tried
+        messages = [r.message for r in caplog.records]
+        assert sum('reason="server_status_persistent"' in m for m in messages) == files_tried
+        aborted = [m for m in messages if "RUN_ABORTED" in m]
+        assert aborted and "伺服器拒絕" in aborted[0]
+
+    def test_backoff_is_capped(self, uploader_factory, tmp_path, monkeypatch):
+        fake = _CountingSFTP(files={})
+        fake.open = MagicMock(side_effect=OSError("Failure"))
+        d, sleeps = self._prepare(uploader_factory, tmp_path, monkeypatch, ["a.csv"], fake,
+                                  retry_delay=1000)
+        d.run()
+        assert sleeps and max(sleeps) == dl.SERVER_STATUS_BACKOFF_CAP_SECONDS
+
+    def test_success_resets_the_consecutive_file_counter(
+        self, uploader_factory, tmp_path, monkeypatch
+    ):
+        # 拒絕的檔與成功的檔交錯：任何一個檔成功就代表伺服器還能寫，不該累計到中止。
+        fake = _CountingSFTP(files={})
+        real_open = fake.open
+
+        def open_(path, mode="r", *a, **kw):
+            if "w" in mode and path.rsplit("/", 1)[-1].startswith("bad"):
+                raise OSError("Failure")
+            return real_open(path, mode, *a, **kw)
+
+        fake.open = open_
+        names = ["bad1.csv", "bad2.csv", "good1.csv", "bad3.csv", "bad4.csv", "good2.csv"]
+        d, _ = self._prepare(uploader_factory, tmp_path, monkeypatch, names, fake,
+                             retry_delay=0)
+        d._list_local_files = lambda source, remote_root: [
+            (tmp_path / n, n) for n in names
+        ]
+
+        assert d.run() is False                          # 有檔失敗
+        assert fake.files.get("/remote/good2.csv") == b"data"   # 但沒有被中止，最後一個照傳
+
+    def test_refused_remote_mkdir_does_not_reconnect_forever(
+        self, uploader_factory, tmp_path, monkeypatch
+    ):
+        fake = _CountingSFTP(files={})
+        d, sleeps = self._prepare(uploader_factory, tmp_path, monkeypatch, ["a.csv"], fake,
+                                  retry_delay=10)
+        d._list_local_files = MagicMock(side_effect=OSError("Failure"))
+
+        assert d.run() is False
+        assert d._list_local_files.call_count == dl.SERVER_STATUS_RETRY_LIMIT
+        assert d._connect_with_retry.call_count == 1
+        assert sleeps == [10, 20]
+
+    def test_connection_errors_still_reconnect_immediately(
+        self, uploader_factory, tmp_path, monkeypatch
+    ):
+        fake = _CountingSFTP(files={})
+        real_open = fake.open
+        state = {"dropped": False}
+
+        def open_(path, mode="r", *a, **kw):
+            if "w" in mode and not state["dropped"]:
+                state["dropped"] = True
+                raise OSError("Socket is closed")
+            return real_open(path, mode, *a, **kw)
+
+        fake.open = open_
+        d, sleeps = self._prepare(uploader_factory, tmp_path, monkeypatch, ["a.csv"], fake,
+                                  retry_delay=10)
+
+        assert d.run() is True
+        assert d._connect_with_retry.call_count == 2
+        assert sleeps == []
+
+
+def paramiko_ssh_exception(msg):
+    import paramiko
+    return paramiko.SSHException(msg)

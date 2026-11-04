@@ -18,12 +18,14 @@ from downloader import (
     CHUNK_SIZE,
     MANIFEST_FILENAME,
     PART_SUFFIX,
+    SERVER_STATUS_RETRY_LIMIT,
     SFTPBase,
     TransferCancelled,
     checkpoint_offset,
     diagnostic_message,
     format_exception,
     format_size,
+    is_server_status_error,
     permission_bits,
 )
 
@@ -728,12 +730,16 @@ class SFTPUploader(SFTPBase):
 
                     file_list = None
                     list_attempts = 0
+                    list_server_attempts = 0
                     while file_list is None:
                         try:
                             file_list = self._list_local_files(source, remote_root)
                         except (paramiko.SSHException, OSError, EOFError) as e:
                             file_list = None
                             list_attempts += 1
+                            server_status = is_server_status_error(e)
+                            if server_status:
+                                list_server_attempts += 1
                             self.logger.warning(diagnostic_message(
                                 "LIST_RETRY",
                                 f"建立遠端目錄或列出本地檔案清單發生錯誤（第 {list_attempts} 次）: {format_exception(e)}",
@@ -744,11 +750,22 @@ class SFTPUploader(SFTPBase):
                                 attempt=list_attempts,
                                 retry_limit=(self.retry_count if self.retry_count is not None and self.retry_count > 0 else "unlimited"),
                                 error=format_exception(e),
-                                action="reconnect",
+                                reason="server_status" if server_status else "transfer_error",
+                                action="wait_retry" if server_status else "reconnect",
                             ))
                             if not self.auto_reconnect or self._retry_limit_reached(list_attempts):
                                 self.logger.error("已達重試上限，任務中止")
                                 return False
+                            if server_status:
+                                # 岸端磁碟滿時第一個撞到的常是這裡（建不出新目錄）。
+                                if list_server_attempts >= SERVER_STATUS_RETRY_LIMIT:
+                                    self.logger.error(
+                                        f"SFTP 伺服器連續 {list_server_attempts} 次拒絕建立遠端目錄"
+                                        f"（{format_exception(e)}），任務中止"
+                                    )
+                                    return False
+                                self._server_status_backoff(list_server_attempts)
+                                continue
                             self._connect_with_retry()
 
                     self._plan_remote_listings(remote_root, file_list)
@@ -764,6 +781,7 @@ class SFTPUploader(SFTPBase):
                             self.logger.warning(f"多個來源都含有 {rel_path}，遠端以後面的來源為準: {source}")
                         seen_rel[rel_path] = str(source)
                         attempts = 0
+                        server_attempts = 0
                         while True:
                             try:
                                 result = self._upload_one_file(local_file, rel_path, remote_root, local_root)
@@ -771,6 +789,7 @@ class SFTPUploader(SFTPBase):
                                     skipped += 1
                                 else:
                                     uploaded += 1
+                                    self._server_status_failed_files = 0
                                 # _delete_local_source 自己吞掉所有刪除錯誤、只記警告，刻意不讓它
                                 # 冒到下面的 except：刪不掉來源不是傳輸錯誤，不該觸發重連並把整個
                                 # 檔案重傳一次（內容此時已經完整送達遠端了）。
@@ -812,6 +831,9 @@ class SFTPUploader(SFTPBase):
                                 break
                             except (paramiko.SSHException, OSError, EOFError) as e:
                                 attempts += 1
+                                server_status = is_server_status_error(e)
+                                if server_status:
+                                    server_attempts += 1
                                 self.logger.warning(diagnostic_message(
                                     "TRANSFER_RETRY",
                                     f"上傳 {rel_path} 發生錯誤（第 {attempts} 次）: {format_exception(e)}",
@@ -822,22 +844,37 @@ class SFTPUploader(SFTPBase):
                                     attempt=attempts,
                                     retry_limit=(self.retry_count if self.retry_count is not None and self.retry_count > 0 else "unlimited"),
                                     error=format_exception(e),
-                                    action="reconnect",
+                                    reason="server_status" if server_status else "transfer_error",
+                                    action="wait_retry" if server_status else "reconnect",
                                 ))
-                                if not self.auto_reconnect or self._retry_limit_reached(attempts):
-                                    reason = "auto_reconnect_disabled" if not self.auto_reconnect else "retry_limit_reached"
+                                gave_up_reason = None
+                                if not self.auto_reconnect:
+                                    gave_up_reason = "auto_reconnect_disabled"
+                                elif self._retry_limit_reached(attempts):
+                                    gave_up_reason = "retry_limit_reached"
+                                elif server_status and server_attempts >= SERVER_STATUS_RETRY_LIMIT:
+                                    gave_up_reason = "server_status_persistent"
+                                if gave_up_reason:
                                     self.logger.error(diagnostic_message(
                                         "TRANSFER_ERROR",
                                         f"檔案 {rel_path} 上傳失敗，放棄重試",
                                         direction="upload",
-                                        reason=reason,
+                                        reason=gave_up_reason,
                                         file=rel_path,
                                         attempts=attempts,
                                         error=format_exception(e),
                                         action="fail_file",
                                     ))
                                     failed.append(rel_path)
+                                    if server_status:
+                                        self._server_status_gave_up(e, rel_path, "上傳")
                                     break
+                                if server_status:
+                                    # 連線是好的（伺服器有回應，只是拒絕）：不重連，等一下在同一條
+                                    # 連線上再試。2026-11-04 磁碟滿時這裡每檔 3 秒握手 8 次，船隊
+                                    # 疊起來把岸端 sshd 打到 Exceeded MaxStartups。
+                                    self._server_status_backoff(server_attempts)
+                                    continue
                                 # 重連放棄時 _connect_with_retry 已記下 CONNECTION_ERROR 再往外拋，這裡
                                 # 不能吞掉、改去下一個檔：self.sftp 此時是 None，下一個檔的第一個遠端
                                 # 呼叫就是 'NoneType' object has no attribute 'stat'，RUN_ABORTED 記到

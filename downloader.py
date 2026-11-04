@@ -67,6 +67,45 @@ SFTP_RETRY_EXCEPTIONS = (
     EOFError,
 )
 
+# 【伺服器回了狀態碼，不是斷線】paramiko 把 SFTP 狀態碼 FAILURE／BAD_MESSAGE／OP_UNSUPPORTED
+# 轉成「只帶伺服器訊息、errno 為 None」的 IOError（sftp_client._convert_status 最後那個 else）。
+# 這時連線是活的，重連毫無用處：2026-11-04 岸端 /fleet 磁碟 100% 滿，OpenSSH 把 ENOSPC 回成
+# SSH_FX_FAILURE，上傳端卻當成斷線「立刻重連、不等、無上限」—— 一個檔 3 秒內握手 8 次，
+# 整個船隊疊起來把岸端 sshd 打到 `Exceeded MaxStartups`，連帶所有人都連不上。
+#
+# 只認這三種訊息、而且要 errno 為 None 才算：真正的斷線是 EOFError／SSHException／帶 errno
+# 的 socket 錯誤，不受影響；NO_SUCH_FILE／PERMISSION_DENIED 帶 errno，走各自既有的分支。
+SERVER_STATUS_MESSAGES = frozenset(
+    paramiko.sftp.SFTP_DESC[code]
+    for code in (
+        paramiko.sftp.SFTP_FAILURE,
+        paramiko.sftp.SFTP_BAD_MESSAGE,
+        paramiko.sftp.SFTP_OP_UNSUPPORTED,
+    )
+)
+# 同一個檔被伺服器拒絕幾次就放棄這個檔（與 retry_count 取較嚴者）。retry_count 的「無上限」
+# 是為了船上斷斷續續的衛星鏈路；伺服器明確拒絕不是鏈路問題，等再久也不會自己好。
+SERVER_STATUS_RETRY_LIMIT = 3
+# 被拒絕後的等待：retry_delay × 2^(n-1)，封頂這麼多秒。
+SERVER_STATUS_BACKOFF_CAP_SECONDS = 300
+# 連續這麼多個檔都因伺服器拒絕而放棄，就中止整趟：磁碟滿的時候後面每個檔都一樣，
+# 逐檔各試三次只是把同樣的拒絕再要幾百遍。成功傳完任何一個檔就歸零。
+SERVER_STATUS_ABORT_AFTER_FILES = 3
+
+
+def is_server_status_error(exc) -> bool:
+    """SFTP 伺服器以狀態碼拒絕了這次操作（連線仍然是好的），見 SERVER_STATUS_MESSAGES。"""
+    return (
+        type(exc) is OSError
+        and exc.errno is None
+        and len(exc.args) == 1
+        and exc.args[0] in SERVER_STATUS_MESSAGES
+    )
+
+
+class RemoteServerRejecting(Exception):
+    """連續多個檔都被 SFTP 伺服器以狀態碼拒絕（例如岸端磁碟滿），整趟中止。"""
+
 _FILENAME_UNSAFE = re.compile(r'[<>:"/\\|?*]')
 
 
@@ -339,6 +378,27 @@ class SFTPBase:
         self._ignore_spec = None
         # 這條連線上已確認存在（或剛建立）的遠端目錄，見 _ensure_remote_dir；_close() 時清空。
         self._remote_dirs_ok = set()
+        # 連續幾個檔因伺服器拒絕而放棄（見 SERVER_STATUS_ABORT_AFTER_FILES）。
+        self._server_status_failed_files = 0
+
+    def _server_status_backoff(self, server_attempts):
+        """伺服器拒絕後、在**同一條連線**上重試前的等待（不重連，見 SERVER_STATUS_MESSAGES）。"""
+        delay = min(
+            float(self.retry_delay or 0) * (2 ** max(0, server_attempts - 1)),
+            SERVER_STATUS_BACKOFF_CAP_SECONDS,
+        )
+        if delay > 0:
+            time.sleep(delay)
+
+    def _server_status_gave_up(self, exc, rel_path, direction):
+        """一個檔因伺服器拒絕而放棄後呼叫；連續太多個就中止整趟。"""
+        self._server_status_failed_files += 1
+        if self._server_status_failed_files >= SERVER_STATUS_ABORT_AFTER_FILES:
+            raise RemoteServerRejecting(
+                f"連續 {self._server_status_failed_files} 個檔都被 SFTP 伺服器拒絕"
+                f"（最後一個：{rel_path}，{format_exception(exc)}），"
+                f"伺服器端多半是磁碟滿或配額用完，{direction} 中止，等下一趟再試"
+            )
 
     def _reset_remote_cache(self):
         """丟掉所有「這條連線上看過的遠端狀態」。斷線重連後伺服器那邊可能已經變了。"""
@@ -1644,6 +1704,7 @@ class SFTPDownloader(SFTPBase):
 
                 file_list = None
                 list_attempts = 0
+                list_server_attempts = 0
                 while file_list is None:
                     current_root = None
                     try:
@@ -1666,6 +1727,9 @@ class SFTPDownloader(SFTPBase):
                     except SFTP_RETRY_EXCEPTIONS as e:
                         file_list = None
                         list_attempts += 1
+                        server_status = is_server_status_error(e)
+                        if server_status:
+                            list_server_attempts += 1
                         self.logger.warning(diagnostic_message(
                             "LIST_RETRY",
                             f"列出遠端檔案清單發生錯誤（第 {list_attempts} 次）: {format_exception(e)}",
@@ -1675,11 +1739,21 @@ class SFTPDownloader(SFTPBase):
                             attempt=list_attempts,
                             retry_limit=(self.retry_count if self.retry_count is not None and self.retry_count > 0 else "unlimited"),
                             error=format_exception(e),
-                            action="reconnect",
+                            reason="server_status" if server_status else "transfer_error",
+                            action="wait_retry" if server_status else "reconnect",
                         ))
                         if not self.auto_reconnect or self._retry_limit_reached(list_attempts):
                             self.logger.error("已達重試上限，任務中止")
                             return False
+                        if server_status:
+                            if list_server_attempts >= SERVER_STATUS_RETRY_LIMIT:
+                                self.logger.error(
+                                    f"SFTP 伺服器連續 {list_server_attempts} 次拒絕列目錄"
+                                    f"（{format_exception(e)}），任務中止"
+                                )
+                                return False
+                            self._server_status_backoff(list_server_attempts)
+                            continue
                         self._connect_with_retry()
 
                 # 同一 job 內多來源合併時，若不同來源含有相同的相對路徑，後面的來源會覆蓋前面的
@@ -1703,6 +1777,7 @@ class SFTPDownloader(SFTPBase):
 
                 for remote_file, rel_path, listed_attr in file_list:
                     attempts = 0
+                    server_attempts = 0
                     while True:
                         try:
                             result = self._download_one_file(remote_file, rel_path, local_root, listed_attr)
@@ -1710,6 +1785,7 @@ class SFTPDownloader(SFTPBase):
                                 skipped += 1
                             else:
                                 downloaded += 1
+                                self._server_status_failed_files = 0
                             # _delete_remote_source 自己吞掉所有刪除錯誤、只記警告，刻意不讓它
                             # 冒到下面的 except：刪不掉來源不是傳輸錯誤，不該觸發重連並把整個檔案
                             # 重下一次（內容此時已經完整落地了）。
@@ -1750,6 +1826,9 @@ class SFTPDownloader(SFTPBase):
                             break
                         except SFTP_RETRY_EXCEPTIONS as e:
                             attempts += 1
+                            server_status = is_server_status_error(e)
+                            if server_status:
+                                server_attempts += 1
                             self.logger.warning(diagnostic_message(
                                 "TRANSFER_RETRY",
                                 f"下載 {rel_path} 發生錯誤（第 {attempts} 次）: {format_exception(e)}",
@@ -1759,22 +1838,35 @@ class SFTPDownloader(SFTPBase):
                                 attempt=attempts,
                                 retry_limit=(self.retry_count if self.retry_count is not None and self.retry_count > 0 else "unlimited"),
                                 error=format_exception(e),
-                                action="reconnect",
+                                reason="server_status" if server_status else "transfer_error",
+                                action="wait_retry" if server_status else "reconnect",
                             ))
-                            if not self.auto_reconnect or self._retry_limit_reached(attempts):
-                                reason = "auto_reconnect_disabled" if not self.auto_reconnect else "retry_limit_reached"
+                            gave_up_reason = None
+                            if not self.auto_reconnect:
+                                gave_up_reason = "auto_reconnect_disabled"
+                            elif self._retry_limit_reached(attempts):
+                                gave_up_reason = "retry_limit_reached"
+                            elif server_status and server_attempts >= SERVER_STATUS_RETRY_LIMIT:
+                                gave_up_reason = "server_status_persistent"
+                            if gave_up_reason:
                                 self.logger.error(diagnostic_message(
                                     "TRANSFER_ERROR",
                                     f"檔案 {rel_path} 下載失敗，放棄重試",
                                     direction="download",
-                                    reason=reason,
+                                    reason=gave_up_reason,
                                     file=rel_path,
                                     attempts=attempts,
                                     error=format_exception(e),
                                     action="fail_file",
                                 ))
                                 failed.append(rel_path)
+                                if server_status:
+                                    self._server_status_gave_up(e, rel_path, "下載")
                                 break
+                            if server_status:
+                                # 連線是好的：不重連，等一下在同一條連線上再試。
+                                self._server_status_backoff(server_attempts)
+                                continue
                             # 重連後重來一次時丟掉走訪當下的屬性，改回實打 stat：清單是任務
                             # 一開始一次列完的，重試代表這中間已經歷過一段網路中斷，來源
                             # 版本是否還是同一份不該再用舊屬性斷定（manifest 會記下它）。

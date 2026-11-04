@@ -294,6 +294,7 @@ sftp_transfer 與 scheduler 是 OTA 的控制面（booster）：其他專案都�
 | **損毀**（FAIL） | stamp 不符，**而且**：0 byte（發佈版不是空檔）、`.py` 編譯失敗、`.sh` 過不了 `bash -n`、`.json` 解析失敗，或與下載 manifest 記下的整檔 sha256 / 大小不同（下載後變質） | 印出修法；`--unattended` 記進 `UNATTENDED_FAIL` → 離開碼 1、unit failed |
 | 版本交錯（WARN） | stamp 不符，但內容就是某次完整下載的結果 | 只 warn（warm 下一輪會補齊） |
 | 不一致 / 缺少（WARN） | stamp 不符而沒有證據分辨；或 stamp 有、本地沒有 | 只 warn；好幾天都還在就用 `--force-redownload` 重抓 |
+| **持續不一致**（FAIL，v0.31.0） | 上面三種 WARN 的同一個檔，簽名（本地 sha、發佈版 sha）持續 3 天都沒變 —— warm 一天兩輪早該補齊，所以不是更新進行中。依原類別判讀：不一致 → 本機內容很可能已損毀（大小沒變的 bit rot、截在語法仍完整之處的截斷）；版本交錯 → **岸端 STANDARD 上那份很可能本身就壞了**（重抓只會抓回同一份）；缺少 → 漏送或被刪 | 同損毀。狀態檔 `share/.env/booster_integrity_state.json`（不在 OTA 範圍內）；岸上發佈新版時 stamp 的 sha 變了，自動重新計時；CLINK 不計 |
 | 檢查器沒交結論 | 輸出裡沒有 `BOOSTER_INTEGRITY status=` 那一行（檢查器自己被截成 0 byte 時 rc 也是 0） | 當成損毀處理 |
 
 不是部署的必要條件：沒有任何一種結果會中止部署（擋下部署修不好壞檔）。CLINK 開發機帶

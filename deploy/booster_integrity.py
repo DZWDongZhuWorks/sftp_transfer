@@ -3,12 +3,17 @@
 
 用法:
     python3 deploy/booster_integrity.py <專案根目錄> [<專案根目錄> ...] [--dev]
+                                        [--state <狀態檔>] [--persist-days <天數>]
 
     deploy_offline.sh 的 stage_booster_integrity 會帶上 share/sftp_transfer 與 share/scheduler。
     --dev:CLINK 開發機。工作樹與發佈版本來就不同,「不一致」只列為 INFO,也不拿下載 manifest
            當證據(開發機的 manifest 是陳年的);只有「確定壞掉」(空檔、語法壞掉)仍算損毀。
 
-離開碼:0 = OK、1 = FAIL(有損毀)、2 = WARN(有不一致 / 缺檔 / 無法驗證)、3 = 參數錯誤。
+    --state:記住每個「不一致」第一次出現的時間(見下方〈持續不一致〉)。deploy_offline.sh 傳
+           share/.env/booster_integrity_state.json(不在 OTA 範圍內)。不給就不判持續。
+    --persist-days:同一個不一致持續幾天才升級為 FAIL(預設 3)。
+
+離開碼:0 = OK、1 = FAIL(有損毀或持續不一致)、2 = WARN(有不一致 / 缺檔 / 無法驗證)、3 = 參數錯誤。
 
 【為什麼要有】sftp_transfer 與 scheduler 是 OTA 的控制面(scheduler 稱為 booster):其他專案
 都靠它們下載,而它們也靠自己下載自己。實測過:main.py 被截成 0 byte 時 ——
@@ -35,6 +40,17 @@
   * 不一致(mismatch):沒有任何證據能分辨是哪一種(船上多數檔還沒有整檔雜湊)。WARN。
   * 缺少(missing):stamp 有、本地沒有。WARN —— 可能是漏送,也可能是新版還沒抓到。
 
+【持續不一致 → FAIL】上面三種 WARN 的共同前提是「更新進行到一半」。warm 一天兩輪,booster 的
+檔又小,同一個不一致若**好幾天都一模一樣**(本地內容的 sha 與發佈版的 sha 都沒變),就不可能是
+更新進行中。--state 記下每一筆的簽名 (本地 sha, 發佈版 sha) 與第一次出現的時間,持續滿
+--persist-days 天就升級為 FAIL(persistent),並依原本的類別給出判讀:
+  * 不一致(沒有下載證據)→ 內容很可能已損毀:大小沒變的 bit rot、截在語法仍完整之處的截斷 ——
+    這兩種結構驗證抓不到,下載的略過分支也永遠不會重抓。
+  * 版本交錯(內容是一次完整的下載)→ 船上忠實地抓下了岸上的內容,它卻一直不是發佈時的樣子:
+    岸端 STANDARD 上那份很可能本身就壞了(或發佈後被改過、stamp 沒有跟著重產)。
+  * 缺少 → 不是新版還沒抓到,是漏送或被刪。
+簽名任一邊變了就重新計時:岸上發佈新版(stamp 的 sha 變了)時,換版期間的不一致不會被誤判。
+
 【一定要印結論行】最後一行固定是 `BOOSTER_INTEGRITY status=...`。呼叫端**必須**以這一行為準,
 不能只看離開碼:這支檔本身也可能被截成 0 byte,而空的 .py 執行起來就是 rc=0 —— 那正是本檢查
 要抓的問題。沒有結論行 = 檢查器自己壞了。
@@ -50,6 +66,8 @@ import os
 import shutil
 import subprocess
 import sys
+import tempfile
+import time
 from collections import OrderedDict
 
 STAMP_NAME = "VERSION.stamp.json"
@@ -61,10 +79,14 @@ _HASH_CHUNK = 1024 * 1024
 LIST_LIMIT = 20
 
 EXIT_OK, EXIT_FAIL, EXIT_WARN, EXIT_USAGE = 0, 1, 2, 3
+DEFAULT_PERSIST_DAYS = 3
+STATE_VERSION = 1
 
-CORRUPT, SKEW, MISMATCH, MISSING = "corrupt", "skew", "mismatch", "missing"
+CORRUPT, PERSISTENT = "corrupt", "persistent"
+SKEW, MISMATCH, MISSING = "skew", "mismatch", "missing"
 CATEGORY_LABEL = OrderedDict((
     (CORRUPT, "損毀"),
+    (PERSISTENT, "持續不一致"),
     (MISMATCH, "與發佈版不一致"),
     (SKEW, "版本交錯(完整下載,但不是這一版)"),
     (MISSING, "缺少"),
@@ -166,6 +188,8 @@ class RootReport(object):
         self.findings = OrderedDict((key, []) for key in CATEGORY_LABEL)
         self.unverified = None   # 整個根目錄無法驗證時的原因
         self.stamp_broken = False
+        # 不一致的簽名:rel → (本地 sha 或 "missing", 發佈版 sha)。給 apply_persistence 用。
+        self.signatures = {}
 
 
 def check_root(root, dev=False, bash=None):
@@ -206,6 +230,7 @@ def check_root(root, dev=False, bash=None):
             actual = sha256_file(path)
         except FileNotFoundError:
             report.findings[MISSING].append((rel, ""))
+            report.signatures[rel] = ("missing", expected)
             continue
         except OSError as exc:
             report.findings[CORRUPT].append((rel, "無法讀取:{}".format(_one_line(exc))))
@@ -231,13 +256,77 @@ def check_root(root, dev=False, bash=None):
             report.findings[CORRUPT].append((rel, ";".join(reasons)))
         elif baseline is not None:
             report.findings[SKEW].append((rel, ""))
+            report.signatures[rel] = (actual, expected)
         else:
             report.findings[MISMATCH].append((rel, ""))
+            report.signatures[rel] = (actual, expected)
     return report
 
 
+PERSISTENT_HINT = {
+    MISMATCH: ("與發佈版不同、內容一直沒變 —— warm 早該補齊,內容很可能已損毀(大小沒變的 bit rot、"
+               "截在語法仍完整之處的截斷),下載的略過分支也不會自己重抓。用 main.py --force-redownload 重抓"),
+    SKEW: ("內容是一次完整的下載,卻一直不是發佈時的樣子 —— 岸端 STANDARD 上那份很可能本身就壞了"
+           "(或發佈後被改過、stamp 沒有重產)。先比對岸端的檔,重抓只會抓回同一份"),
+    MISSING: "一直缺少 —— 不是新版還沒抓到,是漏送或被刪",
+}
+
+
+def apply_persistence(report, previous, now, persist_days):
+    """把持續滿 persist_days 天、簽名沒變的不一致升級為 PERSISTENT。回傳這個根目錄的新狀態。
+
+    previous:上一次的狀態 {rel: {"category", "local", "expected", "first_seen"}};簽名變了就重新計時。
+    消失的不一致(修好了、或換版完成)自然不會出現在新狀態裡。
+    """
+    threshold = persist_days * 86400
+    current = {}
+    for category in (MISMATCH, SKEW, MISSING):
+        kept = []
+        for rel, detail in report.findings[category]:
+            local, expected = report.signatures.get(rel, (None, None))
+            old = previous.get(rel) if isinstance(previous, dict) else None
+            first_seen = now
+            if (isinstance(old, dict) and old.get("local") == local and old.get("expected") == expected
+                    and isinstance(old.get("first_seen"), (int, float))
+                    and not isinstance(old.get("first_seen"), bool) and old["first_seen"] <= now):
+                first_seen = old["first_seen"]
+            current[rel] = {"category": category, "local": local, "expected": expected,
+                            "first_seen": first_seen}
+            if now - first_seen >= threshold:
+                days = int((now - first_seen) // 86400)
+                report.findings[PERSISTENT].append(
+                    (rel, "已連續 {} 天{}".format(days, PERSISTENT_HINT[category])))
+            else:
+                kept.append((rel, detail))
+        report.findings[category] = kept
+    return current
+
+
+def load_state(path, out):
+    data, error = _load_json_dict(path)
+    if error is not None:
+        out.write("[WARN] 狀態檔讀不出來,從頭計時:{}({})\n".format(path, error))
+        return {}
+    if data is None or data.get("version") != STATE_VERSION or not isinstance(data.get("roots"), dict):
+        return {}
+    return data["roots"]
+
+
+def save_state(path, roots_state, out):
+    """寫不進去只提醒:狀態檔是加值,不能因為它讓檢查本身失敗。"""
+    try:
+        directory = os.path.dirname(os.path.abspath(path))
+        fd, tmp = tempfile.mkstemp(dir=directory, prefix=".booster_integrity.", suffix=".tmp")
+        with os.fdopen(fd, "w", encoding="utf-8") as handle:
+            json.dump({"version": STATE_VERSION, "roots": roots_state}, handle,
+                      ensure_ascii=False, indent=1, sort_keys=True)
+        os.replace(tmp, path)
+    except OSError as exc:
+        out.write("[WARN] 狀態檔寫不進去,下次無法判斷是否持續:{}({})\n".format(path, _one_line(exc)))
+
+
 def root_status(report, dev):
-    if report.findings[CORRUPT] or report.stamp_broken:
+    if report.findings[CORRUPT] or report.findings[PERSISTENT] or report.stamp_broken:
         return "FAIL"
     if dev:
         return "OK"
@@ -262,7 +351,8 @@ def print_report(report, dev, out):
         # --dev:工作樹本來就跟發佈版不同,只有損毀值得逐檔列出。
         if dev and key != CORRUPT:
             continue
-        tag = {CORRUPT: "CORRUPT", MISMATCH: "MISMATCH", SKEW: "SKEW", MISSING: "MISSING"}[key]
+        tag = {CORRUPT: "CORRUPT", PERSISTENT: "PERSISTENT", MISMATCH: "MISMATCH",
+               SKEW: "SKEW", MISSING: "MISSING"}[key]
         for rel, detail in items[:LIST_LIMIT]:
             out.write("  [{}] {}{}\n".format(tag, rel, " —— " + detail if detail else ""))
         if len(items) > LIST_LIMIT:
@@ -272,27 +362,53 @@ def print_report(report, dev, out):
     return status
 
 
-def main(argv=None, out=None):
+def _usage_error(out, message):
+    sys.stderr.write("booster_integrity: {}\n".format(message))
+    out.write("{} status=ERROR reason=usage\n".format(VERDICT_PREFIX))
+    return EXIT_USAGE
+
+
+def main(argv=None, out=None, now=None):
     out = out or sys.stdout
+    now = time.time() if now is None else now
     args = list(sys.argv[1:] if argv is None else argv)
     dev = False
+    state_path = None
+    persist_days = DEFAULT_PERSIST_DAYS
     roots = []
-    for arg in args:
+    i = 0
+    while i < len(args):
+        arg = args[i]
         if arg == "--dev":
             dev = True
         elif arg in ("-h", "--help"):
             out.write(__doc__)
             return EXIT_OK
+        elif arg in ("--state", "--persist-days"):
+            if i + 1 >= len(args):
+                return _usage_error(out, "{} 需要一個值".format(arg))
+            value = args[i + 1]
+            i += 1
+            if arg == "--state":
+                state_path = value
+            else:
+                try:
+                    persist_days = float(value)
+                except ValueError:
+                    persist_days = -1
+                if persist_days <= 0:
+                    return _usage_error(out, "--persist-days 必須是正數:{}".format(value))
         elif arg.startswith("-"):
-            sys.stderr.write("booster_integrity: 未知參數 {}\n".format(arg))
-            out.write("{} status=ERROR reason=usage\n".format(VERDICT_PREFIX))
-            return EXIT_USAGE
+            return _usage_error(out, "未知參數 {}".format(arg))
         else:
             roots.append(arg)
+        i += 1
     if not roots:
-        sys.stderr.write("booster_integrity: 至少要指定一個專案根目錄\n")
-        out.write("{} status=ERROR reason=usage\n".format(VERDICT_PREFIX))
-        return EXIT_USAGE
+        return _usage_error(out, "至少要指定一個專案根目錄")
+    # --dev(CLINK):工作樹本來就跟發佈版不同,「持續」沒有意義。
+    use_state = state_path is not None and not dev
+    previous_state = load_state(state_path, out) if use_state else {}
+    new_state = {}
 
     bash = shutil.which("bash")
     totals = OrderedDict((key, 0) for key in CATEGORY_LABEL)
@@ -300,20 +416,27 @@ def main(argv=None, out=None):
     unverified = 0
     for root in roots:
         report = check_root(root, dev=dev, bash=bash)
+        if use_state and not report.unverified:
+            new_state[report.name] = apply_persistence(
+                report, previous_state.get(report.name, {}), now, persist_days)
         statuses.append(print_report(report, dev, out))
         unverified += 1 if report.unverified else 0
         for key, items in report.findings.items():
             totals[key] += len(items)
 
+    if use_state:
+        save_state(state_path, new_state, out)
     if "FAIL" in statuses:
         overall, code = "FAIL", EXIT_FAIL
     elif "WARN" in statuses:
         overall, code = "WARN", EXIT_WARN
     else:
         overall, code = "OK", EXIT_OK
-    out.write("{} status={} roots={} corrupt={} mismatch={} skew={} missing={} unverified={}{}\n"
-              .format(VERDICT_PREFIX, overall, len(roots), totals[CORRUPT], totals[MISMATCH],
-                      totals[SKEW], totals[MISSING], unverified, " dev=1" if dev else ""))
+    out.write("{} status={} roots={} corrupt={} persistent={} mismatch={} skew={} missing={} "
+              "unverified={}{}\n"
+              .format(VERDICT_PREFIX, overall, len(roots), totals[CORRUPT], totals[PERSISTENT],
+                      totals[MISMATCH], totals[SKEW], totals[MISSING], unverified,
+                      " dev=1" if dev else ""))
     return code
 
 

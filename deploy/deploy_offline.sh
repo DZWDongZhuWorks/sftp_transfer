@@ -1174,7 +1174,14 @@ stage_booster_integrity() {
   BOOSTER_INTEGRITY_STATUS="未執行"
   echo ""
   info "檢查 booster(sftp_transfer / scheduler)完整性:對照發佈端的 VERSION.stamp.json ..."
-  [ "${DEPLOY_VSL_UPPER:-}" = "CLINK" ] && args+=(--dev)
+  # 狀態檔記住每個不一致第一次出現的時間:同一個不一致持續 3 天就不可能是「更新進行中」,
+  # 升級為 FAIL(見 booster_integrity.py 的〈持續不一致〉)。放 .env/:不在 OTA 範圍內。
+  # CLINK 帶 --dev:工作樹本來就跟發佈版不同,不計持續。
+  if [ "${DEPLOY_VSL_UPPER:-}" = "CLINK" ]; then
+    args+=(--dev)
+  else
+    args+=(--state "$SHARE_DIR/.env/booster_integrity_state.json")
+  fi
   RC=0
   out="$("$PYTHON_BIN" "$checker" "${args[@]}" 2>&1)" || RC=$?
   [ -n "$out" ] && printf '%s\n' "$out"
@@ -1195,11 +1202,11 @@ stage_booster_integrity() {
     2)
       BOOSTER_INTEGRITY_STATUS="有不一致(未確認損毀;$(printf '%s' "$verdict" | grep -oE 'mismatch=[0-9]+ skew=[0-9]+ missing=[0-9]+ unverified=[0-9]+'))"
       warn "booster 完整性:$BOOSTER_INTEGRITY_STATUS"
-      warn "  多半是鏡像更新到一半(warm 下一輪會補齊)。好幾天都還在的話,用 main.py 的"
-      warn "  --force-redownload 重抓上方列出的檔(同大小的壞檔不會自己被重抓)。"
+      warn "  多半是鏡像更新到一半(warm 下一輪會補齊)。同一個不一致持續 3 天,下一次部署會自動"
+      warn "  升級為 FAIL 並判讀是本機損毀還是岸端那份壞了。"
       ;;
     1)
-      BOOSTER_INTEGRITY_STATUS="⚠ 損毀 $(printf '%s' "$verdict" | grep -oE 'corrupt=[0-9]+' | cut -d= -f2) 個檔(見上方 [CORRUPT])"
+      BOOSTER_INTEGRITY_STATUS="⚠ 損毀 $(printf '%s' "$verdict" | grep -oE 'corrupt=[0-9]+' | cut -d= -f2) 個、持續不一致 $(printf '%s' "$verdict" | grep -oE 'persistent=[0-9]+' | cut -d= -f2 || true) 個(見上方 [CORRUPT] / [PERSISTENT])"
       err "booster 完整性:$BOOSTER_INTEGRITY_STATUS"
       err "  下一輪 OTA **不一定**修得好:同大小的壞檔會被略過,而 main.py 壞了下載器根本跑不動。"
       err "  修法(擇一):"
@@ -1208,6 +1215,7 @@ stage_booster_integrity() {
       err "        cd $PROJECT_DIR && \"$VENV_DIR/bin/python\" main.py --cli --mode download \\"
       err "            --config config/<sftp|scheduler>_download_settings.json --force-redownload '<相對路徑>'"
       err "    * main.py / downloader.py 本身壞了:從同船另一台 IPC 或離線包複製該檔(路徑相同)。"
+      err "    * [PERSISTENT] 說「岸端那份可能本身就壞了」的:重抓只會抓回同一份,先修岸端 STANDARD。"
       unattended_note_fail "booster 有損毀的檔($verdict)" || true
       ;;
     *)

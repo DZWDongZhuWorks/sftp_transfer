@@ -349,3 +349,123 @@ def test_empty_checker_exits_zero_without_verdict(tmp_path):
                           stdout=subprocess.PIPE, stderr=subprocess.PIPE)
     assert proc.returncode == 0
     assert B.VERDICT_PREFIX not in proc.stdout.decode("utf-8")
+
+
+# --- 持續不一致(--state):好幾天都一模一樣,就不是「更新進行中」 ---------------------
+
+DAY = 86400.0
+T0 = 1800000000.0
+
+
+def run_at(now, *args):
+    out = io.StringIO()
+    code = B.main([str(a) for a in args], out=out, now=now)
+    return code, out.getvalue()
+
+
+def test_mismatch_persisting_three_days_becomes_failure(tmp_path):
+    """大小沒變的 bit rot / 語法仍完整的截斷:結構驗證抓不到,只有時間抓得到。"""
+    root = make_root(tmp_path)
+    (root / "notes.txt").write_bytes(b"silently rotted content, same shape\n")
+    state = tmp_path / "state.json"
+    code, _ = run_at(T0, root, "--state", state)
+    assert code == B.EXIT_WARN
+    code, _ = run_at(T0 + 2.9 * DAY, root, "--state", state)
+    assert code == B.EXIT_WARN, "還沒滿 3 天,仍可能是更新進行中"
+    code, text = run_at(T0 + 3 * DAY, root, "--state", state)
+    assert code == B.EXIT_FAIL
+    assert "persistent=1" in verdict(text) and "mismatch=0" in verdict(text)
+    assert "[PERSISTENT] notes.txt" in text and "已連續 3 天" in text and "很可能已損毀" in text
+
+
+def test_persisting_skew_points_at_the_shore_copy(tmp_path):
+    """完整下載、卻一直不是發佈時的樣子 → 岸端那份本身壞了;重抓只會抓回同一份。"""
+    root = make_root(tmp_path)
+    shore = b"what the shore actually serves\n"
+    (root / "notes.txt").write_bytes(shore)
+    (root / B.DOWNLOAD_MANIFEST_NAME).write_text(json.dumps({
+        "notes.txt": {"size": len(shore), "mtime": 1, "local_bytes": len(shore),
+                      "local_sha256": sha(shore)}}), encoding="utf-8")
+    state = tmp_path / "state.json"
+    assert run_at(T0, root, "--state", state)[0] == B.EXIT_WARN
+    code, text = run_at(T0 + 4 * DAY, root, "--state", state)
+    assert code == B.EXIT_FAIL
+    assert "岸端 STANDARD 上那份很可能本身就壞了" in text
+
+
+def test_persisting_missing_file_is_a_failure(tmp_path):
+    root = make_root(tmp_path)
+    (root / "notes.txt").unlink()
+    state = tmp_path / "state.json"
+    run_at(T0, root, "--state", state)
+    code, text = run_at(T0 + 3 * DAY, root, "--state", state)
+    assert code == B.EXIT_FAIL and "漏送或被刪" in text
+
+
+def test_new_release_restarts_the_clock(tmp_path):
+    """岸上發佈新版 → stamp 的 sha 變了 → 換版期間的不一致不能被誤判為持續。"""
+    root = make_root(tmp_path)
+    (root / "notes.txt").write_bytes(b"old release content\n")
+    state = tmp_path / "state.json"
+    run_at(T0, root, "--state", state)
+    stamp = json.loads((root / B.STAMP_NAME).read_text(encoding="utf-8"))
+    stamp["files"]["notes.txt"] = sha(b"brand new release\n")
+    (root / B.STAMP_NAME).write_text(json.dumps(stamp), encoding="utf-8")
+    run_at(T0 + 2 * DAY, root, "--state", state)
+    code, _ = run_at(T0 + 4 * DAY, root, "--state", state)
+    assert code == B.EXIT_WARN, "新版從 T0+2 天才開始計時,到 T0+4 天只有 2 天"
+
+
+def test_local_change_restarts_the_clock_and_fix_clears_state(tmp_path):
+    root = make_root(tmp_path)
+    state = tmp_path / "state.json"
+    (root / "notes.txt").write_bytes(b"first wrong content\n")
+    run_at(T0, root, "--state", state)
+    (root / "notes.txt").write_bytes(b"second wrong content\n")   # 下載換過一次內容
+    assert run_at(T0 + 3 * DAY, root, "--state", state)[0] == B.EXIT_WARN
+    (root / "notes.txt").write_bytes(GOOD_FILES["notes.txt"])      # 修好了
+    assert run_at(T0 + 4 * DAY, root, "--state", state)[0] == B.EXIT_OK
+    saved = json.loads(state.read_text(encoding="utf-8"))
+    assert saved["roots"]["sftp_transfer"] == {}, "修好的不一致要從狀態裡消失"
+
+
+def test_without_state_nothing_persists(tmp_path):
+    root = make_root(tmp_path)
+    (root / "notes.txt").write_bytes(b"different\n")
+    assert run_at(T0, root)[0] == B.EXIT_WARN
+    assert run_at(T0 + 30 * DAY, root)[0] == B.EXIT_WARN
+
+
+def test_dev_mode_never_uses_state(tmp_path):
+    root = make_root(tmp_path)
+    (root / "notes.txt").write_bytes(b"edited on CLINK\n")
+    state = tmp_path / "state.json"
+    run_at(T0, root, "--dev", "--state", state)
+    assert run_at(T0 + 30 * DAY, root, "--dev", "--state", state)[0] == B.EXIT_OK
+    assert not state.exists()
+
+
+def test_broken_or_unwritable_state_never_breaks_the_check(tmp_path):
+    root = make_root(tmp_path)
+    (root / "notes.txt").write_bytes(b"different\n")
+    bad = tmp_path / "state.json"
+    bad.write_text("{not json", encoding="utf-8")
+    code, text = run_at(T0, root, "--state", bad)
+    assert code == B.EXIT_WARN and "狀態檔讀不出來" in text
+    code, text = run_at(T0, root, "--state", tmp_path / "no-such-dir" / "state.json")
+    assert code == B.EXIT_WARN and "狀態檔寫不進去" in text
+    assert text.splitlines()[-1].startswith(B.VERDICT_PREFIX + " ")
+
+
+@pytest.mark.parametrize("args", [["--state"], ["--persist-days", "0"], ["--persist-days", "x"]])
+def test_state_option_usage_errors(tmp_path, args):
+    code, text = run(make_root(tmp_path), *args)
+    assert code == B.EXIT_USAGE and "status=ERROR" in verdict(text)
+
+
+def test_persist_days_is_configurable(tmp_path):
+    root = make_root(tmp_path)
+    (root / "notes.txt").write_bytes(b"different\n")
+    state = tmp_path / "state.json"
+    run_at(T0, root, "--state", state, "--persist-days", "1")
+    assert run_at(T0 + DAY, root, "--state", state, "--persist-days", "1")[0] == B.EXIT_FAIL

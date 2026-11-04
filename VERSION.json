@@ -1,5 +1,5 @@
 {
-  "version": "0.32.0",
+  "version": "0.32.2",
   "date": "2026-11-04",
-  "notes": "booster_integrity.py 新增 --repair(必須搭配 --lock):損毀、以及持續不一致中「本機損毀」那一類的檔,在該專案自己的下載 manifest 標成失效(有紀錄的 mtime=-1;沒有紀錄的補 {size:-1, mtime:-1} —— 下載器對「沒有紀錄、同大小」是略過的),下一輪 warm 就整份重抓、原子換名覆蓋。不刪檔、不改名,被檢查的檔一個 byte 都不動(--verify --quarantine 不開的理由在這裡不成立)。不修:持續的版本交錯(岸端那份壞了)、缺少、--dev。修之前用 fcntl.flock 非阻塞地拿 launcher.lock(warm 下載時持有),拿不到就只回報;manifest 讀不出來就不動(避免丟掉下載器的斷點紀錄)。結論行多了 repaired=N。deploy_offline.sh 的 A1b 在非 CLINK、非 --check-only 時傳 --repair --lock share/.env/launcher.lock;有排程重抓時總結註明「已排程 N 個檔在下一輪 warm 重抓」,不再說修不好。測試:test_booster_integrity.py 新增 9 條,包括用真正的 SFTPDownloader + 假 SFTP 的端到端測試(未修復時同大小壞檔被略過;標成失效後整份重抓覆蓋,有紀錄與沒紀錄兩種);test_offline_deploy.py 補部署階段會排程重抓、--check-only 與 CLINK 不修。反證(標記停用)讓 5 條失敗。"
+  "notes": "伺服器以狀態碼拒絕(OSError('Failure') 等,errno 為 None、只帶 SFTP_DESC 訊息)時不再當成斷線:不重連、同一條連線上退避 retry_delay×2^(n-1)(封頂 300 秒),同檔被拒 3 次放棄該檔、連續 3 檔即中止整趟(RemoteServerRejecting → RUN_ABORTED),retry_count 的無限次只適用於真斷線;上下載的逐檔重試與 LIST_RETRY 都套用。起因:2026-11-04 岸端 /fleet 磁碟滿,舊行為每檔 3 秒握手 8 次、無上限,船隊疊起來讓 sshd Exceeded MaxStartups。log_monitor TUI:--watch 時明細/說明彈窗、CSV 檢視、搜尋列閒置超過 max(watch, 600 秒)自動關閉,讓自動同步恢復;起因:10-28~11-04 TUI 行程活著卻 7 天沒同步(彈窗各自阻塞讀鍵),fleet_logs 停更、remote-log-retention 每天 fail-closed。測試:test_uploader/test_downloader 新增 TestServerStatusFailure*,test_tui 新增 _ModalKeys 與彈窗閒置關閉;另以 pty 實際驅動 TUI 驗證(main 上彈窗開 8 秒重載 0 次,修正後自動關閉並恢復重載)。"
 }

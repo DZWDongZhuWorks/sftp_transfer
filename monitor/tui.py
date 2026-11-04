@@ -1503,8 +1503,46 @@ def popup_mouse_action(x: int, y: int, bstate: int, *,
     return None
 
 
-def _popup(stdscr, lines, title="明細", hint=" 點擊/任意鍵關閉 "):
-    """置中彈窗；回傳關閉它的按鍵，讓呼叫端能據此再往下鑽一層。"""
+# 【彈窗閒置太久就自己關】主迴圈的 --watch 自動重載只在主迴圈的 getch 回 -1 時才檢查；
+# 明細／說明彈窗、CSV 檢視、搜尋列各自有讀鍵迴圈，開著的時候主迴圈根本回不來。
+# 2026-10-28 03:00 ～ 11-04 03:24 岸端 log_monitor 的 TUI 行程一直活著，卻一次同步都沒跑
+# （這段期間沒有任何 D_*log_monitor*.csv），fleet_logs 鏡像整整停了 7 天；remote-log-retention
+# 看鏡像不新鮮於是每天 fail-closed，岸端 sftp_logs 只增不減。
+# 閒置門檻取 max(watch, 這個值)：--watch 60 的人看一份 CSV 不會一分鐘就被關掉，
+# 而同步最多晚一到兩個週期，不會再停好幾天。
+MODAL_IDLE_CLOSE_SECONDS = 600
+#: _ModalKeys.getch 閒置逾時時回傳的值；呼叫端一律當成「關閉」。
+IDLE_CLOSE = -2
+
+
+class _ModalKeys:
+    """彈窗的讀鍵：沒開 --watch 時照舊阻塞；開了就每秒醒一次，閒置太久回 IDLE_CLOSE。"""
+
+    def __init__(self, watch, clock=None):
+        import time
+
+        self._clock = clock or time.monotonic
+        self.limit = max(float(watch), MODAL_IDLE_CLOSE_SECONDS) if watch else None
+        self.since = self._clock()
+
+    def getch(self, win) -> int:
+        if self.limit is None:
+            return win.getch()
+        win.timeout(1000)
+        while True:
+            ch = win.getch()
+            if ch != -1:
+                self.since = self._clock()
+                return ch
+            if self._clock() - self.since >= self.limit:
+                return IDLE_CLOSE
+
+
+def _popup(stdscr, lines, title="明細", hint=" 點擊/任意鍵關閉 ", watch=0):
+    """置中彈窗；回傳關閉它的按鍵，讓呼叫端能據此再往下鑽一層。
+
+    --watch 時閒置太久回 IDLE_CLOSE（見 MODAL_IDLE_CLOSE_SECONDS）。
+    """
     maxy, maxx = stdscr.getmaxyx()
     body = lines or ["（無明細）"]
     # hint 也要參與寬度計算：否則明細短、提示長時提示會被切掉
@@ -1519,6 +1557,7 @@ def _popup(stdscr, lines, title="明細", hint=" 點擊/任意鍵關閉 "):
     win.keypad(True)  # wrapper 只替 stdscr 開 keypad；滑鼠/方向鍵也要讓子視窗解碼
     view_h = max(1, h - 4)
     off = 0
+    keys = _ModalKeys(watch)
 
     while True:
         off = clamp_scroll(len(body), view_h, off)
@@ -1533,7 +1572,9 @@ def _popup(stdscr, lines, title="明細", hint=" 點擊/任意鍵關閉 "):
         _addstr(win, h - 1, 2, fit_display(hint.rstrip() + shown, w - 4)[0], curses.A_DIM)
         win.refresh()
 
-        ch = win.getch()
+        ch = keys.getch(win)
+        if ch == IDLE_CLOSE:
+            return ch
         if ch == curses.KEY_UP and len(body) > view_h:
             off -= 1
             continue
@@ -1591,7 +1632,9 @@ def _csv_viewer(stdscr, rec, watch) -> None:
 
     view = CsvView()
     rows = source
-    stdscr.timeout(-1)  # 模態期間阻塞讀鍵，不被 --watch 的 1 秒輪詢打斷
+    # 模態期間不被 --watch 的 1 秒輪詢打斷；但閒置太久要自己關（見 MODAL_IDLE_CLOSE_SECONDS）。
+    stdscr.timeout(-1)
+    keys = _ModalKeys(watch)
     try:
         while True:
             maxy, maxx = stdscr.getmaxyx()  # 每幀重讀 → 改視窗大小自動重排
@@ -1625,7 +1668,9 @@ def _csv_viewer(stdscr, rec, watch) -> None:
             _addstr(stdscr, maxy - 1, 0, pad_display(foot, width), curses.A_REVERSE)
             stdscr.refresh()
 
-            ch = stdscr.getch()
+            ch = keys.getch(stdscr)
+            if ch == IDLE_CLOSE:
+                return IDLE_CLOSE
             if ch == curses.KEY_MOUSE:
                 event = _read_mouse()
                 if event is None:
@@ -1660,15 +1705,18 @@ def _device_drilldown(stdscr, dev, watch, repaint) -> None:
             stdscr,
             device_detail_lines(dev),
             hint=" Enter/左鍵 看 CSV｜右鍵/點外側返回｜滾輪瀏覽 ",
+            watch=watch,
         )
         if ch not in _ENTER_KEYS:
             return
-        _csv_viewer(stdscr, dev.latest, watch)
+        if _csv_viewer(stdscr, dev.latest, watch) == IDLE_CLOSE:
+            return  # 閒置關掉的：一路退回主畫面，不要再把明細彈窗開回來重新計時
 
 
-def _prompt_search(stdscr, state: TuiState):
+def _prompt_search(stdscr, state: TuiState, watch=0):
     maxy, maxx = stdscr.getmaxyx()
     buf = list(state.query)
+    keys = _ModalKeys(watch)
     curses.curs_set(1)
     while True:
         text = "".join(buf)
@@ -1678,7 +1726,11 @@ def _prompt_search(stdscr, state: TuiState):
             stdscr.move(maxy - 1, min(7 + len(text), maxx - 2))
         except curses.error:
             pass
-        ch = stdscr.getch()
+        ch = keys.getch(stdscr)
+        if ch == IDLE_CLOSE:  # 打到一半人走了：維持原本的搜尋條件，回主畫面讓同步繼續
+            curses.curs_set(0)
+            stdscr.timeout(1000 if watch else -1)
+            return
         if ch in (10, 13, curses.KEY_ENTER):
             break
         if ch == 27:  # Esc：清除搜尋
@@ -1853,12 +1905,13 @@ def _main_loop(stdscr, args):
         elif act == "cycle_status":
             cycle_status(state)
         elif act == "search":
-            _prompt_search(stdscr, state)
+            _prompt_search(stdscr, state, watch)
+            stdscr.timeout(1000 if watch else -1)
         elif act == "reload":
             tree = reload(tree)
             last = time.monotonic()
         elif act == "help":
-            _popup(stdscr, _HELP_LINES, "說明")
+            _popup(stdscr, _HELP_LINES, "說明", watch=watch)
 
 
 def run_app(args) -> int:

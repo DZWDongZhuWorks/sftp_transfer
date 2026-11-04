@@ -1,5 +1,5 @@
 {
-  "version": "0.31.0",
+  "version": "0.32.0",
   "date": "2026-11-04",
-  "notes": "booster_integrity.py 新增持續不一致的判定(--state / --persist-days,預設 3 天)。三種 WARN(不一致 / 版本交錯 / 缺少)的共同前提是「更新進行到一半」;warm 一天兩輪,同一個不一致的簽名(本地 sha, 發佈版 sha)持續 3 天都沒變就不可能是更新進行中,升級為 FAIL(persistent)並依原類別判讀:不一致 → 本機內容很可能已損毀(大小沒變的 bit rot、截在語法仍完整之處的截斷 —— 結構驗證抓不到、略過分支也不會重抓);版本交錯(內容是一次完整的下載)→ 岸端 STANDARD 上那份很可能本身就壞了(重抓只會抓回同一份);缺少 → 漏送或被刪。簽名任一邊變了就重新計時(岸上發佈新版時不誤判);修好的不一致從狀態裡消失;狀態檔讀不出來就從頭計時、寫不進去只提醒,都不讓檢查本身失敗;--dev 不使用狀態。結論行多了 persistent=N。deploy_offline.sh 的 A1b 在非 CLINK 時傳 --state share/.env/booster_integrity_state.json(不在 OTA 範圍內),FAIL 的總結改成「損毀 N 個、持續不一致 M 個」,並提示 [PERSISTENT] 的岸端判讀要先修 STANDARD。測試:test_booster_integrity.py 新增 12 條(用注入的 now 模擬時間;反證停用升級讓 4 條失敗),test_offline_deploy.py 補狀態檔參數的契約。"
+  "notes": "booster_integrity.py 新增 --repair(必須搭配 --lock):損毀、以及持續不一致中「本機損毀」那一類的檔,在該專案自己的下載 manifest 標成失效(有紀錄的 mtime=-1;沒有紀錄的補 {size:-1, mtime:-1} —— 下載器對「沒有紀錄、同大小」是略過的),下一輪 warm 就整份重抓、原子換名覆蓋。不刪檔、不改名,被檢查的檔一個 byte 都不動(--verify --quarantine 不開的理由在這裡不成立)。不修:持續的版本交錯(岸端那份壞了)、缺少、--dev。修之前用 fcntl.flock 非阻塞地拿 launcher.lock(warm 下載時持有),拿不到就只回報;manifest 讀不出來就不動(避免丟掉下載器的斷點紀錄)。結論行多了 repaired=N。deploy_offline.sh 的 A1b 在非 CLINK、非 --check-only 時傳 --repair --lock share/.env/launcher.lock;有排程重抓時總結註明「已排程 N 個檔在下一輪 warm 重抓」,不再說修不好。測試:test_booster_integrity.py 新增 9 條,包括用真正的 SFTPDownloader + 假 SFTP 的端到端測試(未修復時同大小壞檔被略過;標成失效後整份重抓覆蓋,有紀錄與沒紀錄兩種);test_offline_deploy.py 補部署階段會排程重抓、--check-only 與 CLINK 不修。反證(標記停用)讓 5 條失敗。"
 }

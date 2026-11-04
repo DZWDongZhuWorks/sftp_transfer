@@ -4,6 +4,7 @@
 用法:
     python3 deploy/booster_integrity.py <專案根目錄> [<專案根目錄> ...] [--dev]
                                         [--state <狀態檔>] [--persist-days <天數>]
+                                        [--repair --lock <launcher.lock>]
 
     deploy_offline.sh 的 stage_booster_integrity 會帶上 share/sftp_transfer 與 share/scheduler。
     --dev:CLINK 開發機。工作樹與發佈版本來就不同,「不一致」只列為 INFO,也不拿下載 manifest
@@ -12,6 +13,8 @@
     --state:記住每個「不一致」第一次出現的時間(見下方〈持續不一致〉)。deploy_offline.sh 傳
            share/.env/booster_integrity_state.json(不在 OTA 範圍內)。不給就不判持續。
     --persist-days:同一個不一致持續幾天才升級為 FAIL(預設 3)。
+    --repair:把確定要重抓的檔在下載 manifest 標成失效,下一輪下載就會整份覆蓋(見下方〈修復〉)。
+           必須同時給 --lock(launcher.lock):warm 下載時持有它,拿不到就不修,不跟下載搶寫 manifest。
 
 離開碼:0 = OK、1 = FAIL(有損毀或持續不一致)、2 = WARN(有不一致 / 缺檔 / 無法驗證)、3 = 參數錯誤。
 
@@ -51,11 +54,22 @@
   * 缺少 → 不是新版還沒抓到,是漏送或被刪。
 簽名任一邊變了就重新計時:岸上發佈新版(stamp 的 sha 變了)時,換版期間的不一致不會被誤判。
 
+【修復(--repair)】偵測到壞檔之後,原本只能人工 --force-redownload。下載的略過分支只比 manifest
+記的遠端 size/mtime,所以大小沒變的壞檔每一輪都會被略過。--repair 把要修的那幾筆在**該專案自己
+的下載 manifest**(根目錄的 .sftp_download_manifest.json)標成失效:有紀錄的把 mtime 設成 -1,沒有
+紀錄的補一筆 {size:-1, mtime:-1}(下載器對「沒有紀錄、大小相同」是略過的)。下一輪 warm 就走「來源
+已更新,覆蓋舊檔案」,整份重抓、原子換名。**不刪檔、不改名**:--verify --quarantine 刻意不開的理由
+(manifest 不剪枝,隔離後抓不回來的檔會永久消失)在這裡不成立 —— 檔案一直都在,只是會被覆蓋。
+  修:損毀(有證據)、持續不一致中「本機損毀」那一類。
+  不修:持續的版本交錯(岸端那份壞了,重抓只會抓回同一份)、缺少(下載本來就會補)、--dev。
+修過的檔這一輪仍算 FAIL —— 它要到下一輪下載後才真的好。
+
 【一定要印結論行】最後一行固定是 `BOOSTER_INTEGRITY status=...`。呼叫端**必須**以這一行為準,
 不能只看離開碼:這支檔本身也可能被截成 0 byte,而空的 .py 執行起來就是 rc=0 —— 那正是本檢查
 要抓的問題。沒有結論行 = 檢查器自己壞了。
 
-只讀:不改、不刪、不改名任何檔案,也不連網路。不印任何檔案內容(config/ 裡有密碼檔)。
+預設只讀:不改、不刪、不改名任何檔案,也不連網路;唯一的寫入是 --repair 改**下載 manifest**
+(被檢查的檔本身一個 byte 都不動)與 --state 的狀態檔。不印任何檔案內容(config/ 裡有密碼檔)。
 Python 3.6 相容、只用標準庫:由 deploy_offline.sh 的 $PYTHON_BIN(系統 python3)執行,
 而且刻意不 import 本專案任何模組 —— 被檢查的對象不能同時是檢查器的相依。
 """
@@ -68,6 +82,11 @@ import subprocess
 import sys
 import tempfile
 import time
+
+try:
+    import fcntl
+except ImportError:   # 非 POSIX:沒有 flock,就不修(--repair 只在船端的 Linux 上有意義)
+    fcntl = None
 from collections import OrderedDict
 
 STAMP_NAME = "VERSION.stamp.json"
@@ -190,6 +209,9 @@ class RootReport(object):
         self.stamp_broken = False
         # 不一致的簽名:rel → (本地 sha 或 "missing", 發佈版 sha)。給 apply_persistence 用。
         self.signatures = {}
+        # 持續不一致的原類別:rel → MISMATCH / SKEW / MISSING。決定要不要修。
+        self.persistent_origin = {}
+        self.repaired = []
 
 
 def check_root(root, dev=False, bash=None):
@@ -294,6 +316,7 @@ def apply_persistence(report, previous, now, persist_days):
                             "first_seen": first_seen}
             if now - first_seen >= threshold:
                 days = int((now - first_seen) // 86400)
+                report.persistent_origin[rel] = category
                 report.findings[PERSISTENT].append(
                     (rel, "已連續 {} 天{}".format(days, PERSISTENT_HINT[category])))
             else:
@@ -323,6 +346,78 @@ def save_state(path, roots_state, out):
         os.replace(tmp, path)
     except OSError as exc:
         out.write("[WARN] 狀態檔寫不進去,下次無法判斷是否持續:{}({})\n".format(path, _one_line(exc)))
+
+
+def repair_targets(report):
+    """要在下載 manifest 標成失效的檔:損毀(讀得到的)與持續不一致中的本機損毀那一類。"""
+    targets = [rel for rel, detail in report.findings[CORRUPT] if not detail.startswith("無法讀取")]
+    targets += [rel for rel, _ in report.findings[PERSISTENT]
+                if report.persistent_origin.get(rel) == MISMATCH]
+    return targets
+
+
+def invalidate_entries(root, rels):
+    """在 root 的下載 manifest 把 rels 標成失效,原子寫回。回傳實際標了幾筆;manifest 壞掉回 None。
+
+    有紀錄:mtime = -1(下載器的 unchanged 判斷就不成立)。沒有紀錄:補 {size:-1, mtime:-1} ——
+    下載器對「沒有紀錄、本地與遠端同大小」是姑且略過的,不補一筆壞檔就永遠不會被重抓。
+    """
+    path = os.path.join(root, DOWNLOAD_MANIFEST_NAME)
+    manifest, error = _load_json_dict(path)
+    if error is not None:
+        return None
+    manifest = manifest or {}
+    changed = 0
+    for rel in rels:
+        entry = manifest.get(rel)
+        if isinstance(entry, dict):
+            if entry.get("mtime") != -1:
+                entry["mtime"] = -1
+                changed += 1
+        else:
+            manifest[rel] = {"size": -1, "mtime": -1}
+            changed += 1
+    if changed:
+        fd, tmp = tempfile.mkstemp(dir=root, prefix=".sftp_manifest.", suffix=".tmp")
+        with os.fdopen(fd, "w", encoding="utf-8") as handle:
+            json.dump(manifest, handle, ensure_ascii=False, indent=2)   # 與 downloader 同格式
+        os.replace(tmp, path)
+    return changed
+
+
+def acquire_lock(path):
+    """非阻塞地拿 launcher.lock。拿到回傳 fd(呼叫端負責關),拿不到回 None。"""
+    if fcntl is None:
+        return None
+    try:
+        fd = os.open(path, os.O_WRONLY | os.O_APPEND | os.O_CREAT, 0o644)
+    except OSError:
+        return None
+    try:
+        fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+    except OSError:
+        os.close(fd)
+        return None
+    return fd
+
+
+def repair_root(report, out):
+    targets = repair_targets(report)
+    if not targets:
+        return
+    try:
+        changed = invalidate_entries(report.root, targets)
+    except OSError as exc:
+        out.write("  [REPAIR] 無法寫入下載 manifest,沒有排程重抓:{}\n".format(_one_line(exc)))
+        return
+    if changed is None:
+        out.write("  [REPAIR] 下載 manifest 讀不出來,不動它(避免覆蓋掉下載器的斷點紀錄)\n")
+        return
+    report.repaired = targets
+    for rel in targets[:LIST_LIMIT]:
+        out.write("  [REPAIR] {} —— 已在下載 manifest 標成失效,下一輪下載會整份重抓覆蓋\n".format(rel))
+    if len(targets) > LIST_LIMIT:
+        out.write("  …另有 {} 個已排程重抓\n".format(len(targets) - LIST_LIMIT))
 
 
 def root_status(report, dev):
@@ -374,6 +469,8 @@ def main(argv=None, out=None, now=None):
     args = list(sys.argv[1:] if argv is None else argv)
     dev = False
     state_path = None
+    lock_path = None
+    repair = False
     persist_days = DEFAULT_PERSIST_DAYS
     roots = []
     i = 0
@@ -384,13 +481,17 @@ def main(argv=None, out=None, now=None):
         elif arg in ("-h", "--help"):
             out.write(__doc__)
             return EXIT_OK
-        elif arg in ("--state", "--persist-days"):
+        elif arg == "--repair":
+            repair = True
+        elif arg in ("--state", "--persist-days", "--lock"):
             if i + 1 >= len(args):
                 return _usage_error(out, "{} 需要一個值".format(arg))
             value = args[i + 1]
             i += 1
             if arg == "--state":
                 state_path = value
+            elif arg == "--lock":
+                lock_path = value
             else:
                 try:
                     persist_days = float(value)
@@ -405,6 +506,13 @@ def main(argv=None, out=None, now=None):
         i += 1
     if not roots:
         return _usage_error(out, "至少要指定一個專案根目錄")
+    if repair and not lock_path:
+        return _usage_error(out, "--repair 需要 --lock <launcher.lock>(不能跟正在跑的下載搶寫 manifest)")
+    lock_fd = None
+    if repair and not dev:
+        lock_fd = acquire_lock(lock_path)
+        if lock_fd is None:
+            out.write("[INFO] {} 有人持有(下載進行中?)或無法取得 → 本輪不修,只回報\n".format(lock_path))
     # --dev(CLINK):工作樹本來就跟發佈版不同,「持續」沒有意義。
     use_state = state_path is not None and not dev
     previous_state = load_state(state_path, out) if use_state else {}
@@ -414,16 +522,22 @@ def main(argv=None, out=None, now=None):
     totals = OrderedDict((key, 0) for key in CATEGORY_LABEL)
     statuses = []
     unverified = 0
+    repaired = 0
     for root in roots:
         report = check_root(root, dev=dev, bash=bash)
         if use_state and not report.unverified:
             new_state[report.name] = apply_persistence(
                 report, previous_state.get(report.name, {}), now, persist_days)
         statuses.append(print_report(report, dev, out))
+        if lock_fd is not None and not report.unverified:
+            repair_root(report, out)
+        repaired += len(report.repaired)
         unverified += 1 if report.unverified else 0
         for key, items in report.findings.items():
             totals[key] += len(items)
 
+    if lock_fd is not None:
+        os.close(lock_fd)
     if use_state:
         save_state(state_path, new_state, out)
     if "FAIL" in statuses:
@@ -433,9 +547,9 @@ def main(argv=None, out=None, now=None):
     else:
         overall, code = "OK", EXIT_OK
     out.write("{} status={} roots={} corrupt={} persistent={} mismatch={} skew={} missing={} "
-              "unverified={}{}\n"
+              "unverified={} repaired={}{}\n"
               .format(VERDICT_PREFIX, overall, len(roots), totals[CORRUPT], totals[PERSISTENT],
-                      totals[MISMATCH], totals[SKEW], totals[MISSING], unverified,
+                      totals[MISMATCH], totals[SKEW], totals[MISSING], unverified, repaired,
                       " dev=1" if dev else ""))
     return code
 

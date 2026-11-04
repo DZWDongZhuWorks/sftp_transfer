@@ -1498,3 +1498,69 @@ class TestReconnectGiveUp:
         assert aborted and "Network is unreachable" in aborted[0]
         from monitor.log_monitor import _RE_ABORT
         assert "Network is unreachable" in _RE_ABORT.search(aborted[0]).group(1)
+
+
+class TestSkipSummaryLine:
+    """「版本相符而略過」收成一行（2026-11-04：dashboard 紀錄 82% 是逐檔略過行）。"""
+
+    def _run(self, uploader_factory, tmp_path, fake, caplog):
+        d = uploader_factory(wait_for_network=False, recursive=False, remote_path=DASHBOARD_REMOTE)
+        d._connect_with_retry = MagicMock(side_effect=lambda: setattr(d, "sftp", fake))
+        caplog.clear()
+        with caplog.at_level(logging.INFO):
+            ok = d.run()
+        return ok, [r.message for r in caplog.records]
+
+    def test_version_matched_skips_become_one_line(self, uploader_factory, tmp_path, caplog):
+        _reports(tmp_path, 5)
+        fake = _CountingSFTP(files={})
+        assert self._run(uploader_factory, tmp_path, fake, caplog)[0] is True   # 第一趟：全傳、寫 manifest
+        _write(tmp_path / "dashboard_report_new.csv", b"new")
+
+        ok, messages = self._run(uploader_factory, tmp_path, fake, caplog)
+
+        assert ok is True
+        assert not any("略過（已完整上傳）" in m for m in messages)
+        summary = [m for m in messages if "FILE_DECISION" in m and 'reason="manifest_version_match"' in m]
+        assert len(summary) == 1
+        assert "略過 5 個已完整上傳的檔" in summary[0] and "count=5" in summary[0]
+        end = [i for i, m in enumerate(messages) if "上傳任務結束" in m][0]
+        assert messages.index(summary[0]) < end                 # 在結尾彙總之前
+        assert "成功 1，略過 5，失敗 0" in messages[end]         # 結尾的數字不受影響
+        from monitor.log_monitor import _RE_SUMMARY
+        assert _RE_SUMMARY.search(messages[end]).groups()[1:] == ("1", "5", "0")
+
+    def test_nothing_skipped_writes_no_summary(self, uploader_factory, tmp_path, caplog):
+        _reports(tmp_path, 3)
+        ok, messages = self._run(uploader_factory, tmp_path, _CountingSFTP(files={}), caplog)
+        assert ok is True
+        assert not any('reason="manifest_version_match"' in m for m in messages)
+
+    def test_size_only_skip_without_manifest_is_still_logged_per_file(
+        self, uploader_factory, tmp_path, caplog
+    ):
+        _reports(tmp_path, 3)
+        fake = _CountingSFTP(files=_already_uploaded(tmp_path, DASHBOARD_REMOTE))
+        ok, messages = self._run(uploader_factory, tmp_path, fake, caplog)
+        assert ok is True
+        per_file = [m for m in messages if 'reason="same_size_without_manifest"' in m]
+        assert len(per_file) == 3                                # 判斷比較弱：逐檔留下
+        assert not any('reason="manifest_version_match"' in m for m in messages)
+
+    def test_summary_is_written_even_when_the_run_aborts(self, uploader_factory, tmp_path, caplog):
+        _reports(tmp_path, 4)
+        fake = _CountingSFTP(files={})
+        assert self._run(uploader_factory, tmp_path, fake, caplog)[0] is True
+        _write(tmp_path / "zz_last.csv", b"new")                 # 排在最後、會觸發上傳
+        real_open = fake.open
+
+        def open_(path, mode="r", *a, **kw):
+            if path.endswith("zz_last.csv") and "w" in mode:
+                raise RuntimeError("boom")                       # 走 RUN_ABORTED
+            return real_open(path, mode, *a, **kw)
+
+        fake.open = open_
+        ok, messages = self._run(uploader_factory, tmp_path, fake, caplog)
+        assert ok is False
+        summary = [m for m in messages if 'reason="manifest_version_match"' in m]
+        assert len(summary) == 1 and "count=4" in summary[0]

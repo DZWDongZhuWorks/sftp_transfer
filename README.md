@@ -688,6 +688,7 @@ manifest 不能當證據：2026-09-22 實測 `.sftp_download_manifest.json` 的 
 | `MODE_ALIGNED` | 內容未變更、但兩端 mode 不同，已只補權限不重傳；含 `old_mode` / `new_mode`（八進位字串） |
 | `VERIFY_MISMATCH` / `VERIFY_QUARANTINED` | `--verify` 發現本地檔內容與完整下載當時的整檔 SHA-256 不符（含 `expected_sha256` / `actual_sha256`）；有 `--quarantine` 時接著記改名後的 `quarantined_as` |
 | `VERIFY_SUMMARY` | `--verify` 結尾彙總：`ok` / `mismatch` / `quarantined` / `no_baseline` / `missing` / `size_differs` / `unreadable` 筆數、`hashed_bytes`、`elapsed_seconds` |
+| `FILE_DECISION` | 單檔判斷（覆蓋、另存、只憑大小略過等）逐檔記錄；**大小與 mtime 都與版本紀錄相符而略過的檔不逐檔記**，每個來源跑完時收成一行 `略過 N 個已完整上傳／下載的檔`（`reason="manifest_version_match"`、`count=N`）。逐檔略過行曾占 dashboard 上傳紀錄 82% 的容量，而且每份都經衛星傳回岸端 |
 | `LIST_RETRY` / `TRANSFER_RETRY` / `TRANSFER_ERROR` | 清單、單檔傳輸的階段、重試資訊、例外及最終動作 |
 | `LOG_UPLOAD_ATTEMPT` / `LOG_UPLOAD_RETRY` | 回傳 Log 的目的地，以及 `reused_connection`（是否沿用傳輸階段的連線，見下方【連線次數】）；沿用的連線失效時會出現 `LOG_UPLOAD_RETRY` 並重連一次 |
 

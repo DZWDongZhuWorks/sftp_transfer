@@ -339,6 +339,35 @@ class SFTPBase:
         self._ignore_spec = None
         # 這條連線上已確認存在（或剛建立）的遠端目錄，見 _ensure_remote_dir；_close() 時清空。
         self._remote_dirs_ok = set()
+        # 本來源累積、還沒寫進 log 的「版本相符而略過」檔數，見 _emit_skip_summary。
+        self._skip_tally = 0
+
+    def _emit_skip_summary(self, direction, source):
+        """把「版本相符而略過」的檔收成一行寫進 log（每個來源跑完、以及任務收尾時各叫一次）。
+
+        【為什麼不逐檔記】2026-11-04 抽樣 300 份 dashboard_report 上傳紀錄：中位數一份 89 行、
+        26 KB，其中 50 行是「略過（已完整上傳）」、實際上傳 1 個檔 —— 略過行占容量 82%。
+        dashboard 紀錄占岸端 sftp_logs 的 65%，每一份都從船上經衛星傳回岸端。逐檔略過行
+        沒有任何程式在讀（log_monitor 只解析結尾的「成功 N，略過 N，失敗 N」），而它記的
+        內容（大小、mtime 都與版本紀錄相符）本來就在 manifest 裡。
+
+        只收這一種：只用大小比對的略過（沒有版本紀錄）、覆蓋、改名另存這些真的有做判斷的
+        決定照樣逐檔記，它們少而且查問題時用得到。
+        """
+        count, self._skip_tally = self._skip_tally, 0
+        if not count:
+            return
+        word = "上傳" if direction == "upload" else "下載"
+        self.logger.info(diagnostic_message(
+            "FILE_DECISION",
+            f"略過 {count} 個已完整{word}的檔（大小與 mtime 皆與版本紀錄相符）",
+            direction=direction,
+            reason="manifest_version_match",
+            count=count,
+            source=source,
+            verification="size_and_mtime",
+            action="skip",
+        ))
 
     def _reset_remote_cache(self):
         """丟掉所有「這條連線上看過的遠端狀態」。斷線重連後伺服器那邊可能已經變了。"""
@@ -1099,7 +1128,11 @@ class SFTPDownloader(SFTPBase):
                     # entry 若是傳到一半的檢查點，它描述的是還在 .part 裡的那一版、不是目的地 ——
                     # 不能略過，交給下面的 .part 接續驗證（見 checkpoint_incomplete）。
                     if unchanged and force is None and not checkpoint_incomplete(known):
-                        self.logger.info(f"略過（已完整下載）: {rel_path}")
+                        if known is None:
+                            # 沒有版本紀錄、只憑大小相同就略過：判斷比較弱，逐檔留下來。
+                            self.logger.info(f"略過（已完整下載，僅大小比對）: {rel_path}")
+                        else:
+                            self._skip_tally += 1  # 收成一行，見 _emit_skip_summary
                         self._align_local_mode(local_file, local_stat, remote_stat, rel_path)
                         # 上一次完整下載留下的整檔雜湊要帶著走。舊版在這裡把 entry 整筆覆寫成
                         # {size, mtime}，於是任何檔只要被略過一次，雜湊就沒了 —— 船上正常運作的
@@ -1788,6 +1821,7 @@ class SFTPDownloader(SFTPBase):
                             self._connect_with_retry()
 
                 # 這組工作跑完：把累積的「略過」項目一次寫回。
+                self._emit_skip_summary("download", local_root)
                 self._flush_manifest(local_root)
         except paramiko.AuthenticationException:
             self.logger.error("=== 任務中止：帳號或密碼錯誤 ===")
@@ -1806,6 +1840,7 @@ class SFTPDownloader(SFTPBase):
             # 中止（含 SIGTERM 取消）時，尚未落盤的略過項目也寫回，避免下一趟白跑一次比對。
             # 正常路徑上面已經寫過，這裡因 _manifest_dirty 為 False 而不會重複寫。
             if current_local_root is not None:
+                self._emit_skip_summary("download", current_local_root)
                 self._flush_manifest(current_local_root)
 
         # 刪除統計接在「失敗 N」**之後**：monitor/log_monitor.py 與 run_selected_transfers.py

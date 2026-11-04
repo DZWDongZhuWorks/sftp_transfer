@@ -1,5 +1,5 @@
 {
-  "version": "0.32.0",
+  "version": "0.32.1",
   "date": "2026-11-04",
-  "notes": "booster_integrity.py 新增 --repair(必須搭配 --lock):損毀、以及持續不一致中「本機損毀」那一類的檔,在該專案自己的下載 manifest 標成失效(有紀錄的 mtime=-1;沒有紀錄的補 {size:-1, mtime:-1} —— 下載器對「沒有紀錄、同大小」是略過的),下一輪 warm 就整份重抓、原子換名覆蓋。不刪檔、不改名,被檢查的檔一個 byte 都不動(--verify --quarantine 不開的理由在這裡不成立)。不修:持續的版本交錯(岸端那份壞了)、缺少、--dev。修之前用 fcntl.flock 非阻塞地拿 launcher.lock(warm 下載時持有),拿不到就只回報;manifest 讀不出來就不動(避免丟掉下載器的斷點紀錄)。結論行多了 repaired=N。deploy_offline.sh 的 A1b 在非 CLINK、非 --check-only 時傳 --repair --lock share/.env/launcher.lock;有排程重抓時總結註明「已排程 N 個檔在下一輪 warm 重抓」,不再說修不好。測試:test_booster_integrity.py 新增 9 條,包括用真正的 SFTPDownloader + 假 SFTP 的端到端測試(未修復時同大小壞檔被略過;標成失效後整份重抓覆蓋,有紀錄與沒紀錄兩種);test_offline_deploy.py 補部署階段會排程重抓、--check-only 與 CLINK 不修。反證(標記停用)讓 5 條失敗。"
+  "notes": "傳輸紀錄瘦身:大小與 mtime 都與版本紀錄相符而略過的檔(reason=manifest_version_match)不再逐檔寫 log,每個來源跑完(及任務收尾的 finally)收成一行 [FILE_DECISION] 略過 N 個已完整上傳/下載的檔(count=N);只憑大小比對的略過(沒有版本紀錄)、覆蓋、另存照舊逐檔記。上傳與下載兩端都改。起因:2026-11-04 抽樣 300 份 dashboard_report 上傳紀錄,中位數一份 89 行/26 KB,其中 50 行是逐檔略過、實際上傳 1 個檔,略過行占容量 82%;dashboard 紀錄占岸端 sftp_logs 的 65%,每份都經衛星從船上傳回。沒有程式讀逐檔略過行(log_monitor 只解析結尾的「成功 N,略過 N,失敗 N」,數字不變)。以真實紀錄回放估算:dashboard 上傳紀錄 28.9→4.7 KB/份(-84%)、全部上傳紀錄 -74%、下載紀錄 -85%。測試:test_uploader.TestSkipSummaryLine(4 條,含中止時仍寫出彙總、log_monitor 的 _RE_SUMMARY 解析不變)、test_downloader.TestSkipSummaryLineDownload(2 條)。"
 }

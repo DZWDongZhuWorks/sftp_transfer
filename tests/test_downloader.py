@@ -3173,3 +3173,37 @@ class TestDeleteSourceFilters:
         assert "已刪除來源 1，保留 1" in summary
         from run_selected_transfers import TRANSFER_SUMMARY_RE
         assert TRANSFER_SUMMARY_RE.search(summary).groups() == ("2", "0", "0")
+
+
+class TestSkipSummaryLineDownload:
+    """下載端與上傳端同一套：版本相符的略過收成一行，只憑大小的略過照舊逐檔記。"""
+
+    FILES = {"/remote/a.txt": b"A", "/remote/b.txt": b"BB", "/remote/c.txt": b"CCC"}
+    MTIMES = {"/remote/a.txt": 1, "/remote/b.txt": 2, "/remote/c.txt": 3}
+
+    def _run(self, downloader_factory, fake_sftp_factory, caplog):
+        d = downloader_factory(wait_for_network=False)
+        d._connect_with_retry = MagicMock(
+            side_effect=lambda: setattr(d, "sftp", fake_sftp_factory(files=self.FILES, mtimes=self.MTIMES)))
+        d._close = MagicMock()
+        caplog.clear()
+        with caplog.at_level(logging.INFO):
+            ok = d.run()
+        return ok, [r.message for r in caplog.records]
+
+    def test_second_run_writes_one_summary_line(self, downloader_factory, fake_sftp_factory, caplog):
+        assert self._run(downloader_factory, fake_sftp_factory, caplog)[0] is True
+        ok, messages = self._run(downloader_factory, fake_sftp_factory, caplog)
+        assert ok is True
+        assert not any("略過（已完整下載）" in m for m in messages)
+        summary = [m for m in messages if 'reason="manifest_version_match"' in m]
+        assert len(summary) == 1 and "略過 3 個已完整下載的檔" in summary[0]
+        assert any("成功 0，略過 3，失敗 0" in m for m in messages)
+
+    def test_size_only_skip_is_still_logged_per_file(self, downloader_factory, fake_sftp_factory, caplog, tmp_path):
+        for name, data in (("a.txt", b"A"), ("b.txt", b"BB"), ("c.txt", b"CCC")):
+            (tmp_path / name).write_bytes(data)                  # 本地已有、但沒有 manifest
+        ok, messages = self._run(downloader_factory, fake_sftp_factory, caplog)
+        assert ok is True
+        assert sum("略過（已完整下載，僅大小比對）" in m for m in messages) == 3
+        assert not any('reason="manifest_version_match"' in m for m in messages)

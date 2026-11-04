@@ -327,18 +327,22 @@ class SFTPUploader(SFTPBase):
                 if remote_disk_size == local_size:
                     # 大小相同：用版本紀錄（若有）判斷是否真的未變更；沒有紀錄則姑且視為未變更略過。
                     if known is None or (known.get("size") == local_size and known.get("mtime") == local_mtime):
-                        self.logger.info(diagnostic_message(
-                            "FILE_DECISION",
-                            f"略過（已完整上傳）: {rel_path}",
-                            direction="upload",
-                            reason="same_size_without_manifest" if known is None else "manifest_version_match",
-                            file=rel_path,
-                            local_size=local_size,
-                            local_mtime=local_mtime,
-                            remote_size=remote_disk_size,
-                            verification="size_only" if known is None else "size_and_mtime",
-                            action="skip",
-                        ))
+                        if known is None:
+                            # 沒有版本紀錄、只憑大小相同就略過：判斷比較弱，逐檔留下來。
+                            self.logger.info(diagnostic_message(
+                                "FILE_DECISION",
+                                f"略過（已完整上傳）: {rel_path}",
+                                direction="upload",
+                                reason="same_size_without_manifest",
+                                file=rel_path,
+                                local_size=local_size,
+                                local_mtime=local_mtime,
+                                remote_size=remote_disk_size,
+                                verification="size_only",
+                                action="skip",
+                            ))
+                        else:
+                            self._skip_tally += 1  # 收成一行，見 SFTPBase._emit_skip_summary
                         self._manifest[rel_path] = {"size": local_size, "mtime": local_mtime}
                         self._manifest_dirty = True  # 收尾一次寫回，見 _flush_manifest
                         self._align_remote_mode(remote_file, remote_stat, local_stat, rel_path)
@@ -847,6 +851,7 @@ class SFTPUploader(SFTPBase):
                                 self._connect_with_retry()
 
                     # 這個來源跑完：把累積的「略過」項目一次寫回。
+                    self._emit_skip_summary("upload", source)
                     self._flush_manifest(local_root)
         except paramiko.AuthenticationException:
             self.logger.error("=== 任務中止：帳號或密碼錯誤 ===")
@@ -865,6 +870,7 @@ class SFTPUploader(SFTPBase):
             # 中止（含 SIGTERM 取消）時，尚未落盤的略過項目也寫回，避免下一趟白跑一次比對。
             # 正常路徑上面已經寫過，這裡因 _manifest_dirty 為 False 而不會重複寫。
             if current_local_root is not None:
+                self._emit_skip_summary("upload", current_local_root)
                 self._flush_manifest(current_local_root)
 
         # 刪除統計接在「失敗 N」**之後**：monitor/log_monitor.py 與 run_selected_transfers.py

@@ -1299,6 +1299,40 @@ class UnattendedReconcileTests(unittest.TestCase):
         self.assertIn('TEAMVIEWER_STATUS="未執行"\n', self.SOURCE.split("stage_teamviewer() {")[0],
                       "set -u 下兩份總結都會讀它:要在 file scope 先給值")
 
+    # --- 停用 GNOME tracker(A8c)----------------------------------------------
+
+    def test_gnome_tracker_never_aborts_the_round(self):
+        """停用 tracker 不是部署的必要條件:失敗不能讓後面的項目停擺。沒有 exit,失敗走 unattended_note_fail。"""
+        body = self._stage_body("stage_gnome_tracker")
+        self.assertIsNone(re.search(r"^\s*exit\b", body, re.M), "stage_gnome_tracker 裡不該有 exit")
+        self.assertIn('unattended_note_fail "GNOME tracker 套用失敗', body)
+
+    def test_gnome_tracker_judges_before_it_changes_and_needs_no_sudo(self):
+        """要不要停由 install_gnome_tracker_off.sh --status 判斷(依船策略、這台有沒有 tracker、
+        哪些是那支腳本停的),這裡不重寫一份。全是 systemctl --user:不該有 sudo 閘門 ——
+        加了的話,沒有密碼檔的船(多數)會永遠補不到。"""
+        body = self._stage_body("stage_gnome_tracker")
+        lines = [ln.strip() for ln in body.splitlines()]
+        status_at = lines.index('run_rc bash "$installer" --status')
+        apply_at = lines.index('run_rc bash "$installer"')
+        self.assertLess(status_at, apply_at)
+        before = "\n".join(lines[status_at:apply_at])
+        for guard in ('if [ "$CHECK_ONLY" -eq 1 ]; then', "5) ;;", "7) TRACKER_STATUS="):
+            self.assertIn(guard, before, "套用之前少了:{}".format(guard))
+        self.assertNotIn("sudo_obtainable", body)
+        self.assertIsNone(re.search(r"^\s*(run_rc\s+)?sudo\b", body, re.M), "不該呼叫 sudo")
+
+    def test_gnome_tracker_runs_after_teamviewer_and_is_in_both_summaries(self):
+        """A8c:在階段 A 裡、TeamViewer 之後;兩份總結都有它那一欄。"""
+        self.assertLess(self.SOURCE.index("  stage_teamviewer  "),
+                        self.SOURCE.index("  stage_gnome_tracker  "))
+        self.assertLess(self.SOURCE.index("  stage_gnome_tracker  "),
+                        self.SOURCE.index("  stage_launch_decision  "))
+        for summary in ("stage_summary", "stage_summary_unattended"):
+            self.assertIn("GNOME tracker", self._stage_body(summary), summary)
+        self.assertIn('TRACKER_STATUS="未執行"\n', self.SOURCE.split("stage_gnome_tracker() {")[0],
+                      "set -u 下兩份總結都會讀它:要在 file scope 先給值")
+
     # --- booster 完整性 / 版本(A1b)-------------------------------------------
 
     def test_booster_integrity_never_aborts_the_round(self):

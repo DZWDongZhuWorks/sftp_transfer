@@ -35,6 +35,9 @@
 #         etc/teamviewer_update.json 指定的版本(需密碼;不問 [Y/n])。要不要更新由岸端的
 #         依船策略 teamviewer_update 決定(預設關,這一步就什麼都不做);deb 由 scheduler 的
 #         nssms-teamviewer-fetch 先下載並驗證。規格:scheduler/docs/teamviewer-update.md。
+#     8c) scheduler 的 install_gnome_tracker_off.sh → 依船策略 gnome_tracker_off 停用(或恢復)
+#         GNOME 的檔案索引器 tracker(systemctl --user,不需要密碼)。理由:scheduler 的
+#         docs/health-recorder.md §0.1 —— 主碟 eMMC 的寫回逾時都緊跟在 tracker 結束之後。
 #      9) install_setup_ssh_key.sh → 照片同步的免密碼登入(**僅實體 IPC-2**)。
 #         這一步輸入的是**遠端主機的密碼**(給 ssh-copy-id),不是本機 sudo。
 #         nssms-download-photos.timer 每 4 小時跑 script/download_photos.sh,而它以
@@ -190,6 +193,8 @@ TMUX_STATUS="未執行"
 SSH_KEY_STATUS="未執行"
 # TeamViewer 更新的結果。同上:兩份總結都會讀它,而 stage_teamviewer 有好幾個提早 return 的出口。
 TEAMVIEWER_STATUS="未執行"
+# 停用 GNOME tracker 的結果。同上:兩份總結都會讀它,stage_gnome_tracker 有好幾個提早 return 的出口。
+TRACKER_STATUS="未執行"
 # booster(sftp_transfer / scheduler)的版本與完整性。同上:兩份總結都會讀它們。
 BOOSTER_VERSIONS="未讀取"
 BOOSTER_INTEGRITY_STATUS="未執行"
@@ -1911,6 +1916,51 @@ stage_teamviewer() {
   esac
 }
 
+# --- 停用 GNOME tracker(scheduler/install_gnome_tracker_off.sh)--------------
+# 理由在 scheduler 的 docs/health-recorder.md §0.1:2026-11 四艘凍結的 IPC-1 共 13 次主碟 eMMC 寫回逾時
+# (mmc0: cache flush error -110),每一次都緊跟在 GNOME 檔案索引器 tracker 結束之後。
+# 要不要停由岸端的依船策略 gnome_tracker_off 決定(預設關,這一步就什麼都不做);判斷與動作
+# 全在 install_gnome_tracker_off.sh(--status 的離開碼見其檔頭),這裡**不重寫第二份判斷**,
+# 只把離開碼翻成總結的一欄 —— 與 stage_teamviewer 同一個形狀。
+#
+# 【不需要 sudo】全是 systemctl --user,所以沒有 sudo_obtainable 閘門,無人模式照樣做。
+# 【不是部署的必要條件】任何結果都 return;失敗走 unattended_note_fail(unit 會是 failed,岸端看得到)。
+# 【可逆】策略關回去時,那支腳本只恢復它自己停掉的單元(人工停的不碰)。
+stage_gnome_tracker() {
+  local installer="${SHARE_DIR}/scheduler/install_gnome_tracker_off.sh"
+  TRACKER_STATUS="未執行"
+  echo ""
+  info "檢查 GNOME tracker(依船策略 gnome_tracker_off)..."
+  if [ ! -f "$installer" ]; then
+    TRACKER_STATUS="略過(這版 scheduler 沒有 install_gnome_tracker_off.sh)"
+    info "$TRACKER_STATUS"
+    return
+  fi
+  run_rc bash "$installer" --status
+  case "$RC" in
+    0) TRACKER_STATUS="已停用(依船策略)"; return ;;
+    6) TRACKER_STATUS="不適用(這台沒有 tracker)"; return ;;
+    7) TRACKER_STATUS="依船策略沒打開"; return ;;
+    5) ;;
+    *)
+      TRACKER_STATUS="無法判斷(--status exit=$RC)"
+      unattended_note_fail "GNOME tracker 的判斷失敗(--status exit=$RC)" || true
+      return ;;
+  esac
+  if [ "$CHECK_ONLY" -eq 1 ]; then
+    TRACKER_STATUS="需要依船策略變更$DRYRUN_NOTE"
+    return
+  fi
+  mutating "依船策略停用 / 恢復 GNOME tracker(systemctl --user)"
+  run_rc bash "$installer"
+  case "$RC" in
+    0) TRACKER_STATUS="已依船策略套用"; ok "GNOME tracker 已依船策略套用。" ;;
+    *) TRACKER_STATUS="套用失敗(exit=$RC)"
+       err "GNOME tracker 套用失敗(exit=$RC);明天這一輪會再試。"
+       unattended_note_fail "GNOME tracker 套用失敗(exit=$RC)" || true ;;
+  esac
+}
+
 # --- 照片同步的 SSH 金鑰（scheduler/install_setup_ssh_key.sh）---------------
 # nssms-download-photos.timer（每 4 小時，僅實體 IPC-2）會跑 script/download_photos.sh，
 # 而那支腳本以 `ssh -o BatchMode=yes` 連遠端 nsms master —— **沒有金鑰就是立刻失敗**，
@@ -2467,6 +2517,7 @@ stage_summary() {
   printf "  GDM 自動登入    ：%s\n" "$GDM_AUTOLOGIN_STATUS"
   printf "  tmux            ：%s\n" "$TMUX_STATUS"
   printf "  TeamViewer 更新 ：%s\n" "$TEAMVIEWER_STATUS"
+  printf "  GNOME tracker   ：%s\n" "$TRACKER_STATUS"
   printf "  照片同步金鑰    ：%s\n" "$SSH_KEY_STATUS"
   [ "$RUN_HEALTH" -eq 1 ] && printf "  健康檢查        ：%s\n" \
     "$( [ "$HEALTH_RC" -eq 0 ] && echo HEALTHY || echo "有問題（exit=$HEALTH_RC）" )"
@@ -2565,6 +2616,7 @@ stage_summary_unattended() {
   printf "  GDM 自動登入    ：%s\n" "${GDM_AUTOLOGIN_STATUS:-未執行}"
   printf "  tmux            ：%s\n" "${TMUX_STATUS:-未執行}"
   printf "  TeamViewer 更新 ：%s\n" "${TEAMVIEWER_STATUS:-未執行}"
+  printf "  GNOME tracker   ：%s\n" "${TRACKER_STATUS:-未執行}"
   printf "  照片同步金鑰    ：%s\n" "${SSH_KEY_STATUS:-未執行}"
   echo "──────────────────────────────"
   if [ "$UNATTENDED_FAIL" -gt 0 ]; then
@@ -2733,6 +2785,7 @@ main() {
   stage_scheduler_units              # A5/A6/A7 timer + sudoers + 常駐服務
   stage_tmux                         # A8 tmux 離線補齊 —— **必須早於 A10**（見該函式）
   stage_teamviewer                   # A8b TeamViewer 更新（依船策略;scheduler/install_teamviewer.sh）
+  stage_gnome_tracker                # A8c 停用 GNOME tracker（依船策略;scheduler/install_gnome_tracker_off.sh）
   stage_ssh_key                      # A9 照片同步的 SSH 金鑰（僅實體 IPC-2）
   stage_launch_decision              # A10 只收集決定，執行在階段 C
 

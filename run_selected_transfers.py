@@ -8,11 +8,14 @@
 設定檔可用 ``trans_type: telemetry`` 宣告自己是船到岸的資料回傳流，
 不受上述方向鎖管制（見 ``read_trans_type``）。
 
+執行順序＝勾選順序：先勾的先跑，讓操作者決定哪個專案優先（例如先拉最急的
+那份）。取消勾選再重勾會排到最後。
+
 挑選與執行可以拆成兩個行程（``--pick-to`` / ``--run-from``）：挑選需要真正的
 TTY、只要幾秒；執行可能跑很久、從頭到尾不問問題。scheduler 的 dashboard 靠這個
 把挑選留在前景、把傳輸放到背景（見 ``write_selection``）。
 """
-from typing import List, Optional, Set, Tuple
+from typing import List, Optional, Tuple
 
 import argparse
 import curses
@@ -56,7 +59,8 @@ class TransferItem:
 
 @dataclass
 class SelectionState:
-    selected: Set[Path] = field(default_factory=set)
+    # 刻意用 list 而不是 set：順序就是執行順序（勾選先後）。項目只有幾十份，線性查找無妨。
+    selected: List[Path] = field(default_factory=list)
     index: int = 0
     scroll: int = 0
     mode_filter: str = "all"
@@ -196,7 +200,7 @@ def toggle_item(state: SelectionState, item: TransferItem, locked_mode: str) -> 
     if item.path in state.selected:
         state.selected.remove(item.path)
     else:
-        state.selected.add(item.path)
+        state.selected.append(item.path)
     state.message = ""
 
 
@@ -205,12 +209,19 @@ def toggle_all_visible(
     items: List[TransferItem],
     locked_mode: str,
 ) -> None:
-    paths = {item.path for item in items if is_selectable(item, locked_mode)}
-    if paths and paths <= state.selected:
-        state.selected.difference_update(paths)
+    """全選時，尚未勾的項目依畫面順序接在既有勾選之後；已全勾則全部取消。"""
+    paths = [item.path for item in items if is_selectable(item, locked_mode)]
+    if paths and all(path in state.selected for path in paths):
+        state.selected[:] = [path for path in state.selected if path not in paths]
     else:
-        state.selected.update(paths)
+        state.selected.extend(path for path in paths if path not in state.selected)
     state.message = ""
+
+
+def selected_in_order(state: SelectionState, items: List[TransferItem]) -> List[TransferItem]:
+    """依勾選順序取出項目；已不在掃描結果裡的勾選直接略過。"""
+    by_path = {item.path: item for item in items}
+    return [by_path[path] for path in state.selected if path in by_path]
 
 
 def clamp_state(state: SelectionState, rows: List[TransferItem]) -> None:
@@ -277,7 +288,7 @@ def _addstr(win, y: int, x: int, text: str, attr: int = 0) -> None:
         pass
 
 
-def _counts(items: List[TransferItem], selected: Set[Path]) -> Tuple[int, int]:
+def _counts(items: List[TransferItem], selected) -> Tuple[int, int]:
     downloads = sum(item.mode == "download" and item.path in selected for item in items)
     uploads = sum(item.mode == "upload" and item.path in selected for item in items)
     return downloads, uploads
@@ -327,7 +338,13 @@ def _draw(
         item = rows[row_index]
         locked = not is_selectable(item, locked_mode)
         checked = item.path in state.selected
-        mark = "[-]" if locked else ("[x]" if checked else "[ ]")
+        # 勾選欄直接顯示執行序號，操作者不必進確認畫面就看得出先後。
+        if locked:
+            mark = "[--]"
+        elif checked:
+            mark = f"[{state.selected.index(item.path) + 1:>2}]"
+        else:
+            mark = "[  ]"
         mode = f"[{MODE_LABEL[item.mode]}]"
         # 標出回傳類，讓操作者看得出某筆為何在鎖定方向仍可勾選；空白版與 [回傳] 顯示等寬。
         tag = "[回傳]" if item.trans_type == TELEMETRY else "      "
@@ -340,7 +357,7 @@ def _draw(
             attr |= curses.color_pair(1)
         _addstr(stdscr, body_top + line_index, 0, fit_display(line, width), attr)
 
-    message = state.message or "↑↓/j/k 移動  Space 勾選  a 全選目前  x 清除  m 篩選  r 重掃  Enter 執行  q 離開"
+    message = state.message or "↑↓/j/k 移動  Space 勾選(依序)  a 全選目前  x 清除  m 篩選  r 重掃  Enter 執行  q 離開"
     _addstr(stdscr, maxy - 1, 0, fit_display((" " + message).ljust(width), width), curses.A_REVERSE)
     stdscr.refresh()
 
@@ -355,7 +372,7 @@ def _confirm(stdscr, selected: List[TransferItem]) -> bool:
             stdscr,
             0,
             0,
-            fit_display(f" 即將依序執行 {len(selected)} 個專案（下載 {downloads}、上傳 {uploads}）", width),
+            fit_display(f" 即將依勾選順序執行 {len(selected)} 個專案（下載 {downloads}、上傳 {uploads}）", width),
             curses.A_BOLD,
         )
         available = max(0, maxy - 4)
@@ -426,10 +443,10 @@ def _main_loop(stdscr, config_dir: Path, scan_mode: str, locked_mode: str):
         elif action == "reload":
             items = scan_setting_files(config_dir, scan_mode)
             existing = {item.path for item in items}
-            state.selected.intersection_update(existing)
+            state.selected[:] = [path for path in state.selected if path in existing]
             state.message = f"已重新掃描，共 {len(items)} 份設定檔。"
         elif action == "run":
-            selected = [item for item in items if item.path in state.selected]
+            selected = selected_in_order(state, items)
             if not selected:
                 state.message = "尚未選擇任何專案。"
             elif _confirm(stdscr, selected):

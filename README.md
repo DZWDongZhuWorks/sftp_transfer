@@ -44,7 +44,7 @@ sftp_transfer 是一套跑在船端與岸端之間的 SFTP 自動化傳輸工具
 - `example_settings.json`：下載設定檔範本，複製改名為 `settings.json` 後填入實際值即可使用。
 - `example_upload_settings.json`：上傳設定檔範本（`mode` 為 `upload`）。
 - `run_all_downloads.py` / `run_all_uploads.py`：分別遍歷 `config/` 內 `*_download_settings.json` / `*_upload_settings.json` 並依序執行。
-- `run_selected_transfers.py`（或 `script/run_selected_transfers.sh`）：以 curses 掃描上述兩類設定檔，讓操作者勾選本次真正要執行的下載／上傳專案。
+- `run_selected_transfers.py`（或 `script/run_selected_transfers.sh`）：以 curses 掃描上述兩類設定檔，讓操作者勾選本次真正要執行的下載／上傳專案，並依勾選順序執行。
 - `example_download_ignore.txt`：「忽略設定檔」範本，複製改名後依需求增刪規則即可使用。
 - `version_stamp.py`：版本標記產生器，把 `VERSION.json` 的宣告加上 git 狀態與每個待上傳檔案的 sha256 寫成 `VERSION.stamp.json`，詳見下方【版本標記】。
 - `VERSION.json`：本工具自己宣告的版號（與 git tag 對齊）；`VERSION.stamp.json` 是它的產物，已排除於版本控制外。
@@ -273,6 +273,7 @@ GUI：啟動後於頂端工具列的「模式」切換到「上傳」，來源/�
 
 人工挑選本次傳輸：
 - `script/run_selected_transfers.sh`：同時掃描下載／上傳設定，初始不預選；以 `Space` 勾選、`Enter` 確認執行。
+- **執行順序＝勾選順序**：先勾的先跑，勾選欄會顯示序號（`[ 1]`、`[ 2]`…）；取消後再勾會排到最後，想調整先後就取消重勾。`a` 全選時，尚未勾的項目依畫面順序接在已勾項目之後。`--pick-to` 寫出的交接檔同樣保留這個順序，`--run-from` 照它執行。
 - `script/run_selected_transfers.sh --mode download` 或 `--mode upload`：只顯示單一方向。
 - `m` 切換顯示方向、`a` 全選目前畫面、`x` 清除、`r` 重掃 config、`q` 不執行直接離開。
 - 在 CLINK 發佈端，下載項目會維持鎖定，只允許上傳，避免覆蓋尚未發佈的開發修改。

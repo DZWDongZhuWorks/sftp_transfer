@@ -50,14 +50,14 @@ def test_toggle_all_visible_skips_locked_direction(tmp_path):
 
     publish_state = selected.SelectionState()
     selected.toggle_all_visible(publish_state, [download, upload], locked_mode="download")
-    assert publish_state.selected == {upload.path}
+    assert publish_state.selected == [upload.path]
     selected.toggle_item(publish_state, download, locked_mode="download")
     assert download.path not in publish_state.selected
     assert "禁止下載" in publish_state.message
 
     deploy_state = selected.SelectionState()
     selected.toggle_all_visible(deploy_state, [download, upload], locked_mode="upload")
-    assert deploy_state.selected == {download.path}
+    assert deploy_state.selected == [download.path]
     selected.toggle_item(deploy_state, upload, locked_mode="upload")
     assert upload.path not in deploy_state.selected
     assert "回灌 OTA" in deploy_state.message
@@ -156,7 +156,7 @@ def test_toggle_all_visible_includes_telemetry_in_locked_direction(tmp_path):
 
     state = selected.SelectionState()
     selected.toggle_all_visible(state, [deploy_download, telemetry_download], locked_mode="download")
-    assert state.selected == {telemetry_download.path}
+    assert state.selected == [telemetry_download.path]
 
     selected.toggle_item(state, telemetry_download, locked_mode="download")
     assert telemetry_download.path not in state.selected
@@ -253,6 +253,49 @@ def _picked(tmp_path, *names):
     for name in names:
         _touch(tmp_path / name)
     return [item for item in selected.scan_setting_files(tmp_path) if item.path.name in names]
+
+
+def _downloads(tmp_path, *projects):
+    return [
+        selected.TransferItem(tmp_path / f"{p}_download_settings.json", "download", p)
+        for p in projects
+    ]
+
+
+def test_run_order_follows_toggle_order_not_scan_order(tmp_path):
+    a, b, c = _downloads(tmp_path, "a", "b", "c")
+    state = selected.SelectionState()
+    for item in (c, a, b):
+        selected.toggle_item(state, item, locked_mode="upload")
+    assert selected.selected_in_order(state, [a, b, c]) == [c, a, b]
+
+
+def test_untoggle_then_retoggle_moves_item_to_the_end(tmp_path):
+    a, b, c = _downloads(tmp_path, "a", "b", "c")
+    state = selected.SelectionState()
+    for item in (a, b, c, a, a):
+        selected.toggle_item(state, item, locked_mode="upload")
+    assert selected.selected_in_order(state, [a, b, c]) == [b, c, a]
+
+
+def test_toggle_all_appends_unpicked_in_display_order(tmp_path):
+    a, b, c = _downloads(tmp_path, "a", "b", "c")
+    state = selected.SelectionState()
+    selected.toggle_item(state, c, locked_mode="upload")
+    selected.toggle_all_visible(state, [a, b, c], locked_mode="upload")
+    assert selected.selected_in_order(state, [a, b, c]) == [c, a, b]
+
+    # 再按一次＝全部取消，但只動目前畫面上的項目。
+    other = _downloads(tmp_path, "z")[0]
+    selected.toggle_item(state, other, locked_mode="upload")
+    selected.toggle_all_visible(state, [a, b, c], locked_mode="upload")
+    assert state.selected == [other.path]
+
+
+def test_selected_in_order_drops_picks_no_longer_scanned(tmp_path):
+    a, b = _downloads(tmp_path, "a", "b")
+    state = selected.SelectionState(selected=[b.path, a.path])
+    assert selected.selected_in_order(state, [a]) == [a]
 
 
 def test_selection_round_trips_in_picked_order(tmp_path):

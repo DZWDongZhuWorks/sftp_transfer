@@ -1253,6 +1253,7 @@ class UnattendedReconcileTests(unittest.TestCase):
             "stage_docker_group",
             "stage_unattended_boot",
             "stage_scheduler_units",
+            "stage_apt_repair",
             "stage_teamviewer",
         )
         for name in stages:
@@ -1297,6 +1298,41 @@ class UnattendedReconcileTests(unittest.TestCase):
         for summary in ("stage_summary", "stage_summary_unattended"):
             self.assertIn("TeamViewer 更新", self._stage_body(summary), summary)
         self.assertIn('TEAMVIEWER_STATUS="未執行"\n', self.SOURCE.split("stage_teamviewer() {")[0],
+                      "set -u 下兩份總結都會讀它:要在 file scope 先給值")
+
+    # --- apt 依賴修復(A8a)----------------------------------------------------
+
+    def test_apt_repair_never_aborts_the_round(self):
+        """修不好不能讓後面的項目停擺:沒有 exit,失敗一律走 unattended_note_fail。"""
+        body = self._stage_body("stage_apt_repair")
+        self.assertIsNone(re.search(r"^\s*exit\b", body, re.M), "stage_apt_repair 裡不該有 exit")
+        self.assertIn('unattended_note_fail "apt 依賴修復失敗', body)
+
+    def test_apt_repair_judges_before_it_installs(self):
+        """要不要修由 install_apt_repair.sh --status 判斷,這裡不重寫一份。
+        --check-only 與拿不到 sudo 都要在變更呼叫之前就 return。"""
+        body = self._stage_body("stage_apt_repair")
+        lines = [ln.strip() for ln in body.splitlines()]
+        status_at = lines.index('run_rc bash "$installer" --status')
+        install_at = lines.index('run_rc bash "$installer"')
+        self.assertLess(status_at, install_at)
+        before = "\n".join(lines[status_at:install_at])
+        for guard in ('if [ "$CHECK_ONLY" -eq 1 ]; then', "if ! sudo_obtainable; then",
+                      'mutating "以 apt-get 離線補回斷掉的 apt 依賴"', "5) ;;"):
+            self.assertIn(guard, before, "安裝之前少了:{}".format(guard))
+        self.assertNotIn("apt-get", "\n".join(ln for ln in lines if not ln.startswith(("#", "mutating", "info"))),
+                         "apt-get 的參數只能由 scheduler 的 install_apt_repair.sh 決定(不加 -f、--no-remove)")
+
+    def test_apt_repair_runs_before_teamviewer_and_is_in_both_summaries(self):
+        """A8a:**必須在 TeamViewer 之前** —— apt 依賴斷掉時 TeamViewer 的模擬一定失敗;
+        同一輪先修好,TeamViewer 才裝得上(否則要多等一天)。兩份總結都有它那一欄。"""
+        self.assertLess(self.SOURCE.index("  stage_tmux  "),
+                        self.SOURCE.index("  stage_apt_repair  "))
+        self.assertLess(self.SOURCE.index("  stage_apt_repair  "),
+                        self.SOURCE.index("  stage_teamviewer  "))
+        for summary in ("stage_summary", "stage_summary_unattended"):
+            self.assertIn("apt 依賴修復", self._stage_body(summary), summary)
+        self.assertIn('APT_REPAIR_STATUS="未執行"\n', self.SOURCE.split("stage_apt_repair() {")[0],
                       "set -u 下兩份總結都會讀它:要在 file scope 先給值")
 
     # --- 停用 GNOME tracker(A8c)----------------------------------------------

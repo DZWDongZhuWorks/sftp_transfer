@@ -31,6 +31,10 @@
 #         **必須排在 10) 之前**:10) 的提示要據此警告「缺 tmux 時 session 型專案全起不來」。
 #         scheduler 的每一支 start_*.sh 都靠 tmux new-session,啟動器也靠 tmux has-session
 #         對帳 —— 少了它,啟動流程會一項一項 exit 2,而船上又沒有網路可以 apt install。
+#     8a) scheduler 的 install_apt_repair.sh → 用岸端備好的 deb 補回斷掉的 apt 依賴(需密碼;
+#         不問 [Y/n])。要不要修由依船策略 apt_repair 決定(預設關);deb 由 scheduler 的
+#         nssms-apt-repair-fetch 先下載並驗證。**必須排在 8b) 之前**:apt 依賴斷掉時任何 apt
+#         安裝都會失敗,TeamViewer 更新就是被它擋下的。規格:scheduler/docs/apt-health.md §5。
 #     8b) scheduler 的 install_teamviewer.sh → 把 TeamViewer 更新到 scheduler
 #         etc/teamviewer_update.json 指定的版本(需密碼;不問 [Y/n])。要不要更新由岸端的
 #         依船策略 teamviewer_update 決定(預設關,這一步就什麼都不做);deb 由 scheduler 的
@@ -191,6 +195,8 @@ TMUX_STATUS="未執行"
 # 照片同步金鑰的設定結果。同上：stage_summary 會讀它，而該 stage 在非 IPC-2 上會提早
 # return —— 雖然它 return 前一定已賦值，仍在 file scope 先給值，理由與 TMUX_STATUS 相同。
 SSH_KEY_STATUS="未執行"
+# apt 依賴修復的結果。同上:兩份總結都會讀它,而 stage_apt_repair 有好幾個提早 return 的出口。
+APT_REPAIR_STATUS="未執行"
 # TeamViewer 更新的結果。同上:兩份總結都會讀它,而 stage_teamviewer 有好幾個提早 return 的出口。
 TEAMVIEWER_STATUS="未執行"
 # 停用 GNOME tracker 的結果。同上:兩份總結都會讀它,stage_gnome_tracker 有好幾個提早 return 的出口。
@@ -1860,6 +1866,63 @@ stage_tmux() {
   TMUX_STATUS="已安裝（dpkg / $NSSMS_PROFILE_ID）"
 }
 
+# --- apt 依賴修復(scheduler/install_apt_repair.sh)-----------------------
+# 規格在 scheduler 的 docs/apt-health.md §5。有些船上的 apt 依賴是斷的(2026-07-24 有人手動
+# dpkg -i 一包離線 deb,把 libc6 / libudev1 / openssh-client 升了上去,依賴它們同版的沒跟),
+# 而 apt 只要有任何一筆斷掉就拒絕安裝任何東西 —— 下一步的 TeamViewer 更新就是被它擋下的。
+# 所以這一步**排在 stage_teamviewer 之前**:修好了,同一輪的 TeamViewer 模擬就過得了。
+#
+# 要不要修、修不修得起來全部由 install_apt_repair.sh --status 判斷(依船策略 apt_repair、
+# apt 依賴是否真的斷了、修復清單蓋不蓋得到、deb 是否已由 nssms-apt-repair-fetch 下載並驗證、
+# 不需要 root 的模擬只動清單內的套件),這裡**不重寫第二份判斷** —— 形狀與 stage_teamviewer 相同。
+# 那支腳本的 apt 參數刻意不加 -f(加了會移除 udev、連帶拆掉 84 個套件)並帶 --no-remove。
+#
+# 【不是部署的必要條件】任何結果都 return:無人模式下失敗記進 UNATTENDED_FAIL、拿不到 sudo
+# 記進 UNATTENDED_BLOCKED;人工部署只印出來。
+# 【不問 [Y/n]】要不要修由岸端的依船策略決定(預設關,--status 回 7,這一步什麼都不做)。
+stage_apt_repair() {
+  local installer="${SHARE_DIR}/scheduler/install_apt_repair.sh"
+  APT_REPAIR_STATUS="未執行"
+  echo ""
+  info "檢查 apt 依賴修復(依船策略 apt_repair)..."
+  if [ ! -f "$installer" ]; then
+    APT_REPAIR_STATUS="略過(這版 scheduler 沒有 install_apt_repair.sh)"
+    info "$APT_REPAIR_STATUS"
+    return
+  fi
+  run_rc bash "$installer" --status
+  case "$RC" in
+    0) APT_REPAIR_STATUS="apt 依賴一致,不用修"; return ;;
+    7) APT_REPAIR_STATUS="依船策略沒打開"; return ;;
+    4) APT_REPAIR_STATUS="等修復用的 deb 下載(nssms-apt-repair-fetch)"; return ;;
+    6) APT_REPAIR_STATUS="不能自動修(原因見上方 --status 輸出)"; return ;;
+    5) ;;
+    *)
+      APT_REPAIR_STATUS="無法判斷(--status exit=$RC)"
+      unattended_note_fail "apt 依賴修復的判斷失敗(--status exit=$RC)" || true
+      return ;;
+  esac
+  if [ "$CHECK_ONLY" -eq 1 ]; then
+    APT_REPAIR_STATUS="可以修$DRYRUN_NOTE"
+    return
+  fi
+  if ! sudo_obtainable; then
+    APT_REPAIR_STATUS="可以修,但這台拿不到 sudo(密碼檔)"
+    warn "$APT_REPAIR_STATUS"
+    return
+  fi
+  mutating "以 apt-get 離線補回斷掉的 apt 依賴"
+  run_rc bash "$installer"
+  case "$RC" in
+    0) APT_REPAIR_STATUS="已修好"; ok "apt 依賴已修好。" ;;
+    3) APT_REPAIR_STATUS="可以修,但 sudo 沒有預先授權(exit=3)"
+       [ "$UNATTENDED" -eq 1 ] && UNATTENDED_BLOCKED=$((UNATTENDED_BLOCKED + 1)) ;;
+    *) APT_REPAIR_STATUS="修復失敗(exit=$RC)"
+       err "apt 依賴修復失敗(exit=$RC);--no-remove 之下沒有移除任何東西,明天這一輪會再試。"
+       unattended_note_fail "apt 依賴修復失敗(exit=$RC)" || true ;;
+  esac
+}
+
 # --- TeamViewer 更新(scheduler/install_teamviewer.sh)---------------------
 # 規格在 scheduler 的 docs/teamviewer-update.md。這一步是那份規格裡唯一需要 root 的地方:
 # 要不要裝、裝不裝得起來全部由 install_teamviewer.sh --status 判斷(依船策略
@@ -2516,6 +2579,7 @@ stage_summary() {
   printf "  資料碟掛載授權  ：%s\n" "$MOUNT_POLICY_STATUS"
   printf "  GDM 自動登入    ：%s\n" "$GDM_AUTOLOGIN_STATUS"
   printf "  tmux            ：%s\n" "$TMUX_STATUS"
+  printf "  apt 依賴修復    ：%s\n" "$APT_REPAIR_STATUS"
   printf "  TeamViewer 更新 ：%s\n" "$TEAMVIEWER_STATUS"
   printf "  GNOME tracker   ：%s\n" "$TRACKER_STATUS"
   printf "  照片同步金鑰    ：%s\n" "$SSH_KEY_STATUS"
@@ -2615,6 +2679,7 @@ stage_summary_unattended() {
   printf "  資料碟掛載授權  ：%s\n" "${MOUNT_POLICY_STATUS:-未執行}"
   printf "  GDM 自動登入    ：%s\n" "${GDM_AUTOLOGIN_STATUS:-未執行}"
   printf "  tmux            ：%s\n" "${TMUX_STATUS:-未執行}"
+  printf "  apt 依賴修復    ：%s\n" "${APT_REPAIR_STATUS:-未執行}"
   printf "  TeamViewer 更新 ：%s\n" "${TEAMVIEWER_STATUS:-未執行}"
   printf "  GNOME tracker   ：%s\n" "${TRACKER_STATUS:-未執行}"
   printf "  照片同步金鑰    ：%s\n" "${SSH_KEY_STATUS:-未執行}"
@@ -2784,6 +2849,7 @@ main() {
   stage_unattended_boot              # A4b 無人值守開機的兩個前提（掛載授權 / 自動登入）
   stage_scheduler_units              # A5/A6/A7 timer + sudoers + 常駐服務
   stage_tmux                         # A8 tmux 離線補齊 —— **必須早於 A10**（見該函式）
+  stage_apt_repair                   # A8a apt 依賴修復(依船策略;scheduler/install_apt_repair.sh)—— 必須早於 A8b
   stage_teamviewer                   # A8b TeamViewer 更新（依船策略;scheduler/install_teamviewer.sh）
   stage_gnome_tracker                # A8c 停用 GNOME tracker（依船策略;scheduler/install_gnome_tracker_off.sh）
   stage_ssh_key                      # A9 照片同步的 SSH 金鑰（僅實體 IPC-2）

@@ -229,5 +229,118 @@ class TestLogMonitorStillParses:
 
         text = log_path.read_text(encoding="utf-8-sig")
         assert "[TRANSFER_BYTES]" in text and "bytes=64" in text
+        assert tb.read_transfer_bytes(str(log_path))["bytes"] == 64  # 唯一解析者讀得到真的落地格式
         rec = parse_log_file(log_path)
         assert (rec.mode, rec.status, rec.success, rec.failed) == ("download", "success", 1, 0)
+
+
+# ---------------------------------------------------------------------------
+# monitor/transfer_bytes.py：唯一解析者（scheduler 的 dashboard 以 importlib 載入）
+# ---------------------------------------------------------------------------
+
+from monitor import transfer_bytes as tb  # noqa: E402
+
+
+class TestParseLogName:
+    def test_conventional_name(self):
+        assert tb.parse_log_name("U_WH322_IPC-1_dashboard_report_20261106_013551.csv") == {
+            "direction": "upload", "device": "WH322_IPC-1_dashboard_report", "task": "dashboard_report",
+            "vsl": "WH322", "ipc": "IPC-1", "date": "2026-11-06", "time": "01:35:51"}
+
+    def test_ship_name_with_underscores_and_task_containing_ipc(self):
+        rec = tb.parse_log_name("D_WH_PORT_KELANG_EXPRESS_IPC-3_share-IPC3_20261101_000000.csv")
+        assert (rec["vsl"], rec["ipc"], rec["task"], rec["direction"]) == (
+            "WH_PORT_KELANG_EXPRESS", "IPC-3", "share-IPC3", "download")
+
+    def test_static_name_is_the_whole_task(self):
+        rec = tb.parse_log_name("U_RADAR_UPLOADER_20261101_120000.csv")
+        assert (rec["task"], rec["vsl"], rec["ipc"]) == ("RADAR_UPLOADER", None, None)
+
+    @pytest.mark.parametrize("name", [
+        "remote_retention.log", "D_x_20261101.csv", "X_a_20261101_000000.csv",
+        "D_a_20261101_000000.csv.part", "", None,
+    ])
+    def test_other_shapes_are_none(self, name):
+        assert tb.parse_log_name(name) is None
+
+    def test_log_monitor_uses_the_same_device_split(self):
+        from monitor import log_monitor
+        assert log_monitor._RE_DEVICE is tb.DEVICE
+
+
+class TestParseMessage:
+    def test_what_the_writer_writes_round_trips(self):
+        msg = dl.diagnostic_message("TRANSFER_BYTES", "本趟傳輸量 1.2MB", direction="download",
+                                    bytes=1234567, files=3, elapsed_s=42.1, result="success")
+        assert tb.parse_message(msg) == {"bytes": 1234567, "files": 3, "elapsed_s": 42.1,
+                                         "direction": "download", "result": "success"}
+
+    @pytest.mark.parametrize("bad", ["true", "-1", "1.5", "null", '"12"'])
+    def test_invalid_bytes_voids_the_record(self, bad):
+        assert tb.parse_message("[TRANSFER_BYTES] x bytes=%s files=1" % bad) is None
+
+    def test_a_bad_auxiliary_field_does_not_void_the_bytes(self):
+        rec = tb.parse_message('[TRANSFER_BYTES] x direction="sideways" bytes=5 files=-2 elapsed_s=true')
+        assert rec == {"bytes": 5, "files": None, "elapsed_s": None, "direction": None, "result": None}
+
+    @pytest.mark.parametrize("other", [
+        "[TRANSFER_RETRY] bytes=5", "完成下載: a.bin", "x [TRANSFER_BYTES] bytes=5", None, 5,
+    ])
+    def test_other_lines_are_none(self, other):
+        assert tb.parse_message(other) is None
+
+
+class TestReadTransferBytes:
+    def _csv(self, path, messages, prefix_bytes=0):
+        with open(path, "w", encoding="utf-8-sig", newline="") as fh:
+            if prefix_bytes:
+                fh.write("2026-11-06 00:00:00,dev,,INFO," + "x" * prefix_bytes + "\n")
+            w = dl.csv.writer(fh)
+            for m in messages:
+                w.writerow(["2026-11-06 00:00:01", "dev", "", "INFO", m])
+
+    def _line(self, n):
+        return dl.diagnostic_message("TRANSFER_BYTES", "本趟", direction="upload", bytes=n, files=1,
+                                     elapsed_s=1.0, result="success")
+
+    def test_no_line_is_none_not_zero(self, tmp_path):
+        p = tmp_path / "U_a_20261106_000000.csv"
+        self._csv(p, ["=== 上傳任務結束：成功 1，略過 0，失敗 0 ==="])
+        assert tb.read_transfer_bytes(str(p)) is None
+
+    def test_found_behind_a_huge_failed_list_and_log_upload_lines(self, tmp_path):
+        p = tmp_path / "U_a_20261106_000000.csv"
+        self._csv(p, ["失敗清單：" + ", ".join("f%05d.bin" % i for i in range(5000)),
+                      self._line(777),
+                      dl.diagnostic_message("LOG_UPLOAD_ATTEMPT", "回傳", remote="/fleet/x.csv")],
+                  prefix_bytes=100000)
+        assert tb.read_transfer_bytes(str(p))["bytes"] == 777
+
+    def test_last_record_wins(self, tmp_path):
+        p = tmp_path / "U_a_20261106_000000.csv"
+        self._csv(p, [self._line(1), self._line(2)])
+        assert tb.read_transfer_bytes(str(p))["bytes"] == 2
+
+    def test_a_line_cut_by_the_tail_window_is_ignored_not_misread(self, tmp_path):
+        p = tmp_path / "U_a_20261106_000000.csv"
+        self._csv(p, [self._line(123456789)])
+        size = p.stat().st_size
+        # 視窗切在那一行的中間：半截的那行不能被當成一筆（例如 bytes=56789）。
+        assert tb.read_transfer_bytes(str(p), tail_bytes=size - 20) is None
+
+    def test_missing_file_raises(self, tmp_path):
+        with pytest.raises(OSError):
+            tb.read_transfer_bytes(str(tmp_path / "gone.csv"))
+
+    def test_loads_standalone_by_path_like_the_dashboard_does(self, tmp_path):
+        # dashboard 以 spec_from_file_location 載入：不能依賴套件、不能拉進 paramiko。
+        import importlib.util
+        path = Path(tb.__file__)
+        spec = importlib.util.spec_from_file_location("transfer_bytes_for_dashboard", str(path))
+        module = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(module)
+        p = tmp_path / "U_a_20261106_000000.csv"
+        self._csv(p, [self._line(9)])
+        assert module.read_transfer_bytes(str(p))["bytes"] == 9
+        source = path.read_text(encoding="utf-8")
+        assert "import paramiko" not in source and "from downloader" not in source

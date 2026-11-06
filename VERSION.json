@@ -1,5 +1,5 @@
 {
   "version": "0.34.0",
   "date": "2026-11-06",
-  "notes": "每趟傳輸收尾記一行 [TRANSFER_BYTES]:direction / bytes(實際經過連線的檔案內容位元組,續傳只算這趟補的、傳到一半斷掉的有算、不含協定開銷)/ files / elapsed_s / result(success/failed/cancelled)。成功、中止、SIGTERM 都記,在回傳 log 之前寫。「完成上傳/下載」那行也帶上這次傳的大小。給 scheduler dashboard 統計每個傳輸任務每天的流量;monitor/log_monitor.py 與 run_selected_transfers.py 的解析不受影響。"
+  "notes": "每趟傳輸收尾記一行 [TRANSFER_BYTES]:direction / bytes(實際經過連線的檔案內容位元組,續傳只算這趟補的、傳到一半斷掉的有算、不含協定開銷)/ files / elapsed_s / result(success/failed/cancelled)。成功、中止、SIGTERM 都記,在回傳 log 之前寫。「完成上傳/下載」那行也帶上這次傳的大小。給 scheduler dashboard 統計每個傳輸任務每天的流量;monitor/log_monitor.py 與 run_selected_transfers.py 的解析不受影響。 解析放在新的 monitor/transfer_bytes.py(唯一解析者,只用標準庫、3.6 相容,列入 SYSTEM_PYTHON_FILES;dashboard 用系統 python3 以 importlib 載入),log_monitor 的 device 切法也改從這裡取。"
 }

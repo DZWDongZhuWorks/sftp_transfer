@@ -62,6 +62,7 @@ class SFTPUploader(SFTPBase):
     """SFTP 上傳（local → remote）：遞迴走訪本地目錄、斷點續傳、忽略規則與版本紀錄。"""
 
     manifest_filename = UPLOAD_MANIFEST_FILENAME
+    direction = "upload"
 
     def __init__(self, *args, **kwargs):
         super().__init__(*args, **kwargs)
@@ -487,6 +488,7 @@ class SFTPUploader(SFTPBase):
                         remote_f.write(chunk)
                         running_hash.update(chunk)
                         transferred += len(chunk)
+                        self._bytes_moved += len(chunk)
                         if local_size > 0:
                             pct = int(transferred / local_size * 100)
                             if pct > last_pct_logged:
@@ -567,9 +569,12 @@ class SFTPUploader(SFTPBase):
         total_elapsed = time.time() - start_time
         uploaded_this_run = transferred - uploaded_bytes  # 本次實際上傳的位元組（不含斷點續傳前遠端已存在的部分）
         done_name = PurePosixPath(target_remote).name if target_remote != remote_file else rel_path
+        self._files_moved += 1
         if total_elapsed > 0 and uploaded_this_run > 0:
             avg_speed = uploaded_this_run / total_elapsed
-            self.logger.info(f"完成上傳: {done_name}（平均 {format_size(avg_speed)}/s）")
+            self.logger.info(
+                f"完成上傳: {done_name}（{format_size(uploaded_this_run)}，平均 {format_size(avg_speed)}/s）"
+            )
         else:
             self.logger.info(f"完成上傳: {done_name}")
         # 保留本地權限與 mtime 到遠端(SFTP 預設不搬;否則 .sh 等會掉 +x)。

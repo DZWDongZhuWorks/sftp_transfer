@@ -100,10 +100,14 @@ BOOT_ACTIVATING_FAIL_SECONDS = 900
 # N/A：未安裝 = SKIP，仍殘留 = FAIL。讀不到船號時**照常要求安裝**,方向與 NSSMS-Vessel 相反,
 # 與安裝器（require_vessel.sh --except）一致 —— 證明不了自己是被排除的那台,就當一般船。
 #
+# nssms-apt-repair-fetch(scheduler v0.110.0,apt 依賴修復的 deb 下載)同樣是 ExceptVessel=CLINK;
+# 依船策略 apt_repair 沒打開的船一秒內 exit 0,所以船隊上它是 active/waiting + Result=success。
+#
 # 【勿在下面的 tuple 內寫含括號的註解】device_monitor/tests/test_integration.sh 的涵蓋度斷言
 # 用 `^TIMERS = \((.*?)\)` 抓這個 tuple,非貪婪會停在**第一個**右括號:註解裡的括號會把清單
 # 截斷,於是後面的 timer 全被誤判為「沒被涵蓋」。要加說明就寫在這一段。
 TIMERS = (
+    "nssms-apt-repair-fetch",
     "nssms-cleanup-old-files",
     "nssms-dashboard-report",
     "nssms-deploy-reconcile",

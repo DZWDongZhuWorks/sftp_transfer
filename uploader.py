@@ -62,6 +62,7 @@ class SFTPUploader(SFTPBase):
     """SFTP 上傳（local → remote）：遞迴走訪本地目錄、斷點續傳、忽略規則與版本紀錄。"""
 
     manifest_filename = UPLOAD_MANIFEST_FILENAME
+    direction = "upload"
 
     def __init__(self, *args, **kwargs):
         super().__init__(*args, **kwargs)
@@ -146,7 +147,8 @@ class SFTPUploader(SFTPBase):
         清單只回答兩種情況：清單裡沒有（接下來整份 "wb" 上傳，不依賴遠端狀態），以及大小與
         本地相同（略過分支，或 manifest 說換版而整份覆蓋）。大小不同代表接下來要寫入遠端，
         其中續傳的截斷/接續判斷必須看伺服器「現在」的長度 —— 清單是本輪稍早列的，中間可能
-        被外部清掉（岸端 /fleet/LOG 一天會被整批清好幾次）—— 所以照改版前實打一次 stat。
+        被外部改掉或刪掉（岸端 /fleet/LOG 當初一天會被整批清好幾次，2026-11-06 起已解決；
+        手動刪檔、別的寫入者照樣可能）—— 所以照改版前實打一次 stat。
         那一次來回跟著一次傳輸，比例上可以忽略。
         """
         listed = self._listed_attr(remote_file)
@@ -162,8 +164,9 @@ class SFTPUploader(SFTPBase):
     def _open_remote(self, remote_file, mode):
         """開遠端檔寫入；目錄在本輪中途被外部清掉時補建一次再開。
 
-        _ensure_remote_dir 在同一條連線內只確認一次目錄，但岸端 /fleet/LOG 會被外部程序整批
-        清掉，連 IPC 目錄一起。改版前每個檔都重新逐層 stat，所以中途被清也會自己建回來；有了
+        _ensure_remote_dir 在同一條連線內只確認一次目錄，但遠端目錄可能在本輪中途不見（岸端
+        /fleet/LOG 當初會被外部程序整批清掉，連 IPC 目錄一起；2026-11-06 起已解決，手動清理
+        照樣可能）。改版前每個檔都重新逐層 stat，所以中途被清也會自己建回來；有了
         快取之後要靠這裡補上同樣的自癒，否則之後每個檔都會帶著 FileNotFoundError 被 _run
         當成「本地檔案不存在」判失敗。
 
@@ -487,6 +490,7 @@ class SFTPUploader(SFTPBase):
                         remote_f.write(chunk)
                         running_hash.update(chunk)
                         transferred += len(chunk)
+                        self._bytes_moved += len(chunk)
                         if local_size > 0:
                             pct = int(transferred / local_size * 100)
                             if pct > last_pct_logged:
@@ -567,9 +571,12 @@ class SFTPUploader(SFTPBase):
         total_elapsed = time.time() - start_time
         uploaded_this_run = transferred - uploaded_bytes  # 本次實際上傳的位元組（不含斷點續傳前遠端已存在的部分）
         done_name = PurePosixPath(target_remote).name if target_remote != remote_file else rel_path
+        self._files_moved += 1
         if total_elapsed > 0 and uploaded_this_run > 0:
             avg_speed = uploaded_this_run / total_elapsed
-            self.logger.info(f"完成上傳: {done_name}（平均 {format_size(avg_speed)}/s）")
+            self.logger.info(
+                f"完成上傳: {done_name}（{format_size(uploaded_this_run)}，平均 {format_size(avg_speed)}/s）"
+            )
         else:
             self.logger.info(f"完成上傳: {done_name}")
         # 保留本地權限與 mtime 到遠端(SFTP 預設不搬;否則 .sh 等會掉 +x)。

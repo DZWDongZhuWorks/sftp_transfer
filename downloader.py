@@ -296,6 +296,8 @@ class SFTPBase:
     使用時互相覆蓋。"""
 
     manifest_filename = MANIFEST_FILENAME
+    #: 子類別各自填 "download" / "upload"，給 TRANSFER_BYTES 那行標方向（見 _log_transfer_bytes）。
+    direction = None
 
     def __init__(
         self,
@@ -382,6 +384,9 @@ class SFTPBase:
         self._remote_dirs_ok = set()
         # 連續幾個檔因伺服器拒絕而放棄（見 SERVER_STATUS_ABORT_AFTER_FILES）。
         self._server_status_failed_files = 0
+        # 本趟經過連線的檔案內容位元組數與傳完的檔數，run() 開頭歸零（見 _log_transfer_bytes）。
+        self._bytes_moved = 0
+        self._files_moved = 0
 
     def _server_status_backoff(self, server_attempts):
         """伺服器拒絕後、在**同一條連線**上重試前的等待（不重連，見 SERVER_STATUS_MESSAGES）。"""
@@ -904,10 +909,18 @@ class SFTPBase:
         不影響回傳值。
 
         關連線的責任在這一層（子類別的 _run() 刻意不關），log 上傳才能沿用傳輸階段的連線、
-        省下一次握手。不論走哪條路徑（正常結束、log 上傳失敗、取消）都保證關掉。"""
+        省下一次握手。不論走哪條路徑（正常結束、log 上傳失敗、取消）都保證關掉。
+
+        本趟的傳輸量也在這一層記（TRANSFER_BYTES，見 _log_transfer_bytes），理由同上：
+        每一種結局都會經過這裡的 finally。"""
         cancelled = False
+        result = None
+        self._bytes_moved = 0
+        self._files_moved = 0
+        started = time.time()
         try:
-            return self._run()
+            result = self._run()
+            return result
         except TransferCancelled as exc:
             cancelled = True
             self.logger.warning(diagnostic_message(
@@ -925,17 +938,50 @@ class SFTPBase:
                     pass
             raise
         finally:
+            self._log_transfer_bytes(started, "cancelled" if cancelled else ("success" if result else "failed"))
             try:
                 if self.upload_log and not cancelled:
                     self._upload_log_file()
             finally:
                 self._close()
 
+    def _log_transfer_bytes(self, started, result):
+        """記一行 TRANSFER_BYTES：本趟實際經過 SFTP 連線的**檔案內容**位元組數。
+
+        給「每個傳輸任務每天用掉多少流量」的統計用（scheduler 的 dashboard 依 CSV 檔名的
+        專案名與日期加總）。一趟一行、機器可讀，人看的「任務結束」那行不動。
+
+        【算的是什麼】傳輸迴圈每讀寫一塊就累加，所以：
+        - 續傳只算這一趟補上的部分 —— 續傳前已在目的地的那段是以前傳的，不是這趟的流量；
+        - 傳到一半失敗、重試、被取消的那幾塊**也算** —— 它們一樣走過了衛星鏈路；
+        - **不含**協定開銷：握手、走訪遠端目錄、比對略過的 stat、回傳 log 本身。目錄多、
+          檔案大多略過的任務，實際鏈路用量會比這個數字高。
+
+        【為什麼在 run() 收尾,不接在「任務結束」那行】中止的路徑有好幾條（帳密錯誤、重試上限、
+        伺服器拒絕、未處理錯誤、SIGTERM），傳了一半的流量在這些路徑上一樣花掉了，而它們都不印
+        「任務結束」。只有 run() 的 finally 每條都會經過；放在 log 上傳之前，回傳岸端的 CSV
+        裡就有這一行。
+        統計行失敗只吞掉：不能讓收尾（上傳 log、關連線）因為它走不下去。
+        """
+        try:
+            self.logger.info(diagnostic_message(
+                "TRANSFER_BYTES",
+                f"本趟傳輸量 {format_size(self._bytes_moved)}",
+                direction=self.direction,
+                bytes=self._bytes_moved,
+                files=self._files_moved,
+                elapsed_s=round(time.time() - started, 1),
+                result=result,
+            ))
+        except Exception:
+            pass
+
 
 class SFTPDownloader(SFTPBase):
     """SFTP 下載（remote → local）：遞迴走訪遠端目錄、斷點續傳、忽略規則與版本紀錄。"""
 
     manifest_filename = MANIFEST_FILENAME
+    direction = "download"
 
     def __init__(self, *args, force_redownload=None, force_redownload_id=None, **kwargs):
         """force_redownload / force_redownload_id 只屬於下載方向，所以不放進 SFTPBase。
@@ -1357,6 +1403,7 @@ class SFTPDownloader(SFTPBase):
                         local_f.write(chunk)
                         running_hash.update(chunk)
                         transferred += len(chunk)
+                        self._bytes_moved += len(chunk)
                         if remote_size > 0:
                             pct = int(transferred / remote_size * 100)
                             if pct > last_pct_logged:
@@ -1456,9 +1503,12 @@ class SFTPDownloader(SFTPBase):
         total_elapsed = time.time() - start_time
         downloaded_bytes = transferred - local_size  # 本次實際下載的位元組（不含斷點續傳前已存在的部分）
         done_name = target_file.name if target_file != local_file else rel_path
+        self._files_moved += 1
         if total_elapsed > 0 and downloaded_bytes > 0:
             avg_speed = downloaded_bytes / total_elapsed
-            self.logger.info(f"完成下載: {done_name}（平均 {format_size(avg_speed)}/s）")
+            self.logger.info(
+                f"完成下載: {done_name}（{format_size(downloaded_bytes)}，平均 {format_size(avg_speed)}/s）"
+            )
         else:
             self.logger.info(f"完成下載: {done_name}")
         # 保留來源權限與 mtime:SFTP/paramiko 預設不會搬,需以 remote_stat 自行鏡射

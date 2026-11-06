@@ -628,6 +628,8 @@ class ShipInterpreterCompatTests(unittest.TestCase):
         "deploy/automation_health_check.py",
         # deploy_offline.sh 以 $PYTHON_BIN(系統 python3)執行,在階段 A、venv 建好之前。
         "deploy/booster_integrity.py",
+        # scheduler 的 dashboard(系統 python3)用 importlib 載入它解析傳輸量。
+        "monitor/transfer_bytes.py",
     )
 
     # 明確豁免、可以不維持 3.6 相容的檔，以及理由。空的也要留著這個機制：新增 3.7+ 的檔

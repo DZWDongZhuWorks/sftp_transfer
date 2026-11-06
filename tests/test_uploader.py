@@ -1241,7 +1241,7 @@ class _CountingSFTP(FakeSFTPClient):
         return self.calls["stat"] + self.calls["listdir_attr"]
 
     def wipe(self, remote_dir):
-        """外部程序把整個目錄清掉（岸端 /fleet/LOG 一天會發生好幾次）。"""
+        """外部把整個目錄清掉（岸端 /fleet/LOG 當初一天好幾次，2026-11-06 起已解決；手動清理照樣可能）。"""
         prefix = remote_dir.rstrip("/") + "/"
         for p in [p for p in self.files if p.startswith(prefix)]:
             del self.files[p]

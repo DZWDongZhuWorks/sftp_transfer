@@ -722,6 +722,7 @@ manifest 不能當證據：2026-09-22 實測 `.sftp_download_manifest.json` 的 
 | `VERIFY_SUMMARY` | `--verify` 結尾彙總：`ok` / `mismatch` / `quarantined` / `no_baseline` / `missing` / `size_differs` / `unreadable` 筆數、`hashed_bytes`、`elapsed_seconds` |
 | `LIST_RETRY` / `TRANSFER_RETRY` / `TRANSFER_ERROR` | 清單、單檔傳輸的階段、重試資訊、例外及最終動作；重試的 `reason` 為 `server_status`（伺服器拒絕，`action="wait_retry"`，不重連）或 `transfer_error`（斷線類，`action="reconnect"`） |
 | `LOG_UPLOAD_ATTEMPT` / `LOG_UPLOAD_RETRY` | 回傳 Log 的目的地，以及 `reused_connection`（是否沿用傳輸階段的連線，見下方【連線次數】）；沿用的連線失效時會出現 `LOG_UPLOAD_RETRY` 並重連一次 |
+| `TRANSFER_BYTES` | 每趟一行，記本趟傳輸量：`direction`、`bytes`（實際經過連線的**檔案內容**位元組）、`files`（傳完的檔數）、`elapsed_s`、`result`（`success` / `failed` / `cancelled`）。成功、中止、SIGTERM 取消都會記，而且在回傳 Log **之前**寫，所以岸端收到的 CSV 裡就有。給「每個傳輸任務每天用多少流量」的統計用：依檔名的專案名與日期加總即可。續傳只算這趟補上的部分；傳到一半失敗、重試的那幾塊**有算**（一樣走過鏈路）；**不含**協定開銷（握手、走訪遠端目錄、比對略過的 stat、回傳 Log 本身），目錄多、大多略過的任務實際鏈路用量會比它高。單檔的量另外寫在「完成上傳／下載」那行（給人看，不給程式解析）。**解析一律經 `monitor/transfer_bytes.py`**（唯一解析者；只用標準庫、系統 python3 3.6 可載入，scheduler 的 dashboard 以 importlib 讀它） |
 
 `RESUME_REJECTED` 的常見 `reason`：
 

@@ -116,6 +116,7 @@ TIMERS = (
     "nssms-download-photos",
     "nssms-ecdis-screenshot-upload",
     "nssms-ecdis-snap-download",
+    "nssms-flag-report",
     "nssms-fleet-status-retention",
     "nssms-reboot",
     "nssms-remote-log-retention",

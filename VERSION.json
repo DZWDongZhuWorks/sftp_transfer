@@ -1,5 +1,5 @@
 {
-  "version": "0.33.0",
-  "date": "2026-11-05",
-  "notes": "deploy_offline.sh 新增 stage_apt_repair(A8a,排在 stage_teamviewer 之前):呼叫 scheduler 的 install_apt_repair.sh,依船策略 apt_repair 用岸端備好的 deb 補回斷掉的 apt 依賴 —— apt 依賴斷掉時任何 apt 安裝都會失敗,TeamViewer 更新就是被它擋下的(scheduler docs/apt-health.md §5)。判斷與 apt 參數全在 scheduler(不加 -f、--no-remove),這裡只翻離開碼。巡檢清單加入 nssms-apt-repair-fetch。需要 scheduler ≥ v0.110.0;舊版 scheduler 沒有那支腳本時這一步印「略過」。"
+  "version": "0.33.1",
+  "date": "2026-11-06",
+  "notes": "巡檢清單 TIMERS 加入 nssms-flag-report(scheduler v0.113.0 新增的每週傳輸任務:把 IPC-1 的 flag_controller vessel_logic log 回傳 /fleet/LOG/<船名>/<IPC>/vessel_log/)。unit 宣告 # NSSMS-BaseIPC=ipc1,本巡檢自己讀,IPC-2/IPC-3 上是 N/A,不需要特例。沒加的話 device_monitor/tests/test_integration.sh 的 TIMERS 涵蓋度斷言會把它列為未涵蓋。"
 }

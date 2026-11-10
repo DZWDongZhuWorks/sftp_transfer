@@ -682,10 +682,14 @@ manifest 不能當證據：2026-09-22 實測 `.sftp_download_manifest.json` 的 
 - **執行中**：畫面（GUI）或終端機（CLI）持續出現如下訊息：
   ```
   連線成功
-  開始下載: xxx.txt (1.2MB)
-    xxx.txt 進度: 50%
-  完成下載: xxx.txt
+  開始下載: xxx.bin (120.0MB)
+    xxx.bin 進度: 8% (1.0MB/s)
+    xxx.bin 進度: 17% (1.0MB/s)
+  完成下載: xxx.bin（120.0MB，平均 1.0MB/s）
   ```
+  進度行是「百分比前進、且距上一行至少 10 秒」才印，所以 10 秒內傳完的檔案只會有開始與完成兩行
+  （大量小檔時，舊版每檔約 100 行曾把 `/var/log/syslog` 灌到一週 2 GB 以上；理由見
+  `downloader.PROGRESS_LOG_INTERVAL_SECONDS`）。
 - **已完美結束**：最後出現以下訊息，且「失敗」數為 0：
   ```
   === 下載任務結束：成功 X，略過 Y，失敗 0 ===

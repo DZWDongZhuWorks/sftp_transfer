@@ -41,6 +41,19 @@ KEEPALIVE_INTERVAL = 15
 # ／單次 144 ms。所以「每個檔都整份重寫一次」這種節奏不能留（見 _flush_manifest_due）。
 CHECKPOINT_INTERVAL_BYTES = 16 * 1024 * 1024
 CHECKPOINT_INTERVAL_SECONDS = 60
+# 單檔進度行（「<檔名> 進度: NN% (速率/s)」）的節奏：百分比要前進、且距離上一行至少這麼多秒，
+# 兩者都成立才印。開始／完成那兩行不受影響，傳得比這個快的檔案只會留下那兩行。
+#
+# 【為什麼不是「每 1% 一行」】那個節奏的行數與檔案大小無關，每個檔案固定約 100 行。對慢鏈路
+# 的大檔剛好（每 1% 要好幾分鐘），對大量小檔就是災難：岸端 CLINK 收全船隊 ECDIS 截圖
+# （每張 1～2 MB、不到一秒傳完、一輪幾千張），2026-11-04 上線後每天 200～290 萬行進度，
+# stdout 經 journald 進 /var/log/syslog（一週 2.2 GB），同一份再寫進 logs/ 的 CSV（每輪約
+# 24 MB），系統碟（eMMC）11-10 只剩 136 MB。
+#
+# 【為什麼不是只看秒數】只看秒數，慢鏈路的大檔反而變吵：5～20 KB/s 的鏈路上 1% 本來就要好幾
+# 分鐘，改成每 N 秒一行會比現在多好幾倍。所以兩個門檻取交集：每個百分比最多一行（同舊版），
+# 而且每 PROGRESS_LOG_INTERVAL_SECONDS 秒最多一行。
+PROGRESS_LOG_INTERVAL_SECONDS = 10
 MANIFEST_FILENAME = ".sftp_download_manifest.json"
 # 下載一律先寫進「目的檔名 + 這個後綴」的暫存檔，完成後才 os.replace 換名到目的地。
 # 換名換的是 inode，於是：
@@ -796,6 +809,10 @@ class SFTPBase:
             or now - last_time >= CHECKPOINT_INTERVAL_SECONDS
         )
 
+    def _progress_log_due(self, pct, last_pct, last_time, now):
+        """傳輸迴圈是否該印一行進度（節奏定義與理由見 PROGRESS_LOG_INTERVAL_SECONDS）。"""
+        return pct > last_pct and now - last_time >= PROGRESS_LOG_INTERVAL_SECONDS
+
     def _ensure_remote_dir(self, remote_dir):
         """從根目錄逐層確認/建立遠端目錄（等同 mkdir -p），已存在的層級略過。
 
@@ -1406,15 +1423,11 @@ class SFTPDownloader(SFTPBase):
                         self._bytes_moved += len(chunk)
                         if remote_size > 0:
                             pct = int(transferred / remote_size * 100)
-                            if pct > last_pct_logged:
-                                now = time.time()
-                                elapsed = now - last_log_time
-                                # elapsed 可能為 0（連續 chunk 太快），此時略過速率不印，避免除以零。
-                                if elapsed > 0:
-                                    speed = (transferred - last_log_bytes) / elapsed
-                                    self.logger.info(f"  {rel_path} 進度: {pct}% ({format_size(speed)}/s)")
-                                else:
-                                    self.logger.info(f"  {rel_path} 進度: {pct}%")
+                            now = time.time()
+                            # 節奏見 PROGRESS_LOG_INTERVAL_SECONDS；它保證 elapsed > 0，速率不會除以零。
+                            if self._progress_log_due(pct, last_pct_logged, last_log_time, now):
+                                speed = (transferred - last_log_bytes) / (now - last_log_time)
+                                self.logger.info(f"  {rel_path} 進度: {pct}% ({format_size(speed)}/s)")
                                 last_log_time = now
                                 last_log_bytes = transferred
                                 last_pct_logged = pct

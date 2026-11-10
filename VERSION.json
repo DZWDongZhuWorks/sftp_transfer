@@ -1,5 +1,5 @@
 {
-  "version": "0.34.0",
-  "date": "2026-11-06",
-  "notes": "每趟傳輸收尾記一行 [TRANSFER_BYTES]:direction / bytes(實際經過連線的檔案內容位元組,續傳只算這趟補的、傳到一半斷掉的有算、不含協定開銷)/ files / elapsed_s / result(success/failed/cancelled)。成功、中止、SIGTERM 都記,在回傳 log 之前寫。「完成上傳/下載」那行也帶上這次傳的大小。給 scheduler dashboard 統計每個傳輸任務每天的流量;monitor/log_monitor.py 與 run_selected_transfers.py 的解析不受影響。 解析放在新的 monitor/transfer_bytes.py(唯一解析者,只用標準庫、3.6 相容,列入 SYSTEM_PYTHON_FILES;dashboard 用系統 python3 以 importlib 載入),log_monitor 的 device 切法也改從這裡取。"
+  "version": "0.34.1",
+  "date": "2026-11-10",
+  "notes": "單檔進度行改成「百分比前進且距上一行 ≥ 10 秒」才印(PROGRESS_LOG_INTERVAL_SECONDS)。舊版每個檔案固定約 100 行,岸端 CLINK 收 ECDIS 截圖(大量 1～2 MB 小檔)一天 200 多萬行灌進 /var/log/syslog 與 logs/ CSV,系統碟只剩 136 MB。不到 10 秒傳完的檔案只留開始/完成兩行;慢鏈路大檔仍是每 1% 最多一行,不會變吵。"
 }

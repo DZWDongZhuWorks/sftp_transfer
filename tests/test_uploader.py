@@ -702,6 +702,52 @@ class TestUploadOneFileCheckpointing:
         assert "manifest_saved=true" in message
 
 
+class TestUploadProgressLogging:
+    """進度行的節奏（理由見 downloader.PROGRESS_LOG_INTERVAL_SECONDS 與 downloader 端同組測試）。"""
+
+    @staticmethod
+    def _progress_percents(caplog):
+        lines = [r.message for r in caplog.records if " 進度: " in r.message]
+        return [int(line.split("進度:")[-1].split("%")[0].strip()) for line in lines]
+
+    def test_fast_transfer_logs_no_progress_lines(self, uploader_factory, fake_sftp_factory, tmp_path, caplog):
+        content = b"Z" * (up.CHUNK_SIZE * 200)
+        local = tmp_path / "f.bin"
+        _write(local, content)
+        d = uploader_factory()
+        d.sftp = fake_sftp_factory(files={})
+        with caplog.at_level(logging.INFO):
+            d._upload_one_file(local, "f.bin", "/remote", tmp_path)
+        assert self._progress_percents(caplog) == []
+        messages = [r.message for r in caplog.records]
+        assert any(m.startswith("開始上傳: f.bin") for m in messages)
+        assert any(m.startswith("完成上傳: f.bin") for m in messages)
+
+    def test_slow_transfer_logs_progress_at_most_once_per_interval(
+        self, uploader_factory, fake_sftp_factory, tmp_path, caplog, monkeypatch
+    ):
+        clock = {"t": 1000.0}
+
+        def fake_time():
+            clock["t"] += 3.0
+            return clock["t"]
+
+        monkeypatch.setattr(dl.time, "time", fake_time)
+        content = b"Z" * (up.CHUNK_SIZE * 50)
+        local = tmp_path / "f.bin"
+        _write(local, content)
+        d = uploader_factory()
+        d.sftp = fake_sftp_factory(files={})
+        with caplog.at_level(logging.INFO):
+            d._upload_one_file(local, "f.bin", "/remote", tmp_path)
+
+        records = [r for r in caplog.records if " 進度: " in r.message]
+        percents = self._progress_percents(caplog)
+        assert 0 < len(percents) < 50
+        assert percents == sorted(set(percents))
+        assert all("/s)" in r.message for r in records)
+
+
 class TestRun:
     def _prepare(self, uploader_factory, fake_sftp_factory, files=None, **overrides):
         d = uploader_factory(wait_for_network=False, **overrides)

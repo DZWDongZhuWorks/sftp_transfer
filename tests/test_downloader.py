@@ -2005,16 +2005,71 @@ class TestDownloadOneFileCheckpointing:
         assert manifest["local_bytes"] == part.stat().st_size
         assert manifest["local_sha256"] == hashlib.sha256(part.read_bytes()).hexdigest()
 
-    def test_progress_logged_and_increases_monotonically(self, downloader_factory, fake_sftp_factory, tmp_path, caplog):
-        content = b"Z" * (dl.CHUNK_SIZE * 5)
+    @staticmethod
+    def _progress_percents(caplog):
+        # 進度訊息格式為「<檔名> 進度: NN% (速率/s)」，取百分號前的數字。
+        lines = [r.message for r in caplog.records if " 進度: " in r.message]
+        return [int(line.split("進度:")[-1].split("%")[0].strip()) for line in lines]
+
+    def test_fast_transfer_logs_no_progress_lines(self, downloader_factory, fake_sftp_factory, tmp_path, caplog):
+        """傳得比 PROGRESS_LOG_INTERVAL_SECONDS 快的檔案只留開始／完成兩行。
+
+        回歸：岸端收全船隊 ECDIS 截圖（每張 1～2 MB、不到一秒傳完），舊版每張固定約 100 行
+        進度，一天 200 多萬行灌進 /var/log/syslog，系統碟被塞到只剩 136 MB。
+        """
+        content = b"Z" * (dl.CHUNK_SIZE * 200)  # 200 個 chunk：舊版會印滿 1%～100%
         d = downloader_factory()
         d.sftp = fake_sftp_factory(files={"/remote/f.bin": content}, mtimes={"/remote/f.bin": 1})
         with caplog.at_level(logging.INFO):
             d._download_one_file("/remote/f.bin", "f.bin", tmp_path)
-        pct_lines = [r.message for r in caplog.records if "進度" in r.message]
-        # 進度訊息格式為「... 進度: NN%」或「... 進度: NN% (速率/s)」，取百分號前的數字。
-        percents = [int(line.split("進度:")[-1].split("%")[0].strip()) for line in pct_lines]
-        assert percents == sorted(percents)
+        assert self._progress_percents(caplog) == []
+        messages = [r.message for r in caplog.records]
+        assert any(m.startswith("開始下載: f.bin") for m in messages)
+        assert any(m.startswith("完成下載: f.bin") for m in messages)
+
+    def test_slow_transfer_logs_progress_at_most_once_per_interval(
+        self, downloader_factory, fake_sftp_factory, tmp_path, caplog, monkeypatch
+    ):
+        """時鐘每次被讀就走 3 秒：進度行要隔 ≥ 10 秒、百分比遞增，且仍帶速率。"""
+        clock = {"t": 1000.0}
+
+        def fake_time():
+            clock["t"] += 3.0
+            return clock["t"]
+
+        monkeypatch.setattr(dl.time, "time", fake_time)
+        content = b"Z" * (dl.CHUNK_SIZE * 50)
+        d = downloader_factory()
+        d.sftp = fake_sftp_factory(files={"/remote/f.bin": content}, mtimes={"/remote/f.bin": 1})
+        with caplog.at_level(logging.INFO):
+            d._download_one_file("/remote/f.bin", "f.bin", tmp_path)
+
+        records = [r for r in caplog.records if " 進度: " in r.message]
+        percents = self._progress_percents(caplog)
+        assert 0 < len(percents) < 50          # 有心跳，但遠少於每 chunk / 每 1% 一行
+        assert percents == sorted(set(percents))
+        assert all("/s)" in r.message for r in records)
+
+    def test_slow_link_large_file_still_capped_at_one_line_per_percent(
+        self, downloader_factory, fake_sftp_factory, tmp_path, caplog, monkeypatch
+    ):
+        """慢鏈路：秒數門檻每個 chunk 都過，行數仍受「百分比要前進」限制，不會比舊版更吵。"""
+        clock = {"t": 1000.0}
+
+        def fake_time():
+            clock["t"] += 60.0
+            return clock["t"]
+
+        monkeypatch.setattr(dl.time, "time", fake_time)
+        content = b"Z" * (dl.CHUNK_SIZE * 250)  # 250 個 chunk，每個不到 1%
+        d = downloader_factory()
+        d.sftp = fake_sftp_factory(files={"/remote/f.bin": content}, mtimes={"/remote/f.bin": 1})
+        with caplog.at_level(logging.INFO):
+            d._download_one_file("/remote/f.bin", "f.bin", tmp_path)
+
+        percents = self._progress_percents(caplog)
+        assert percents == sorted(set(percents))
+        assert len(percents) <= 101            # 0%～100%：第一個 chunk 不到 1% 時會印 0%
         assert percents[-1] == 100
 
 

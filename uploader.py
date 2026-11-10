@@ -493,15 +493,11 @@ class SFTPUploader(SFTPBase):
                         self._bytes_moved += len(chunk)
                         if local_size > 0:
                             pct = int(transferred / local_size * 100)
-                            if pct > last_pct_logged:
-                                now = time.time()
-                                elapsed = now - last_log_time
-                                # elapsed 可能為 0（連續 chunk 太快），此時略過速率不印，避免除以零。
-                                if elapsed > 0:
-                                    speed = (transferred - last_log_bytes) / elapsed
-                                    self.logger.info(f"  {rel_path} 進度: {pct}% ({format_size(speed)}/s)")
-                                else:
-                                    self.logger.info(f"  {rel_path} 進度: {pct}%")
+                            now = time.time()
+                            # 節奏見 downloader.PROGRESS_LOG_INTERVAL_SECONDS；它保證 elapsed > 0，速率不會除以零。
+                            if self._progress_log_due(pct, last_pct_logged, last_log_time, now):
+                                speed = (transferred - last_log_bytes) / (now - last_log_time)
+                                self.logger.info(f"  {rel_path} 進度: {pct}% ({format_size(speed)}/s)")
                                 last_log_time = now
                                 last_log_bytes = transferred
                                 last_pct_logged = pct

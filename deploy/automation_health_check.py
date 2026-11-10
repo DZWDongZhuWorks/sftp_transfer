@@ -103,6 +103,10 @@ BOOT_ACTIVATING_FAIL_SECONDS = 900
 # nssms-apt-repair-fetch(scheduler v0.110.0,apt 依賴修復的 deb 下載)同樣是 ExceptVessel=CLINK;
 # 依船策略 apt_repair 沒打開的船一秒內 exit 0,所以船隊上它是 active/waiting + Result=success。
 #
+# nssms-radar-event-screenshot-upload(scheduler v0.121.0,radar 事件截圖每天 22:20 回傳)宣告
+# BaseIPC=ipc1,ipc2,與 ECDIS 截圖回傳同一組閘門;IPC-3 上是 N/A。依船策略 radar_event_capture
+# 沒打開的船沒有來源目錄,一秒內 exit 0,所以船隊上它是 active/waiting + Result=success。
+#
 # 【勿在下面的 tuple 內寫含括號的註解】device_monitor/tests/test_integration.sh 的涵蓋度斷言
 # 用 `^TIMERS = \((.*?)\)` 抓這個 tuple,非貪婪會停在**第一個**右括號:註解裡的括號會把清單
 # 截斷,於是後面的 timer 全被誤判為「沒被涵蓋」。要加說明就寫在這一段。
@@ -118,6 +122,7 @@ TIMERS = (
     "nssms-ecdis-snap-download",
     "nssms-flag-report",
     "nssms-fleet-status-retention",
+    "nssms-radar-event-screenshot-upload",
     "nssms-reboot",
     "nssms-remote-log-retention",
     "nssms-shipboard-alert-upload",

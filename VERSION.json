@@ -1,5 +1,5 @@
 {
-  "version": "0.34.2",
+  "version": "0.34.3",
   "date": "2026-11-11",
-  "notes": "巡檢清單 TIMERS 補上落後 scheduler/timers/ 的 7 支:nssms-disk-guard、nssms-failure-evidence、nssms-fleet-issues、nssms-fleet-log-download、nssms-radar-event-screenshot-upload、nssms-runtime-log-upload、nssms-teamviewer-fetch。閘門(CLINK 專用、ExceptVessel、BaseIPC)一律由巡檢器自 unit 標頭讀取,不寫特例。其中 runtime-log-upload 與 fleet-log-download 來自 scheduler v0.122.0,須在它之後散佈,否則 unit-sync 會報「找不到 repo 母體」。"
+  "notes": "巡檢清單 TIMERS 補上落後 scheduler/timers/ 的 6 支:nssms-disk-guard、nssms-failure-evidence、nssms-fleet-issues、nssms-fleet-log-download、nssms-runtime-log-upload、nssms-teamviewer-fetch。閘門(CLINK 專用、ExceptVessel、BaseIPC)一律由巡檢器自 unit 標頭讀取,不寫特例。其中 runtime-log-upload 與 fleet-log-download 來自 scheduler v0.122.0,須在它之後散佈,否則 unit-sync 會報「找不到 repo 母體」。"
 }

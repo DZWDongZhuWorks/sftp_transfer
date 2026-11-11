@@ -1,5 +1,5 @@
 {
-  "version": "0.34.1",
-  "date": "2026-11-10",
-  "notes": "單檔進度行改成「百分比前進且距上一行 ≥ 10 秒」才印(PROGRESS_LOG_INTERVAL_SECONDS)。舊版每個檔案固定約 100 行,岸端 CLINK 收 ECDIS 截圖(大量 1～2 MB 小檔)一天 200 多萬行灌進 /var/log/syslog 與 logs/ CSV,系統碟只剩 136 MB。不到 10 秒傳完的檔案只留開始/完成兩行;慢鏈路大檔仍是每 1% 最多一行,不會變吵。"
+  "version": "0.34.2",
+  "date": "2026-11-11",
+  "notes": "巡檢清單 TIMERS 補上落後 scheduler/timers/ 的 7 支:nssms-disk-guard、nssms-failure-evidence、nssms-fleet-issues、nssms-fleet-log-download、nssms-radar-event-screenshot-upload、nssms-runtime-log-upload、nssms-teamviewer-fetch。閘門(CLINK 專用、ExceptVessel、BaseIPC)一律由巡檢器自 unit 標頭讀取,不寫特例。其中 runtime-log-upload 與 fleet-log-download 來自 scheduler v0.122.0,須在它之後散佈,否則 unit-sync 會報「找不到 repo 母體」。"
 }

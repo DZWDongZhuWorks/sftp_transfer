@@ -107,6 +107,16 @@ BOOT_ACTIVATING_FAIL_SECONDS = 900
 # BaseIPC=ipc1,ipc2,與 ECDIS 截圖回傳同一組閘門;IPC-3 上是 N/A。依船策略 radar_event_capture
 # 沒打開的船沒有來源目錄,一秒內 exit 0,所以船隊上它是 active/waiting + Result=success。
 #
+# nssms-runtime-log-upload(scheduler v0.122.0,radar / ecdis 執行期 log 壓 gzip 回傳)同樣宣告
+# BaseIPC=ipc1,ipc2,IPC-3 上是 N/A。
+#
+# nssms-fleet-issues(岸端 issue 流程)與 nssms-fleet-log-download(scheduler v0.122.0,岸端收
+# 全船隊執行期 log、收到就刪遠端)也是 ecdis-snap-download 那一組閘門:BaseIPC=ipc1 AND
+# Vessel=CLINK,船隊上是 N/A,不需要特例。
+#
+# nssms-teamviewer-fetch(依船策略 teamviewer_update 下載 deb)與 apt-repair-fetch 同為
+# ExceptVessel=CLINK。nssms-disk-guard 與 nssms-failure-evidence 沒有任何閘門,每台都裝。
+#
 # 【勿在下面的 tuple 內寫含括號的註解】device_monitor/tests/test_integration.sh 的涵蓋度斷言
 # 用 `^TIMERS = \((.*?)\)` 抓這個 tuple,非貪婪會停在**第一個**右括號:註解裡的括號會把清單
 # 截斷,於是後面的 timer 全被誤判為「沒被涵蓋」。要加說明就寫在這一段。
@@ -117,16 +127,22 @@ TIMERS = (
     "nssms-deploy-reconcile",
     "nssms-device-monitor-probe",
     "nssms-device-monitor-report",
+    "nssms-disk-guard",
     "nssms-download-photos",
     "nssms-ecdis-screenshot-upload",
     "nssms-ecdis-snap-download",
+    "nssms-failure-evidence",
     "nssms-flag-report",
+    "nssms-fleet-issues",
+    "nssms-fleet-log-download",
     "nssms-fleet-status-retention",
     "nssms-radar-event-screenshot-upload",
     "nssms-reboot",
     "nssms-remote-log-retention",
+    "nssms-runtime-log-upload",
     "nssms-shipboard-alert-upload",
     "nssms-teamviewer",
+    "nssms-teamviewer-fetch",
     "nssms-verify-downloads",
     "nssms-warm-env",
     "nssms-warning-sign-upload",

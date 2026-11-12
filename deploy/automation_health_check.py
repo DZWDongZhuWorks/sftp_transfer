@@ -117,6 +117,9 @@ BOOT_ACTIVATING_FAIL_SECONDS = 900
 # nssms-teamviewer-fetch(依船策略 teamviewer_update 下載 deb)與 apt-repair-fetch 同為
 # ExceptVessel=CLINK。nssms-disk-guard 與 nssms-failure-evidence 沒有任何閘門,每台都裝。
 #
+# nssms-radar-snap-download(scheduler v0.123.0,岸端收 radar 事件截圖、收到就刪遠端)與
+# nssms-ecdis-snap-download 同一組閘門:BaseIPC=ipc1 AND Vessel=CLINK,船隊上是 N/A,不需要特例。
+#
 # 【勿在下面的 tuple 內寫含括號的註解】device_monitor/tests/test_integration.sh 的涵蓋度斷言
 # 用 `^TIMERS = \((.*?)\)` 抓這個 tuple,非貪婪會停在**第一個**右括號:註解裡的括號會把清單
 # 截斷,於是後面的 timer 全被誤判為「沒被涵蓋」。要加說明就寫在這一段。
@@ -137,6 +140,7 @@ TIMERS = (
     "nssms-fleet-log-download",
     "nssms-fleet-status-retention",
     "nssms-radar-event-screenshot-upload",
+    "nssms-radar-snap-download",
     "nssms-reboot",
     "nssms-remote-log-retention",
     "nssms-runtime-log-upload",

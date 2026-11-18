@@ -1,5 +1,5 @@
 {
-  "version": "0.34.4",
-  "date": "2026-11-12",
-  "notes": "巡檢的 TIMERS 加入 nssms-radar-snap-download(scheduler v0.123.0,CLINK 收 radar 事件截圖;BaseIPC=ipc1 AND Vessel=CLINK,船隊上是 N/A)。少了它 scheduler 的 test_radar_snap_download 第 13 節與 device_monitor 的涵蓋度檢查會紅。"
+  "version": "0.34.5",
+  "date": "2026-11-18",
+  "notes": "巡檢的 TIMERS 加入 nssms-check-img-upload(scheduler v0.124.0,nsms 檢查照片每天回傳、只傳不刪;BaseIPC=ipc2,ipc3,IPC-1 上是 N/A)。少了它 scheduler 的 test_check_img_upload 第 7 節與 device_monitor 的涵蓋度檢查會紅。"
 }

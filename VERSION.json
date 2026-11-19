@@ -1,5 +1,5 @@
 {
-  "version": "0.34.5",
-  "date": "2026-11-18",
-  "notes": "巡檢的 TIMERS 加入 nssms-check-img-upload(scheduler v0.124.0,nsms 檢查照片每天回傳、只傳不刪;BaseIPC=ipc2,ipc3,IPC-1 上是 N/A)。少了它 scheduler 的 test_check_img_upload 第 7 節與 device_monitor 的涵蓋度檢查會紅。"
+  "version": "0.34.6",
+  "date": "2026-11-19",
+  "notes": "巡檢的 TIMERS 加入 nssms-radar-long-capture-upload(scheduler v0.125.0,radar 長錄影每天兩輪回傳;BaseIPC=ipc1,ipc2,IPC-3 上是 N/A)與 nssms-radar-long-capture-download(岸端收長錄影;BaseIPC=ipc1 AND Vessel=CLINK,船隊上是 N/A)。少了它們 scheduler 的 test_radar_long_capture_download 第 7 節(現為 SKIP)與 device_monitor 的涵蓋度檢查會紅。"
 }

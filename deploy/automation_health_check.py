@@ -124,6 +124,13 @@ BOOT_ACTIVATING_FAIL_SECONDS = 900
 # BaseIPC=ipc2,ipc3:IPC-3 傳 gateway/check_picture、IPC-2 傳 nsms/check_img,IPC-1 上是 N/A。
 # 來源目錄不在的機器一秒內 exit 0,所以船隊上它是 active/waiting + Result=success。
 #
+# nssms-radar-long-capture-upload(scheduler v0.125.0,radar 長錄影每天 04:08 / 15:18 回傳、傳完即刪)
+# 宣告 BaseIPC=ipc1,ipc2,與事件截圖回傳同一組閘門;IPC-3 上是 N/A。依船策略 radar_long_capture
+# 沒打開的船沒有來源目錄,一秒內 exit 0,所以船隊上它是 active/waiting + Result=success。
+# nssms-radar-long-capture-download(岸端每天六輪收長錄影)是 ecdis-snap-download 那一組閘門:
+# BaseIPC=ipc1 AND Vessel=CLINK,船隊上是 N/A。常駐的 nssms-radar-long-capture.service 在 services/,
+# 不列在這裡。
+#
 # 【勿在下面的 tuple 內寫含括號的註解】device_monitor/tests/test_integration.sh 的涵蓋度斷言
 # 用 `^TIMERS = \((.*?)\)` 抓這個 tuple,非貪婪會停在**第一個**右括號:註解裡的括號會把清單
 # 截斷,於是後面的 timer 全被誤判為「沒被涵蓋」。要加說明就寫在這一段。
@@ -145,6 +152,8 @@ TIMERS = (
     "nssms-fleet-log-download",
     "nssms-fleet-status-retention",
     "nssms-radar-event-screenshot-upload",
+    "nssms-radar-long-capture-download",
+    "nssms-radar-long-capture-upload",
     "nssms-radar-snap-download",
     "nssms-reboot",
     "nssms-remote-log-retention",

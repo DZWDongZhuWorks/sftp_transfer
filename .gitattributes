@@ -20,5 +20,7 @@
 *.gif  binary
 *.ico  binary
 *.gz   binary
+*.xz   binary
+*.deb  binary
 *.zip  binary
 *.pyc  binary

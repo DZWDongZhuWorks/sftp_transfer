@@ -1,0 +1,3 @@
+# 靜態 ffmpeg / ffprobe 離線包(linux arm64,musl 完全靜態;Ubuntu 18.04 / 22.04 共用)。
+# 由 build/package.sh 產生;怎麼重編見 build/README.md。
+4d7a986d92c3dc0e28f26ad13da9ff3d9d54371f7432a4ddc643208082162e5f  ffmpeg-8.1.3-nssms1-linux-arm64-static.tar.xz

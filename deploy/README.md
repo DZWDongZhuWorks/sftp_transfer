@@ -46,6 +46,8 @@ Python runtime 本身一律沿用船端映像既有的預安裝版本：不下�
 | `lib/wheel_compat.py` | preflight 守門：wheelhouse 的 wheel 標籤 vs 船端直譯器／glibc／架構 |
 | `install_tmux_offline.sh` | 依偵測到的 profile 離線安裝 tmux（deploy 需要時自動呼叫） |
 | `build/collect_tmux_debs_online.sh` | **僅建置機**：有網路時重新蒐集該平台的 `.deb` 並更新 manifest |
+| `static/ffmpeg/` | musl 完全靜態的 ffmpeg / ffprobe 壓縮檔 + `MANIFEST.txt`（兩個 profile 共用）；`build/` 是重編腳本 |
+| `install_ffmpeg_offline.sh` | 把上面那支 ffmpeg 裝到 `/usr/local/bin`，全船帳號共用（deploy 的 A8d 自動呼叫，見下方〈ffmpeg〉） |
 | `requirements-lock.txt` | Jammy 的版本鎖定清單（可重現安裝） |
 | `wheelhouse/` `MANIFEST.txt` | **legacy 過渡**：已派送到船上的舊離線包形狀，仍可用但會 warn |
 | `deploy_offline.sh` | 離線安裝腳本（全程 `--no-index`，不連外網） |
@@ -66,8 +68,10 @@ deploy/
 │       └── wheelhouse/       cp310 輪子       + MANIFEST.txt
 ├── virtualenv_wheels/        共用的 bootstrap（全部 Requires-Python >=3.6）
 ├── lib/{offline_common.sh,wheel_compat.py}
+├── static/ffmpeg/            靜態 ffmpeg 壓縮檔 + MANIFEST.txt（共用）；build/ 重編腳本
 ├── build/collect_tmux_debs_online.sh
 ├── install_tmux_offline.sh
+├── install_ffmpeg_offline.sh
 └── deploy_offline.sh
 ```
 
@@ -131,6 +135,38 @@ payload / ABI 驗證全過之後才輪到既有 tmux：功能正常就沿用，*
 > 當後備路徑，現已移除：那條路徑會留下一個沒登錄進 dpkg 資料庫的假安裝，
 > 之後的巡檢與 apt 都看不到它。缺權限請補 sudo 後重跑，不要繞過。
 
+## ffmpeg：靜態執行檔，全船共用
+
+radar 長錄影要 ffmpeg 的 `libx264rgb`（無損；radar 開錄前自己實測，沒有就記 `encoder_unavailable` 不錄）。
+船上沒有對外網路，`apt install ffmpeg` 不成立；ffmpeg 的 deb 依賴閉包又上百個套件，一包在別台機器上抓的
+deb 正是 2026-07 弄斷 43 台 apt 依賴的那種東西（scheduler 的 `docs/apt-health.md`）。
+
+所以 ffmpeg 不走 deb，走**一支 musl 完全靜態的執行檔**：`static/ffmpeg/` 放一個
+`ffmpeg-<版本>-nssmsN-linux-arm64-static.tar.xz`（ffmpeg + ffprobe + 授權書 + BUILDINFO，壓縮後約 10 MB、解開約 50 MB；增量 OTA，每台只傳一次）與同目錄的
+`MANIFEST.txt`，**納入 git 版控**（理由同 tmux debs：缺了是船上無法自救的故障）。不依賴 glibc，兩個 profile
+共用同一支；不經 dpkg / apt，apt 依賴斷掉的機器也裝得上。怎麼編、怎麼重編見
+[`static/ffmpeg/build/README.md`](static/ffmpeg/build/README.md)。
+
+`install_ffmpeg_offline.sh`（`deploy_offline.sh` 的 A8d，每日 `--unattended` 也會跑）把它裝到 **`/usr/local/bin`** ——
+所有帳號、所有專案都在 PATH 上找得到，systemd user service 的 PATH 裡它也排在 `/usr/bin` 之前。
+
+```bash
+./deploy/install_ffmpeg_offline.sh --check-only   # 只回報
+./deploy/install_ffmpeg_offline.sh                # 需要時安裝(要 sudo)
+```
+
+動任何東西之前先驗：MANIFEST 的 sha256 → 壓縮檔內的 `SHA256SUMS` → **在本機實測**解開的執行檔（有 `libx264rgb`、
+真的編得出 2 幀 qp 0 的 mp4、ffprobe 讀回 2 幀）。全過才裝；裝完再用裝上去的那兩支測一次。
+
+- 已是同一版（`/usr/local/share/nssms-ffmpeg/SHA256SUMS` 與執行檔 sha256 都相符）→ 什麼都不做。
+- 換版：先寫成同目錄暫存名再 `mv -f`（原子；正在跑的 ffmpeg 不受影響），`SHA256SUMS` 最後寫。
+- `/usr/local/bin` 已有 ffmpeg/ffprobe 但沒有 `/usr/local/share/nssms-ffmpeg/` → 視為別人放的，**不覆蓋**（exit 8）。
+- `/usr/bin/ffmpeg`（apt 裝的）不受影響，只是 PATH 上本包這支在前。
+
+離開碼：`0` 已就緒/已安裝／`1` 安裝失敗／`2` 參數錯誤／`3` 需要 sudo 但沒有預先授權／`4` 離線包不完整／
+`5`（`--check-only`）可安裝／`6` 平台不符或實測失敗／`8` 有別人放的 ffmpeg，不覆蓋。
+**不是部署的必要條件**：`deploy_offline.sh` 對任何結果都只記一欄「ffmpeg」，不中止部署。
+
 ## 安裝目標：專屬 venv
 
 sftp_transfer 使用**專屬虛擬環境**（與 radar / SHM 等其他專案慣例一致），
@@ -182,7 +218,7 @@ python3 deploy/automation_health_check.py
 
 | 密碼 | 用在哪 | 船隊共用（隨 OTA） | 單機覆寫（OTA 碰不到） |
 | --- | --- | --- | --- |
-| 本機 `sudo` | A3 clink 遷移 / A4 docker 群組 / A4b polkit + GDM / A6 sudoers / A8 tmux | `config/deploy_sudo_pass.txt` | `~/.nssms_deploy_pass` |
+| 本機 `sudo` | A3 clink 遷移 / A4 docker 群組 / A4b polkit + GDM / A6 sudoers / A8 tmux / A8d ffmpeg | `config/deploy_sudo_pass.txt` | `~/.nssms_deploy_pass` |
 | 遠端主機 | A9 `ssh-copy-id`（照片同步金鑰，僅實體 IPC-2） | `config/deploy_remote_pass.txt` | `~/.nssms_remote_pass` |
 
 兩個位置都會找，**單機覆寫優先**；也可以用 `--sudo-pass-file` / `--ssh-pass-file`

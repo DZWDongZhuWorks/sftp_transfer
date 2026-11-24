@@ -51,7 +51,7 @@ sftp_transfer 是一套跑在船端與岸端之間的 SFTP 自動化傳輸工具
 - `config/`：實際部署用的各專案設定檔與忽略檔（`*_download_settings.json`／`*_upload_settings.json`／`*_ignore.txt`）。內含帳密，已列在 `.gitignore` 不進版本控制。
 - `script/`：各專案的排程包裝腳本（`run_*.sh`），一律先 `cd` 到本工具資料夾再呼叫對應的 Python 進入點，因此設定檔內的相對路徑是機器無關的。
 - `monitor/`：傳輸 Log 的監視分析工具（終端機分群列表、自包含 HTML 報告、curses TUI）。唯讀、只依賴標準函式庫，詳見 [`monitor/README.md`](monitor/README.md)。
-- `deploy/`：完全無對外網路環境用的離線部署包（依平台分流的 wheelhouse、tmux、安裝腳本），詳見 [`deploy/README.md`](deploy/README.md)。
+- `deploy/`：完全無對外網路環境用的離線部署包（依平台分流的 wheelhouse、tmux、全船共用的靜態 ffmpeg、安裝腳本），詳見 [`deploy/README.md`](deploy/README.md)。
 - `tests/`：pytest 單元測試，詳見下方【開發：執行單元測試】。
 
 ---

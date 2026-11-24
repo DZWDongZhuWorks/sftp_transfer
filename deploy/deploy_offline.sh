@@ -42,6 +42,9 @@
 #     8c) scheduler 的 install_gnome_tracker_off.sh → 依船策略 gnome_tracker_off 停用(或恢復)
 #         GNOME 的檔案索引器 tracker(systemctl --user,不需要密碼)。理由:scheduler 的
 #         docs/health-recorder.md §0.1 —— 主碟 eMMC 的寫回逾時都緊跟在 tracker 結束之後。
+#     8d) install_ffmpeg_offline.sh → 把 static/ffmpeg/ 的 musl 完全靜態 ffmpeg / ffprobe 裝到
+#         /usr/local/bin(需密碼;不問 [Y/n];全船帳號共用)。radar 長錄影要它的 libx264rgb;
+#         船上沒有網路可以 apt install。不是部署的必要條件:失敗只記錄,不中止。
 #      9) install_setup_ssh_key.sh → 照片同步的免密碼登入(**僅實體 IPC-2**)。
 #         這一步輸入的是**遠端主機的密碼**(給 ssh-copy-id),不是本機 sudo。
 #         nssms-download-photos.timer 每 4 小時跑 script/download_photos.sh,而它以
@@ -201,6 +204,8 @@ APT_REPAIR_STATUS="未執行"
 TEAMVIEWER_STATUS="未執行"
 # 停用 GNOME tracker 的結果。同上:兩份總結都會讀它,stage_gnome_tracker 有好幾個提早 return 的出口。
 TRACKER_STATUS="未執行"
+# 靜態 ffmpeg 的安裝結果。同上:兩份總結都會讀它,stage_ffmpeg 有好幾個提早 return 的出口。
+FFMPEG_STATUS="未執行"
 # booster(sftp_transfer / scheduler)的版本與完整性。同上:兩份總結都會讀它們。
 BOOSTER_VERSIONS="未讀取"
 BOOSTER_INTEGRITY_STATUS="未執行"
@@ -2024,6 +2029,60 @@ stage_gnome_tracker() {
   esac
 }
 
+# --- 靜態 ffmpeg(deploy/install_ffmpeg_offline.sh + static/ffmpeg/)----------
+# radar 長錄影要 ffmpeg 的 libx264rgb(無損;radar 每次開錄前自己實測,沒有就記 encoder_unavailable
+# 不錄)。船上沒有對外網路,`apt install ffmpeg` 不成立,所以隨 OTA 帶一支 musl 完全靜態的
+# ffmpeg / ffprobe,裝到 /usr/local/bin —— 全船所有帳號、所有專案都用得到,不只 radar。
+# 判斷與動作全在 install_ffmpeg_offline.sh(離開碼見其檔頭),這裡**不重寫第二份判斷**,
+# 只把離開碼翻成總結的一欄 —— 與 stage_teamviewer 同一個形狀。
+#
+# 【不是部署的必要條件】沒有 ffmpeg 只是長錄影不錄,不該讓部署中止:任何結果都 return;
+# 失敗走 unattended_note_fail(unit 會是 failed,岸端看得到),拿不到 sudo 記進 UNATTENDED_BLOCKED。
+# 【不問 [Y/n]】同一版已裝好時安裝器安靜回 0;/usr/local/bin 已有別人放的 ffmpeg 時回 8、不覆蓋。
+stage_ffmpeg() {
+  local installer="${SCRIPT_DIR}/install_ffmpeg_offline.sh"
+  FFMPEG_STATUS="未執行"
+  echo ""
+  info "檢查 ffmpeg(靜態執行檔,裝到 /usr/local/bin;radar 長錄影的前提)..."
+  if [ ! -f "$installer" ]; then
+    FFMPEG_STATUS="略過(找不到 install_ffmpeg_offline.sh)"
+    info "$FFMPEG_STATUS"
+    return
+  fi
+  run_rc bash "$installer" --check-only
+  case "$RC" in
+    0) FFMPEG_STATUS="已是隨附版本"; return ;;
+    8) FFMPEG_STATUS="/usr/local/bin 已有別人放的 ffmpeg,保留不覆蓋"; return ;;
+    6) FFMPEG_STATUS="不相容,不安裝(原因見上方輸出)"
+       unattended_note_fail "ffmpeg 離線包在本機實測失敗(exit=6)" || true
+       return ;;
+    5) ;;
+    *)
+      FFMPEG_STATUS="無法判斷(--check-only exit=$RC)"
+      unattended_note_fail "ffmpeg 的判斷失敗(--check-only exit=$RC)" || true
+      return ;;
+  esac
+  if [ "$CHECK_ONLY" -eq 1 ]; then
+    FFMPEG_STATUS="可以安裝$DRYRUN_NOTE"
+    return
+  fi
+  if ! sudo_obtainable; then
+    FFMPEG_STATUS="可以安裝,但這台拿不到 sudo(密碼檔)"
+    warn "$FFMPEG_STATUS"
+    return
+  fi
+  mutating "以靜態執行檔安裝 ffmpeg / ffprobe 到 /usr/local/bin"
+  run_rc bash "$installer"
+  case "$RC" in
+    0) FFMPEG_STATUS="已安裝"; ok "ffmpeg 已安裝到 /usr/local/bin。" ;;
+    3) FFMPEG_STATUS="可以安裝,但 sudo 沒有預先授權(exit=3)"
+       [ "$UNATTENDED" -eq 1 ] && UNATTENDED_BLOCKED=$((UNATTENDED_BLOCKED + 1)) ;;
+    *) FFMPEG_STATUS="安裝失敗(exit=$RC)"
+       err "ffmpeg 安裝失敗(exit=$RC);明天這一輪會再試。"
+       unattended_note_fail "ffmpeg 安裝失敗(exit=$RC)" || true ;;
+  esac
+}
+
 # --- 照片同步的 SSH 金鑰（scheduler/install_setup_ssh_key.sh）---------------
 # nssms-download-photos.timer（每 4 小時，僅實體 IPC-2）會跑 script/download_photos.sh，
 # 而那支腳本以 `ssh -o BatchMode=yes` 連遠端 nsms master —— **沒有金鑰就是立刻失敗**，
@@ -2582,6 +2641,7 @@ stage_summary() {
   printf "  apt 依賴修復    ：%s\n" "$APT_REPAIR_STATUS"
   printf "  TeamViewer 更新 ：%s\n" "$TEAMVIEWER_STATUS"
   printf "  GNOME tracker   ：%s\n" "$TRACKER_STATUS"
+  printf "  ffmpeg          ：%s\n" "$FFMPEG_STATUS"
   printf "  照片同步金鑰    ：%s\n" "$SSH_KEY_STATUS"
   [ "$RUN_HEALTH" -eq 1 ] && printf "  健康檢查        ：%s\n" \
     "$( [ "$HEALTH_RC" -eq 0 ] && echo HEALTHY || echo "有問題（exit=$HEALTH_RC）" )"
@@ -2682,6 +2742,7 @@ stage_summary_unattended() {
   printf "  apt 依賴修復    ：%s\n" "${APT_REPAIR_STATUS:-未執行}"
   printf "  TeamViewer 更新 ：%s\n" "${TEAMVIEWER_STATUS:-未執行}"
   printf "  GNOME tracker   ：%s\n" "${TRACKER_STATUS:-未執行}"
+  printf "  ffmpeg          ：%s\n" "${FFMPEG_STATUS:-未執行}"
   printf "  照片同步金鑰    ：%s\n" "${SSH_KEY_STATUS:-未執行}"
   echo "──────────────────────────────"
   if [ "$UNATTENDED_FAIL" -gt 0 ]; then
@@ -2852,6 +2913,7 @@ main() {
   stage_apt_repair                   # A8a apt 依賴修復(依船策略;scheduler/install_apt_repair.sh)—— 必須早於 A8b
   stage_teamviewer                   # A8b TeamViewer 更新（依船策略;scheduler/install_teamviewer.sh）
   stage_gnome_tracker                # A8c 停用 GNOME tracker（依船策略;scheduler/install_gnome_tracker_off.sh）
+  stage_ffmpeg                       # A8d 靜態 ffmpeg 到 /usr/local/bin（radar 長錄影;deploy/install_ffmpeg_offline.sh）
   stage_ssh_key                      # A9 照片同步的 SSH 金鑰（僅實體 IPC-2）
   stage_launch_decision              # A10 只收集決定，執行在階段 C
 

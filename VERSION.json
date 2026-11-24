@@ -1,5 +1,5 @@
 {
-  "version": "0.34.6",
-  "date": "2026-11-19",
-  "notes": "巡檢的 TIMERS 加入 nssms-radar-long-capture-upload(scheduler v0.125.0,radar 長錄影每天兩輪回傳;BaseIPC=ipc1,ipc2,IPC-3 上是 N/A)與 nssms-radar-long-capture-download(岸端收長錄影;BaseIPC=ipc1 AND Vessel=CLINK,船隊上是 N/A)。少了它們 scheduler 的 test_radar_long_capture_download 第 7 節(現為 SKIP)與 device_monitor 的涵蓋度檢查會紅。"
+  "version": "0.35.0",
+  "date": "2026-11-24",
+  "notes": "離線部署新增 A8d:靜態 ffmpeg 裝到 /usr/local/bin,全船所有帳號 / 專案共用。船上沒有對外網路,`apt install ffmpeg` 不成立,而 radar 長錄影要 ffmpeg 的 libx264rgb(無損)。deploy/static/ffmpeg/ 是在 CLINK 用 alpine(musl)容器從官方原始碼編的 FFmpeg 8.1.3 + x264 stable b35605a,完全靜態(不依賴 glibc,Ubuntu 18.04 / 22.04 共用;壓縮後 10 MB),不經 apt / dpkg,apt 依賴斷掉的機器也裝得上;重編腳本在 deploy/static/ffmpeg/build/。install_ffmpeg_offline.sh 先驗 MANIFEST sha256 → 壓縮檔內 SHA256SUMS → 本機實測(有 libx264rgb、2 幀 qp 0 試編、ffprobe 讀回)才裝;同一版就不動;/usr/local/bin 已有別人放的 ffmpeg 時不覆蓋(exit 8)。deploy_offline.sh 對任何結果只記一欄「ffmpeg」,不中止部署;每日 --unattended 也會補裝。"
 }

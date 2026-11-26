@@ -1,5 +1,5 @@
 {
-  "version": "0.35.1",
-  "date": "2026-11-25",
-  "notes": "modify A01 failover config for IPC-1 ip change to .116"
+  "version": "0.35.2",
+  "date": "2026-11-26",
+  "notes": "巡檢清單 TIMERS 加 nssms-check-img-download(scheduler v0.126.0 岸端收 nsms 檢查照片、收到就刪遠端;只裝 CLINK)。"
 }

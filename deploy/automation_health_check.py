@@ -120,7 +120,7 @@ BOOT_ACTIVATING_FAIL_SECONDS = 900
 # nssms-radar-snap-download(scheduler v0.123.0,岸端收 radar 事件截圖、收到就刪遠端)與
 # nssms-ecdis-snap-download 同一組閘門:BaseIPC=ipc1 AND Vessel=CLINK,船隊上是 N/A,不需要特例。
 #
-# nssms-check-img-upload(scheduler v0.124.0,nsms 檢查照片每天 05:20 回傳、只傳不刪)宣告
+# nssms-check-img-upload(scheduler v0.124.0,nsms 檢查照片每天 05:20 回傳;v0.126.0 起傳完即刪)宣告
 # BaseIPC=ipc2,ipc3:IPC-3 傳 gateway/check_picture、IPC-2 傳 nsms/check_img,IPC-1 上是 N/A。
 # 來源目錄不在的機器一秒內 exit 0,所以船隊上它是 active/waiting + Result=success。
 #
@@ -131,11 +131,16 @@ BOOT_ACTIVATING_FAIL_SECONDS = 900
 # BaseIPC=ipc1 AND Vessel=CLINK,船隊上是 N/A。常駐的 nssms-radar-long-capture.service 在 services/,
 # 不列在這裡。
 #
+# nssms-check-img-download(scheduler v0.126.0,岸端每天 11:09 收 nsms 檢查照片、收到就刪遠端,
+# 只放行船上已經會傳完即刪的 IPC)是 ecdis-snap-download 那一組閘門:BaseIPC=ipc1 AND Vessel=CLINK,
+# 船隊上是 N/A。一台都沒放行的那幾天它一秒內 exit 0,所以 CLINK 上是 active/waiting + Result=success。
+#
 # 【勿在下面的 tuple 內寫含括號的註解】device_monitor/tests/test_integration.sh 的涵蓋度斷言
 # 用 `^TIMERS = \((.*?)\)` 抓這個 tuple,非貪婪會停在**第一個**右括號:註解裡的括號會把清單
 # 截斷,於是後面的 timer 全被誤判為「沒被涵蓋」。要加說明就寫在這一段。
 TIMERS = (
     "nssms-apt-repair-fetch",
+    "nssms-check-img-download",
     "nssms-check-img-upload",
     "nssms-cleanup-old-files",
     "nssms-dashboard-report",
